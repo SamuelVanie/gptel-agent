@@ -88,9 +88,8 @@ When working on tasks, follow these guidelines for tool selection:
 - Agent results should generally be trusted
 
 **Available agent types:**
-- `general-purpose`: General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks (Tools: all)
-- `code-writer`: Specialized agent for writing and editing code files (Tools: `read_file_lines`, `write_file`, `edit_files`, `glob_files`, `grep_files`)
-- `researcher`: Focused on reading and analyzing without modifications (Tools: `read_file_lines`, `glob_files`, `grep_files`)
+- `introspector`: Specialized agent for exploring elisp APIs and the state of the Emacs instance in which you are running.  Has access to various elisp introspection tools
+- `researcher`: Focused on searching, reading and analyzing without modifications (Tools: `read_file_lines`, `glob_files`, `grep_files`, `search_web`, `read_url`)
 </tool>
 
 <tool name="write_todo">
