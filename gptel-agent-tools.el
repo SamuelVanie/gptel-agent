@@ -207,19 +207,19 @@ COUNT is the number of results to return (default 5)."
           gptel-agent--web-search-active)))
 
 (defun gptel-agent--web-fix-unreadable ()
-  (decode-coding-region (point-min) (point-max) 'utf-8)
-  (when-let* ((bad-points (check-coding-systems-region
-                           (point-min) (point-max) '(utf-8))))
-    (dolist (pos (cdar bad-points))
-      (goto-char pos)
-      (delete-char 1)
-      (insert "?"))))
+  "Replace invalid characters from point to end in current buffer."
+  (while (and (skip-chars-forward "\0-\x3fff7f")
+              (not (eobp)))
+    (display-warning
+     '(gptel gptel-agent-tools)
+     (format "Invalid character in buffer \"%s\"" (buffer-name)))
+    (delete-char 1) (insert "?")))
 
 (defun gptel-agent--web-search-eww-callback (cb)
   (let* ((count 5) (results))
     (goto-char (point-min))
     (goto-char url-http-end-of-headers)
-    (gptel-agent--web-fix-unreadable)
+    ;; (gptel-agent--web-fix-unreadable)
     (let* ((dom (libxml-parse-html-region (point) (point-max)))
            (result-count 0))
       (eww-score-readability dom)
