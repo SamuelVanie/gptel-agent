@@ -1165,7 +1165,7 @@ Consider using the more granular tools \"insert_in_file\" or \"edit_files\" firs
              (with-temp-buffer
                (let* ((args (list "-l" "-f" "-i" "-I" ".git"
                                   "--sort=mtime" "--ignore-case"
-                                  "--prune" "-P" pattern))
+                                  "--prune" "-P" pattern path))
                       (args (if (natnump depth)
                                 (nconc args '("-L" (number-to-string depth)))
                               args))
@@ -1177,7 +1177,8 @@ Consider using the more granular tools \"insert_in_file\" or \"edit_files\" firs
                (buffer-string)))
  :args '(( :name "pattern"
            :type string
-           :description "Glob pattern to match, for example \"*.el\".")
+           :description "Glob pattern to match, for example \"*.el\"
+Use \"*\" to list all files in a directory.")
          ( :name "path"
            :type string
            :description "Directory to search in.  Supports relative paths and defaults to \".\""
