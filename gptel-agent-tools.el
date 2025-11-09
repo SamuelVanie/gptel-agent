@@ -763,8 +763,9 @@ Exactly one item should have status \"in_progress\"."
           (overlay-put todo-ov 'gptel-agent--todos t)
           (overlay-put todo-ov 'evaporate t)
           (overlay-put todo-ov 'priority -40)
-          (overlay-put todo-ov 'keymap
-                       (define-keymap "M-`" #'gptel-agent-toggle-todos))
+          (overlay-put todo-ov 'keymap (define-keymap
+                                         "<tab>" #'gptel-agent-toggle-todos
+                                         "TAB"   #'gptel-agent-toggle-todos))
           (plist-put
            info :post              ; Don't use push, see note in gptel-anthropic
            (cons (lambda (&rest _)      ; Clean up header line after tasks are done
