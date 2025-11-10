@@ -994,6 +994,28 @@ Exactly one item should have status \"in_progress\"."
           ,#'gptel--handle-tool-use))
   "See `gptel-request--handlers'.")
 
+(setf (alist-get "agent_task" gptel--tool-preview-alist
+                 nil nil #'equal)
+      (list #'gptel-agent--task-preview-setup))
+
+(defun gptel-agent--task-preview-setup (arg-values _info)
+  "Preview setup for agent_task.
+INFO is the tool call info plist.
+ARG-VALUES is a list: (type description prompt)"
+  (pcase-let ((`(,type ,desc ,prompt) arg-values))
+    (insert "("
+            (propertize "agent " 'font-lock-face 'font-lock-keyword-face)
+            (propertize (prin1-to-string type)
+                        'font-lock-face 'font-lock-escape-face)
+            " " (propertize (prin1-to-string desc)
+                            'font-lock-face
+                            '(:inherit font-lock-constant-face :inherit bold))
+            "\n" (propertize (prin1-to-string prompt)
+                             'line-prefix "       "
+                             'wrap-prefix "       "
+                             'font-lock-face 'font-lock-constant-face)
+            ")\n")))
+
 (defun gptel-agent--indicate-wait (fsm)
   (when-let* ((info (gptel-fsm-info fsm))
               (info-ov (plist-get info :context))
