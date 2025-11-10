@@ -184,6 +184,25 @@ properties persist through refontification."
 ;; - Can run commands in background with `run_in_background: true`
 ;; - Default timeout is 2 minutes (120000ms), max is 10 minutes
 
+(setf (alist-get "eval_elisp" gptel--tool-preview-alist
+                 nil t #'equal)
+      (list #'gptel-agent--eval-elisp-preview-setup))
+
+(defun gptel-agent--eval-elisp-preview-setup (arg-values _info)
+  (let ((expr (car arg-values))
+        (from (point)) (inner-from))
+    (insert
+     "(" (propertize "eval_elisp" 'font-lock-face 'font-lock-keyword-face)
+     ")\n")
+    (setq inner-from (point))
+    (insert expr)
+    (gptel-agent--fontify-block 'emacs-lisp-mode inner-from (point))
+    ;; (add-text-properties inner-from (point) '(line-prefix "  " wrap-prefix "  "))
+    (insert "\n\n")
+    (font-lock-append-text-property
+     inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
+    (gptel-agent--confirm-overlay from (point))))
+
 ;;; Web tools
 
 (defun gptel-agent--fetch-with-timeout (url url-cb tool-cb failed-msg &rest args)
@@ -802,6 +821,26 @@ LINE-NUMBER conventions:
     (write-region nil nil path)
 
     (format "Successfully inserted text at line %d in %s" line-number path)))
+
+(setf (alist-get "write_file" gptel--tool-preview-alist
+                 nil nil #'equal)
+      (list #'gptel-agent--write-file-preview-setup))
+
+(defun gptel-agent--write-file-preview-setup (arg-values _info)
+  (pcase-let ((from (point))
+              (`(,path ,filename ,content) arg-values))
+    (insert
+     "(" (propertize "write_file " 'font-lock-face 'font-lock-keyword-face)
+     (propertize (prin1-to-string path) 'font-lock-face 'font-lock-constant-face) " "
+     (propertize (prin1-to-string filename) 'font-lock-face 'font-lock-constant-face)
+     ")\n")
+    (let ((inner-from (point)))
+      (insert content)
+      (gptel-agent--fontify-block filename inner-from (point))
+      (insert "\n\n")
+      (font-lock-append-text-property
+       inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg)))
+    (gptel-agent--confirm-overlay from (point))))
 
 ;;;; Read files or directories
 (defun gptel-agent--read-file-lines (filename start-line end-line)
