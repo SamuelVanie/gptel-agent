@@ -524,7 +524,7 @@ description and transcript formatted as timestamped paragraphs."
 (declare-function flymake--diag-text "flymake")
 (declare-function flymake-diagnostic-buffer "flymake")
 
-(defun gptel--tool-flymake-diagnostics (&optional all)
+(defun gptel-agent--flymake-diagnostics (&optional all)
   "Collect flymake errors across all open buffers in the current project.
 
 Errors with low severity are not collected.  With ALL, collect all
@@ -1354,7 +1354,7 @@ across all open buffers in the current project.
 
 With optional argument `all`, collect notes and low-severity diagnostics
 too."
- :function #'gptel--tool-flymake-diagnostics
+ :function #'gptel-agent--flymake-diagnostics
  :args (list '( :name "all"
                 :type boolean
                 :description
@@ -1371,7 +1371,7 @@ too."
                  (progn
                    (make-directory (expand-file-name name parent) t)
                    (format "Directory %s created/verified in %s" name parent))
-               (error (format "Error creating directory %s in %s:\n%S" name parent errdata))))
+               (error "Error creating directory %s in %s:\n%S" name parent errdata)))
  :args (list '( :name "parent"
                 :type "string"
                 :description "The parent directory where the new directory should be created, e.g. /tmp")
