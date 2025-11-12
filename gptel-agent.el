@@ -106,7 +106,7 @@ any templates to the system prompt."
       (cons name agent-plist))))
 
 (defun gptel-agent-update ()
-  "Update `gptel-agent--agents' with agent presets."
+  "Update agent definitions from `gptel-agent-dirs'."
   ;; First pass: discover all agents and collect their file paths
   (setq gptel-agent--agents nil)
   (let ((agent-files nil))              ; Alist of (agent-name . file-path)

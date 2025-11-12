@@ -25,12 +25,28 @@ https://github.com/user-attachments/assets/03585600-3bb9-4bf7-b5c8-7e02a28c7a37
 gptel-agent is not yet on a package archive, you can install it manually or with
 a package manager like Straight/Elpaca.
 
+#+html: </details>
+#+html: <details><summary>
 **** Manual
+#+html: </summary>
 
 Clone or download this repository and run =M-x package-install-file⏎= on the
 repository directory.
 
+Or from =use-package= (Emacs 30+):
+
+#+begin_src emacs-lisp
+(use-package gptel-agent
+  :vc ( :url "https://github.com/karthink/gptel-agent.git"
+        :rev :newest)
+  :config (gptel-agent-upate))
+#+end_src
+
+
+#+html: </details>
+#+html: <details><summary>
 **** Straight or Elpaca
+#+html: </summary>
 
 #+begin_src emacs-lisp
 (straight-use-package (gptel-agent :host github :repo "karthink/gptel-agent"))
@@ -40,6 +56,15 @@ repository directory.
 (elpaca (gptel-agent :host github :repo "karthink/gptel-agent"))
 #+end_src
 
+Or from =use-package=:
+
+#+begin_src emacs-lisp
+(use-package gptel-agent
+  :straight (:host github :repo "karthink/gptel-agent") ;use :ensure for Elpaca
+  :config (gptel-agent-update))         ;Read files from agents directories
+#+end_src
+
+#+html: </details>
 *** How to use:
 
 - Set =gptel-model= and =gptel-backend= to use your preferred LLM.  See [[https://github.com/karthink/gptel][gptel's
@@ -102,7 +127,9 @@ Right now gptel-agnt includes three sub-agents:
 The LLM should automatically delegate tasks to them as required, but you can
 also ask the LLM to: "/Use the researcher to find out if.../".
 
+#+html: <details><summary>
 **** Why?
+#+html: </summary>
 
 LLMs often run into dead-ends when trying things, and this can both bloat and
 pollute the context window.  Sub-agents don't share any context with the main
@@ -116,7 +143,10 @@ Sub-agents can be configured to use specific models or other API parameters
 (like the level of reasoning) independent of gptel-agent.  They are essentially
 gptel presets.
 
+#+html: </details>
+#+html: <details><summary>
 **** Agents from Markdown files
+#+html: </summary>
 
 gptel-agent reads agent specs from files in =gptel-agent-dirs=, which you can customize.
 
@@ -146,7 +176,10 @@ You can specify any other keys that gptel recognizes as preset keys, including a
 
 In the above example, the =:pre= key is an elisp function that runs before the agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by the "arxiv" MCP server.)
 
+#+html: </details>
+#+html: <details><summary>
 **** Agents from Org files
+#+html: </summary>
 
 gptel-agent reads agent specs from files in =gptel-agent-dirs=, which you can customize.
 
@@ -175,3 +208,5 @@ search for and gather information efficiently.
 You can specify any other keys that gptel recognizes as preset keys -- see =gptel-make-preset= for details.
 
 (In the above example the =:pre= key is an elisp function that runs before the agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by the "arxiv" MCP server.)
+
+#+html: </details>
