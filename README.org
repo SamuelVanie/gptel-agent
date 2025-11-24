@@ -151,9 +151,11 @@ gptel presets.
 **** Agents from Markdown files
 #+html: </summary>
 
-gptel-agent reads agent specs from files in =gptel-agent-dirs=, which you can customize.
+gptel-agent reads agent specs from files in =gptel-agent-dirs=, which you can
+customize.
 
-You can specify the agent name, description and tools used as YAML front-matter in a Markdown file, followed by the system prompt:
+You can specify the agent name, description and tools used as YAML front-matter
+in a Markdown file, followed by the system prompt:
 
 #+begin_src markdown
 ----
@@ -166,18 +168,21 @@ pre: (lambda () (gptel-mcp-connect '(arxiv) 'sync))
 You are a specialized research agent with access to ArXiv.  Your purpose is to
 search for and gather information efficiently.
 
-<core_responsibilites>
-...
-</core_responsibilities>
+<core_responsibilites> ...  </core_responsibilities>
 
 ...
 #+end_src
 
-=name= defaults to the file name, so only the =description= is mandatory.  =tools= is a list of tool names or categories.
+=name= defaults to the file name, so only the =description= is mandatory.
+=tools= is a list of tool names or categories.
 
-You can specify any other keys that gptel recognizes as preset keys, including a specific model, backend and API parameters.  See =gptel-make-preset= for details.
+You can specify any other keys that gptel recognizes as preset keys, including a
+specific model, backend and API parameters.  See =gptel-make-preset= for
+details.
 
-In the above example, the =:pre= key is an elisp function that runs before the agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by the "arxiv" MCP server.)
+In the above example, the =:pre= key is an elisp function that runs before the
+agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by
+the "arxiv" MCP server.
 
 #+html: </details>
 #+html: <details><summary>
@@ -186,7 +191,8 @@ In the above example, the =:pre= key is an elisp function that runs before the a
 
 gptel-agent reads agent specs from files in =gptel-agent-dirs=, which you can customize.
 
-You can specify the agent name, description and tools used in an Org properties block at the top of an Org file, followed by the system prompt:
+You can specify the agent name, description and tools used in an Org properties
+block at the top of an Org file, followed by the system prompt:
 
 #+begin_src org
 :properties:
@@ -206,10 +212,14 @@ search for and gather information efficiently.
 ...
 #+end_src
 
-=name= defaults to the file name, so only the =description= is mandatory.  =tools= is a list of tool names or categories.
+=name= defaults to the file name, so only the =description= is mandatory.
+=tools= is a list of tool names or categories.
 
-You can specify any other keys that gptel recognizes as preset keys -- see =gptel-make-preset= for details.
+You can specify any other keys that gptel recognizes as preset keys -- see
+=gptel-make-preset= for details.
 
-(In the above example the =:pre= key is an elisp function that runs before the agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by the "arxiv" MCP server.)
+In the above example the =:pre= key is an elisp function that runs before the
+agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by
+the "arxiv" MCP server.
 
 #+html: </details>
