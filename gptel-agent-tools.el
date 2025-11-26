@@ -47,6 +47,8 @@
 (require 'url-http)
 (eval-when-compile (require 'cl-lib))
 
+(declare-function org-escape-code-in-region "org-src")
+
 (defvar url-http-end-of-headers)
 (defvar gptel-agent--agents)
 (defconst gptel-agent--hrule
@@ -572,6 +574,7 @@ diagnostics."
           (when (looking-at-p "^ *```\\s-*\\'")
             (delete-region (line-beginning-position) (line-end-position)))
           (setq description "Patch")
+          (require 'diff-mode)
           (gptel-agent--fontify-block 'diff-mode from (point)))
       (when old-str                     ;Text replacement
         (push path files-affected)
@@ -585,6 +588,8 @@ diagnostics."
     (insert "\n")
     (font-lock-append-text-property
      from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
+    (when (derived-mode-p 'org-mode)
+      (org-escape-code-in-region from (1- (point))))
     (save-excursion
       (goto-char from)
       (insert
@@ -758,7 +763,8 @@ Patch STDOUT:\n%s"
 INFO is the tool call info plist.
 ARG-VALUES is a list: (path line-number new-str)"
   (let ((from (point)) (line-offset)
-        (face-bg (gptel-agent--block-bg)))
+        (face-bg (gptel-agent--block-bg))
+        (cb (current-buffer)))
     (pcase-let ((`(,path ,line-number ,new-str) arg-values))
       (insert "("
               (propertize "insert_into_file " 'font-lock-face 'font-lock-keyword-face)
@@ -791,6 +797,9 @@ ARG-VALUES is a list: (path line-number new-str)"
                (delete-region (point) (point-max)))
              (font-lock-append-text-property
               (point-min) (point-max) 'font-lock-face face-bg)
+             (when (provided-mode-derived-p
+                    (buffer-local-value 'major-mode cb) 'org-mode)
+               (org-escape-code-in-region (point-min) (point-max)))
              (buffer-string)) "\n")
         (insert (propertize "[File not readable]\n\n" 'font-lock-face 'error)))
       (gptel-agent--confirm-overlay from (point)))))
@@ -845,7 +854,9 @@ ARG-VALUES is the list of arguments for the tool call."
       (gptel-agent--fontify-block filename inner-from (point))
       (insert "\n\n")
       (font-lock-append-text-property
-       inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg)))
+       inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
+      (when (derived-mode-p 'org-mode)
+        (org-escape-code-in-region inner-from (1- (point)))))
     (gptel-agent--confirm-overlay from (point))))
 
 ;;;; Read files or directories
