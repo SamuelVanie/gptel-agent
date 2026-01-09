@@ -938,9 +938,10 @@ and optional context. Results are sorted by modification time."
     (unless grepper
       (error "Error: ripgrep/grep not available, this tool cannot be used"))
     (with-temp-buffer
-      (let* ((args
+      (let* ((cmd (file-name-sans-extension (file-name-nondirectory grepper)))
+             (args
               (cond
-               ((string-suffix-p "rg" grepper)
+               ((string= "rg" grepper)
                 (delq nil (list "--sort=modified"
                                 (and (natnump context-lines)
                                      (format "--context=%d" context-lines))
@@ -948,13 +949,14 @@ and optional context. Results are sorted by modification time."
                                 ;; "--files-with-matches" "--max-count=10"
                                 "--heading" "--line-number" "-e" regex
                                 (expand-file-name (substitute-in-file-name path)))))
-               ((string-suffix-p "grep" grepper)
+               ((string= "grep" grepper)
                 (delq nil (list "--recursive"
                                 (and (natnump context-lines)
                                      (format "--context=%d" context-lines))
                                 (and glob (format "--include=%s" glob))
                                 "--line-number" "--regexp" regex
-                                (expand-file-name (substitute-in-file-name path)))))))
+                                (expand-file-name (substitute-in-file-name path)))))
+               (t (error "Error: failed to identify grepper"))))
              (exit-code (apply #'call-process grepper nil '(t t) nil args)))
         (when (/= exit-code 0)
           (goto-char (point-min))
