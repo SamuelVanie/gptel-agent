@@ -1581,12 +1581,19 @@ MAX-LINES is the number of lines to keep, defaulting to 50."
   ;; Too large - save to temp file and return truncated info
   (when (> (buffer-size) 20000)
     (let* ((max-lines (or max-lines 50))
-           (temp-file (make-nearby-temp-file
-                       (format "gptel-agent-%s-%s" prefix
-                               (format-time-string "%Y%m%d-%H%M%S"))
-                       nil ".txt"))
+           (temp-dir (expand-file-name "gptel-agent-temp"
+                                       (temporary-file-directory)))
+           (temp-file (expand-file-name
+                       (format "%s-%s-%s.txt"
+                               prefix
+                               (format-time-string "%Y%m%d-%H%M%S")
+                               (random 10000))
+                       temp-dir))
            (orig-size (buffer-size))
            (orig-lines (line-number-at-pos (point-max))))
+      ;; Create temp directory if needed
+      (unless (file-directory-p temp-dir)
+        (make-directory temp-dir t))
       ;; Save full content
       (write-region nil nil temp-file)
       ;; Insert truncated header
