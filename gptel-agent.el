@@ -294,9 +294,9 @@ Returns an alist of (agent-name . file-path)."
   (mapc (lambda (dir)
           (when (file-directory-p dir)
             (dolist (skill-file (directory-files-recursively
-                                 dir "SKILL\\.md$" nil nil t))
-              (pcase-let ((`(,name . ,skill-plist)
-                           (gptel-agent--cached-read-file skill-file nil)))
+                                 dir "SKILL\\.md" nil nil t))
+              (pcase-let ((`(,name . ,skill-plist) ;loading only metadata
+                           (gptel-agent-read-file skill-file nil t)))
                 ;; validating skill definition
                 (if (plist-get skill-plist :description)
                     (setf (alist-get name gptel-agent--skills nil nil #'string-equal)
