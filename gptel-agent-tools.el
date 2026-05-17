@@ -3510,11 +3510,18 @@ the global registry while this request is in flight."
                gptel-tools)))))
 
 (defun gptel-agent--update-agent-tool ()
-  "Retain compatibility; Agent schemas are now built per request.
-
-The registered tool is deliberately immutable.  See
-`gptel-agent--localize-agent-tool'."
-  (gptel-get-tool "Agent"))
+  "Update the Agent tool's description and enum with currently enabled agents."
+  (let* ((tool (gptel-get-tool "Agent"))
+         (enabled (or gptel-agent--enabled-agents
+                      (cl-remove-if
+                       (lambda (name)
+                         (member name '("gptel-agent" "gptel-plan" "ask")))
+                       (mapcar #'car gptel-agent--agents))))
+         (agents-msg (gptel-agent--agents-tool-message gptel-agent--agents)))
+    (setf (gptel-tool-description tool)
+          (concat gptel-agent--agent-tool-base-desc "\n\n" agents-msg))
+    (setf (plist-get (car (gptel-tool-args tool)) :enum)
+          (vconcat enabled))))
 
 (gptel-make-tool
  :name "Agent"
