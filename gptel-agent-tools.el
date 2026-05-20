@@ -127,7 +127,7 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
               :stop-reason
               (format "Agent stuck: tool \"%s\" called %d times with same arguments"
                       name count)))
-       ((> count gptel-agent-max-tool-repetitions)
+       ((eq count gptel-agent-max-tool-repetitions)
         (list :block
               (format "Error: You have called tool \"%s\" %d times with identical \
 arguments. This is not making progress. Change your approach, use different \
