@@ -88,6 +88,52 @@ parameters take precedence over this value."
                  (plist  :tag "Preset plist spec"))
   :group 'gptel-agent)
 
+(defcustom gptel-agent-max-tool-repetitions 3
+  "Max times a tool can be called with identical arguments before blocking.
+
+When a subagent calls the same tool with the same arguments this many
+times consecutively, the call is blocked with an error message asking the
+LLM to change its approach.  Set to nil to disable repetition detection."
+  :type '(choice (natnum :tag "Max repetitions")
+                 (const :tag "Disable" nil))
+  :group 'gptel-agent)
+
+;;; Tool call repetition detection
+(defvar-local gptel-agent--tool-call-counts nil
+  "Hash table tracking tool call repetitions.
+Keys are (name . args) cons cells, values are integer counts.")
+
+(defun gptel-agent--reset-tool-call-counts (&rest _)
+  "Reset the tool call repetition tracker."
+  (when gptel-agent--tool-call-counts
+    (clrhash gptel-agent--tool-call-counts)))
+
+(defun gptel-agent--detect-repetition (tool-call-info)
+  "Pre-tool-call hook that detects and blocks repeated identical tool calls.
+
+TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
+  (when gptel-agent-max-tool-repetitions
+    (let* ((name (plist-get tool-call-info :name))
+           (args (plist-get tool-call-info :args))
+           (key (cons name args))
+           (table (or gptel-agent--tool-call-counts
+                      (setq gptel-agent--tool-call-counts
+                            (make-hash-table :test #'equal))))
+           (count (1+ (gethash key table 0))))
+      (puthash key count table)
+      (cond
+       ((> count (1+ gptel-agent-max-tool-repetitions))
+        (list :stop t
+              :stop-reason
+              (format "Agent stuck: tool \"%s\" called %d times with same arguments"
+                      name count)))
+       ((> count gptel-agent-max-tool-repetitions)
+        (list :block
+              (format "Error: You have called tool \"%s\" %d times with identical \
+arguments. This is not making progress. Change your approach, use different \
+parameters, or stop and report what you have so far."
+                      name count)))))))
+
 ;;; Tool use preview
 (defun gptel-agent--confirm-overlay (from to &optional no-hide)
   "Set up tool call preview overlay FROM TO.
@@ -2146,6 +2192,10 @@ none of the predefined options are suitable."
  :category "gptel-agent"
  :async t
  :include t)
+
+;;; Register repetition detection hook
+(add-hook 'gptel-pre-tool-call-functions #'gptel-agent--detect-repetition)
+(add-hook 'gptel-post-response-functions #'gptel-agent--reset-tool-call-counts)
 
 (provide 'gptel-agent-tools)
 ;;; gptel-agent-tools.el ends here
