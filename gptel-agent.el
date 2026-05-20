@@ -475,14 +475,43 @@ opening delimiter '---' found but no closing delimiter" file-path))
                               :object-type 'plist
                               :object-key-type 'keyword
                               :sequence-type 'list)))
+            ;; Normalize property types and handle special keys.
             (let ((tail parsed-yaml))
               (while tail
                 (let ((key (pop tail))
                       (val (pop tail)))
                   (pcase key
+                    ;; :pre and :post are Elisp expressions as strings.
                     ((or :pre :post) (plist-put parsed-yaml key (eval (read val) t)))
+                    ;; :parents is a YAML list of strings read as a list.
                     (:parents (plist-put parsed-yaml key
-                                         (mapcar #'intern (ensure-list (read val)))))))))
+                                         (mapcar #'intern (ensure-list val))))
+                    ;; :context and :tools: If a string (single-line YAML), split
+                    ;; by spaces. If already a list (YAML sequence), keep as-is.
+                    ((or :context :tools)
+                     (plist-put parsed-yaml key
+                                (if (listp val) val (split-string val))))
+                    ;; Numeric properties: YAML already handles these correctly
+                    ;; (numbers become numbers), so no conversion needed.
+                    ;; Boolean properties: YAML true -> t, YAML false -> :false.
+                    ((or :stream :track-media :track-response
+                         :org-convert-response)
+                     (plist-put parsed-yaml key (unless (eq val :false) val)))
+                    ;; Include-reasoning can be true/t, false/nil, "ignore",
+                    ;; or a string (buffer name).
+                    (:include-reasoning
+                     (plist-put parsed-yaml key (pcase val
+                                                  (:false nil)
+                                                  ("ignore" 'ignore)
+                                                  (_ val))))
+                    ;; Symbol properties (always a symbol or nil)
+                    ((or :use-context :include-tool-results :confirm-tool-calls
+                         :use-tools :cache :model)
+                     (plist-put parsed-yaml key
+                                (pcase val
+                                  (:false nil)
+                                  ((pred stringp) (intern val))
+                                  (_ val))))))))
 
             ;; Validate all keys in the parsed YAML
             (let ((current-plist parsed-yaml))
@@ -562,15 +591,36 @@ Signals an error if:
                                (forward-line 1))
                              (point))))
 
-          ;; Process each property
+          ;; Normalize property types and handle special keys.
           (dolist (pair props-alist)
             (let* ((key-str (downcase (car pair)))
                    (key-sym (intern (concat ":" key-str)))
                    (value (cdr pair)))
 
               (pcase key-sym
-                (:context (setq value (split-string value)))
-                (:tools (setq value (split-string value))))
+                ;; Properties that should remain as lists
+                ((or :context :tools)
+                 (setq value (split-string value)))
+                ;; Numeric properties
+                ((or :temperature :max-tokens :num-messages-to-send)
+                 (setq value (unless (string-equal value "nil")
+                               (string-to-number value))))
+                ;; Include-reasoning can also be a string (buffer name)
+                (:include-reasoning (setq value (pcase value
+                                                  ("nil" nil)
+                                                  ("t" t)
+                                                  ("ignore" 'ignore)
+                                                  (_ value))))
+                ;; Boolean properties
+                ((or :stream :track-media :track-response :org-convert-response)
+                 (setq value (pcase value
+                               ("nil" nil)
+                               ("t" t)
+                               (_ value))))
+                ;; Symbol properties
+                ((or :use-context :include-tool-results :confirm-tool-calls
+                     :use-tools :cache :model)
+                 (setq value (intern value))))
 
               ;; Skip CATEGORY property (added automatically by Org)
               (unless (string-equal key-str "category")
