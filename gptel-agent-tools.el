@@ -87,7 +87,7 @@ parameters take precedence over this value."
                  (plist  :tag "Preset plist spec"))
   :group 'gptel-agent)
 
-(defcustom gptel-agent-max-tool-repetitions 3
+(defcustom gptel-agent-max-tool-repetitions 5
   "Max times a tool can be called with identical arguments before blocking.
 
 When a subagent calls the same tool with the same arguments this many
@@ -108,14 +108,17 @@ Set to nil to disable the timeout."
   :group 'gptel-agent)
 
 ;;; Tool call repetition detection
-(defvar-local gptel-agent--tool-call-counts nil
-  "Hash table tracking tool call repetitions.
-Keys are (name . args) cons cells, values are integer counts.")
+(defvar-local gptel-agent--last-tool-call-key nil
+  "Last tool call key tracked for repetition detection.
+The key is a cons cell (NAME . ARGS).")
+
+(defvar-local gptel-agent--tool-call-streak 0
+  "Current streak of consecutive identical tool calls.")
 
 (defun gptel-agent--reset-tool-call-counts (&rest _)
   "Reset the tool call repetition tracker."
-  (when gptel-agent--tool-call-counts
-    (clrhash gptel-agent--tool-call-counts)))
+  (setq gptel-agent--last-tool-call-key nil
+        gptel-agent--tool-call-streak 0))
 
 (defun gptel-agent--detect-repetition (tool-call-info)
   "Pre-tool-call hook that detects and blocks repeated identical tool calls.
@@ -125,11 +128,12 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
     (let* ((name (plist-get tool-call-info :name))
            (args (plist-get tool-call-info :args))
            (key (cons name args))
-           (table (or gptel-agent--tool-call-counts
-                      (setq gptel-agent--tool-call-counts
-                            (make-hash-table :test #'equal))))
-           (count (1+ (gethash key table 0))))
-      (puthash key count table)
+           (count
+            (if (equal key gptel-agent--last-tool-call-key)
+                (1+ gptel-agent--tool-call-streak)
+              1)))
+      (setq gptel-agent--last-tool-call-key key
+            gptel-agent--tool-call-streak count)
       (cond
        ((> count (1+ gptel-agent-max-tool-repetitions))
         (list :stop t
@@ -1522,21 +1526,26 @@ PROMPT is the detailed prompt instructing the agent on what is required."
                       (plist-get info :position)))
            (partial (format "%s result for task: %s\n\n"
                             (capitalize agent-type) description))
+           (saved-last-tool-call-key gptel-agent--last-tool-call-key)
+           (saved-tool-call-streak gptel-agent--tool-call-streak)
            ;; Once-only wrapper: ensures main-cb is called at most once.
            ;; After the first call, subsequent calls are no-ops.
            (done nil)
            (timeout-timer nil)
            (finish
-            (lambda (result)
-              (unless done
-                (setq done t)
-                (when timeout-timer
-                  (cancel-timer timeout-timer)
-                  (setq timeout-timer nil))
-                (condition-case err
-                    (funcall main-cb result)
-                  (error
-                   (message "gptel-agent: error in main-cb: %S" err)))))))
+             (lambda (result)
+               (unless done
+                 (setq done t)
+                 (when timeout-timer
+                   (cancel-timer timeout-timer)
+                   (setq timeout-timer nil))
+                 (setq gptel-agent--last-tool-call-key saved-last-tool-call-key
+                       gptel-agent--tool-call-streak saved-tool-call-streak)
+                 (condition-case err
+                     (funcall main-cb result)
+                   (error
+                     (message "gptel-agent: error in main-cb: %S" err)))))))
+      (gptel-agent--reset-tool-call-counts)
       (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
       (let* ((task-ov (gptel-agent--task-overlay where agent-type description))
              (task-fsm
