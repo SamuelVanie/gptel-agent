@@ -57,7 +57,6 @@
 (defvar gptel-agent--skills)
 (defvar gptel-agent--enabled-skills)
 (defvar gptel-agent--enabled-agents)
-(defvar gptel-agent--enabled-agents)
 (defconst gptel-agent--hrule
   (propertize "\n" 'face '(:inherit shadow :underline t :extend t)))
 
