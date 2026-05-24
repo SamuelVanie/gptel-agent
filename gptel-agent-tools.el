@@ -1490,7 +1490,7 @@ ARG-VALUES is a list: (type description prompt)"
                (propertize description 'face 'font-lock-doc-face)
                (propertize
                 " " 'display
-                (if (fboundp 'string-pixel-width)
+                (if (and (display-graphic-p) (fboundp 'string-pixel-width))
                     `(space :align-to (- right (,(string-pixel-width model))))
                   `(space :align-to (- right ,(+ 5 (string-width model))))))
                model "\n")))
