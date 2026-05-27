@@ -97,7 +97,7 @@ LLM to change its approach.  Set to nil to disable repetition detection."
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
 
-(defcustom gptel-agent-task-timeout 300
+(defcustom gptel-agent-task-timeout 600
   "Timeout in seconds for sub-agent tasks.
 
 If a sub-agent task does not complete within this many seconds,
