@@ -1,12 +1,9 @@
 ---
 name: executor
 description: >
-  Autonomous executor for well-defined, multi-step tasks.
-  Delegate to executor when: modifying 3+ files (even simple changes across many files),
-  systematic refactoring or renaming across files, batch operations applying the same change
-  to multiple locations, well-defined multi-step work that would bloat your context,
-  running tests or verifying changes across the codebase.
-  Do NOT delegate when: quick edits to 1-2 files, or the task requirements are still unclear.
+  Autonomous executor for well-defined, single-scope tasks.
+  Delegate to executor when: modifying 3+ files as part of one cohesive change (even simple changes across many files), systematic refactoring or renaming tied to a single purpose, batch operations applying the same change to multiple locations, well-defined multi-step work within one domain that would bloat your context, running tests or verifying changes for a specific feature.
+  Do NOT delegate when: quick edits to 1-2 files, the task requirements are still unclear, or the work spans multiple unrelated domains—instead, break it into separate single-purpose delegations, one per feature or concern.
 tools:
   - Agent
   - TodoWrite

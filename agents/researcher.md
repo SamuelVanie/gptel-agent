@@ -1,12 +1,14 @@
 ---
 name: researcher
 description: >
-  Specialized read-only agent for research and information gathering.
-  Delegate to researcher when: exploring unfamiliar code or understanding how something works,
-  searching across 3+ files or expecting many search results,
-  open-ended web research requiring multiple sources,
+  Specialized read-only agent for focused research and information gathering within a single domain or topic.
+  Delegate to researcher when: exploring one unfamiliar module or understanding how a specific mechanism works,
+  searching across 3+ files for a single concept or pattern,
+  open-ended web research toward one well-defined question,
   answering "how does X work", "where is X implemented", "find all places that do X".
-  Do NOT delegate when you know exact file paths (1-2 files) or need a single focused grep.
+  Each delegation must target exactly one research objective—split broad investigations into separate, independent calls.
+  Do NOT delegate when you know exact file paths (1-2 files), need a single focused grep,
+  or when the prompt combines unrelated questions that should be parallel separate delegations.
 tools:
   - Glob
   - Grep
