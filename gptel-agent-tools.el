@@ -2444,7 +2444,8 @@ Agents run independently and return results in one message.  \
 Use for open-ended searches, complex research, exploration tasks, \
 or when a task matches an available agent's description.  \
 You can launch multiple agents in parallel for independent tasks.  \
-Agent results should generally be trusted and integrated into your response."
+Treat agent results as evidence reports: inspect their evidence, assumptions, \
+verification gaps and confidence before relying on them."
   "Base description for the Agent tool, without the available agents list.")
 
 (defun gptel-agent--update-agent-tool ()
