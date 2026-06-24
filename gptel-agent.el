@@ -523,7 +523,8 @@ Substitution happens in-place in the buffer."
 (defun gptel-agent--read-markdown-frontmatter (file-path)
   "Return FILE-PATH's YAML frontmatter without reading the full file."
   (with-temp-buffer
-    (let* ((size (file-attribute-size (file-attributes file-path)))
+    (let* ((read-path (file-truename file-path))
+           (size (file-attribute-size (file-attributes read-path)))
            (offset 0)
            found
            frontmatter-end
@@ -531,7 +532,7 @@ Substitution happens in-place in the buffer."
       (while (and (< offset size) (not found) (not no-frontmatter))
         (let ((end (min size (+ offset gptel-agent--metadata-read-chunk-size))))
           (goto-char (point-max))
-          (insert-file-contents file-path nil offset end)
+          (insert-file-contents read-path nil offset end)
           (setq offset end))
         (save-excursion
           (goto-char (point-min))
@@ -604,7 +605,8 @@ opening delimiter '---' found but no closing delimiter" file-path))))))
 (defun gptel-agent--read-org-properties-metadata (file-path validator)
   "Read FILE-PATH's top Org property drawer as metadata only."
   (with-temp-buffer
-    (let* ((size (file-attribute-size (file-attributes file-path)))
+    (let* ((read-path (file-truename file-path))
+           (size (file-attribute-size (file-attributes read-path)))
            (offset 0)
            found
            no-properties
@@ -613,7 +615,7 @@ opening delimiter '---' found but no closing delimiter" file-path))))))
       (while (and (< offset size) (not found) (not no-properties))
         (let ((end (min size (+ offset gptel-agent--metadata-read-chunk-size))))
           (goto-char (point-max))
-          (insert-file-contents file-path nil offset end)
+          (insert-file-contents read-path nil offset end)
           (setq offset end))
         (save-excursion
           (goto-char (point-min))
