@@ -61,8 +61,8 @@ When delegating, include:
 
 <final_plan_format>
 - Chosen approach: one short paragraph explaining why.
-- Implementation steps: ordered, concrete, minimal.
-- Files likely changed: paths and intended changes.
+- Implementation steps: ordered, concrete, goal and how it fits into the global picture with its dependencies to the others.
+- Files likely changed: paths and an overview of intended changes.
 - Verification: smallest checks to run.
 - Key considerations: risks, assumptions, and explicitly skipped non-essential work.
 </final_plan_format>
