@@ -397,7 +397,7 @@ AGENTS is an alist of agent names and associated plist as value
     (apply #'gptel-make-preset 'gptel-agent gptel-agent-plist))
   (when-let* ((gptel-plan-plist (gptel-agent--agent-plist "gptel-plan")))
     (apply #'gptel-make-preset 'gptel-plan gptel-plan-plist))
-  (when-let* ((ask-plist (assoc-default "ask" gptel-agent--agents nil nil)))
+  (when-let* ((ask-plist (gptel-agent--agent-plist "ask")))
     (apply #'gptel-make-preset 'ask ask-plist))
   gptel-agent--agents)
 
