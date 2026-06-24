@@ -1564,6 +1564,12 @@ the known skills as string ready to be included to the context."
   (when (and ov (overlay-buffer ov))
     (delete-overlay ov)))
 
+(defun gptel-agent--task-finish-response (partial info)
+  "Return the completed task response from PARTIAL and INFO."
+  (if-let* ((transformer (plist-get info :transformer)))
+      (funcall transformer partial)
+    partial))
+
 (defun gptel-agent--handle-task-error (fsm)
   "Handle ERRS state for a sub-agent task FSM.
 Ensures the parent callback is called with an error message."
@@ -1727,6 +1733,7 @@ PROMPT is the detailed prompt instructing the agent on what is required."
                       (plist gptel-agent-preset))))
               (gptel-agent--agent-plist agent-type))
     (let* ((info (gptel-fsm-info gptel--fsm-last))
+           (parent-buffer (plist-get info :buffer))
            (where (or (plist-get info :tracking-marker)
                       (plist-get info :position)))
            (partial (format "%s result for task: %s\n\n"
@@ -1737,6 +1744,8 @@ PROMPT is the detailed prompt instructing the agent on what is required."
            ;; After the first call, subsequent calls are no-ops.
            (done nil)
            (timeout-timer nil)
+           (parent-killed nil)
+           (parent-kill-hook nil)
            (finish
              (lambda (result)
                (unless done
@@ -1744,80 +1753,113 @@ PROMPT is the detailed prompt instructing the agent on what is required."
                  (when timeout-timer
                    (cancel-timer timeout-timer)
                    (setq timeout-timer nil))
+                 (when (buffer-live-p parent-buffer)
+                   (with-current-buffer parent-buffer
+                     (when parent-kill-hook
+                       (remove-hook 'kill-buffer-hook parent-kill-hook t))))
                  (setq gptel-agent--last-tool-call-key saved-last-tool-call-key
                        gptel-agent--tool-call-streak saved-tool-call-streak)
-                 (condition-case err
-                     (funcall main-cb result)
-                   (error
-                     (message "gptel-agent: error in main-cb: %S" err)))))))
+                 (unless parent-killed
+                   (if (buffer-live-p parent-buffer)
+                       (condition-case err
+                           (funcall main-cb result)
+                         (error
+                          (message "gptel-agent: error in main-cb: %S" err)))
+                     (message
+                      "gptel-agent: parent buffer killed; dropping result for task \"%s\""
+                      description)))))))
       (gptel-agent--reset-tool-call-counts)
       (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
       (let* ((task-ov (gptel-agent--task-overlay where agent-type description))
+             (task-callback
+              (lambda (resp info)
+                (condition-case err
+                    (let ((ov (plist-get info :context)))
+                      (pcase resp
+                        ('nil
+                         (gptel-agent--task-cleanup-overlay ov)
+                         (funcall finish
+                                  (format "Error: Task %s could not finish task \"%s\". \
+Error details: %S"
+                                          agent-type description
+                                          (plist-get info :error))))
+                        ('t
+                         (unless (plist-get info :tool-use)
+                           (gptel-agent--task-cleanup-overlay ov)
+                           (funcall finish
+                                    (gptel-agent--task-finish-response
+                                     partial info))))
+                        (`(tool-call . ,calls)
+                         (unless (plist-get info :tracking-marker)
+                           (plist-put info :tracking-marker where))
+                         (gptel--display-tool-calls calls info))
+                        ((pred stringp)
+                         (setq partial (concat partial resp))
+                         ;; If tool use is pending, the agent isn't done, so we
+                         ;; just accumulate output without printing it.  For
+                         ;; streaming, finish on the final t callback.
+                         (unless (or (plist-get info :tool-use)
+                                     (plist-get info :stream))
+                           (gptel-agent--task-cleanup-overlay ov)
+                           (funcall finish
+                                    (gptel-agent--task-finish-response
+                                     partial info))))
+                        ('abort
+                         (gptel-agent--task-cleanup-overlay ov)
+                         (funcall finish
+                                  (format "Error: Task \"%s\" was aborted by the user. \
+%s could not finish."
+                                          description agent-type)))
+                        ;; Reasoning chunks — accumulate silently
+                        (`(reasoning . ,_) nil)
+                        ;; Tool results — ignore, FSM handles continuation
+                        (`(tool-result . ,_) nil)
+                        ;; Catch-all for unexpected response types
+                        (_
+                         (message "gptel-agent: unexpected callback response type: %S"
+                                  (type-of resp)))))
+                  (error
+                   (message "gptel-agent: callback error for task \"%s\": %S"
+                            description err)
+                   (gptel-agent--task-cleanup-overlay (plist-get info :context))
+                   (funcall finish
+                            (format "Error: Internal error in sub-agent task \"%s\": %S"
+                                    description err))))))
              (task-fsm
               (gptel-request prompt
                 :context task-ov
                 :fsm (gptel-make-fsm :table gptel-send--transitions
                                      :handlers gptel-agent-request--handlers)
                 :transforms (list #'gptel--transform-add-context)
-                :callback
-                (lambda (resp info)
-                  (condition-case err
-                      (let ((ov (plist-get info :context)))
-                        (pcase resp
-                          ('nil
-                           (gptel-agent--task-cleanup-overlay ov)
-                           (funcall finish
-                                    (format "Error: Task %s could not finish task \"%s\". \
-Error details: %S"
-                                            agent-type description
-                                            (plist-get info :error))))
-                          (`(tool-call . ,calls)
-                           (unless (plist-get info :tracking-marker)
-                             (plist-put info :tracking-marker where))
-                           (gptel--display-tool-calls calls info))
-                          ((pred stringp)
-                           (setq partial (concat partial resp))
-                           ;; If tool use is pending, the agent isn't done, so we
-                           ;; just accumulate output without printing it.
-                           (unless (plist-get info :tool-use)
-                             (gptel-agent--task-cleanup-overlay ov)
-                             (when-let* ((transformer (plist-get info :transformer)))
-                               (setq partial (funcall transformer partial)))
-                             (funcall finish partial)))
-                          ('abort
-                           (gptel-agent--task-cleanup-overlay ov)
-                           (funcall finish
-                                    (format "Error: Task \"%s\" was aborted by the user. \
-%s could not finish."
-                                            description agent-type)))
-                          ;; Reasoning chunks — accumulate silently
-                          (`(reasoning . ,_) nil)
-                          ;; Tool results — ignore, FSM handles continuation
-                          (`(tool-result . ,_) nil)
-                          ;; Catch-all for unexpected response types
-                          (_
-                           (message "gptel-agent: unexpected callback response type: %S"
-                                    (type-of resp)))))
-                    (error
-                     (message "gptel-agent: callback error for task \"%s\": %S"
-                              description err)
-                     (gptel-agent--task-cleanup-overlay (plist-get info :context))
-                     (funcall finish
-                              (format "Error: Internal error in sub-agent task \"%s\": %S"
-                                      description err))))))))
+                :callback task-callback)))
+        (setq parent-kill-hook
+              (lambda ()
+                (setq parent-killed t
+                      done t)
+                (when timeout-timer
+                  (cancel-timer timeout-timer)
+                  (setq timeout-timer nil))
+                (setq gptel-agent--last-tool-call-key saved-last-tool-call-key
+                      gptel-agent--tool-call-streak saved-tool-call-streak)
+                (ignore-errors
+                  (gptel-abort parent-buffer))))
+        (when (buffer-live-p parent-buffer)
+          (with-current-buffer parent-buffer
+            (add-hook 'kill-buffer-hook parent-kill-hook nil t)))
         ;; Start timeout timer
         (when gptel-agent-task-timeout
           (setq timeout-timer
                 (run-at-time
                  gptel-agent-task-timeout nil
-                 (lambda ()
+                 (lambda (ov)
                    (unless done
-                     (gptel-agent--task-cleanup-overlay task-ov)
+                     (gptel-agent--task-cleanup-overlay ov)
                      (funcall finish
                               (format "Error: Sub-agent task \"%s\" timed out \
 after %d seconds. The %s agent did not complete in time."
                                       description gptel-agent-task-timeout
-                                      agent-type)))))))
+                                      agent-type))))
+                 task-ov)))
         ;; Store the finish function in the FSM info so ERRS/DONE/ABRT
         ;; handlers can call it as a fallback.
         (when task-fsm
