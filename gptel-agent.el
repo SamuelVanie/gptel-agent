@@ -71,7 +71,6 @@
 (declare-function yaml-parse-string "yaml")
 (declare-function project-current "project")
 (declare-function project-root "project")
-(declare-function project-root "project")
 (declare-function org-get-property-block "org")
 (declare-function org-entry-properties "org")
 (declare-function gptel-agent--update-skill-tool "gptel-agent-tools")
@@ -182,6 +181,63 @@ When nil, all discovered agents (except \"gptel-agent\" and
 \"gptel-plan\") are considered enabled.
 Use `gptel-agent-toggle-agent' to manage this list interactively.")
 
+(defvar gptel-agent--agent-files nil
+  "Alist mapping known agent names to their source files.")
+
+(defvar gptel-agent--file-cache nil
+  "Cache for parsed agent and skill files.
+
+Each entry maps an expanded file name to a plist with the source
+modification time, parsed metadata, and optionally the full parsed file.")
+
+(defconst gptel-agent--metadata-read-chunk-size 8192
+  "Number of bytes to read at a time when scanning file metadata.")
+
+(defun gptel-agent--file-mtime (file)
+  "Return FILE's modification time."
+  (file-attribute-modification-time (file-attributes file)))
+
+(defun gptel-agent--plist-without-system (plist)
+  "Return a copy of PLIST without its :system entry."
+  (let ((metadata (copy-sequence plist)))
+    (cl-remf metadata :system)
+    metadata))
+
+(defun gptel-agent--cached-read-file (agent-file &optional full)
+  "Read AGENT-FILE through `gptel-agent--file-cache'.
+
+When FULL is nil, only metadata is read and cached.  When FULL is
+non-nil, the whole file is read only if the cached full parse is absent
+or AGENT-FILE has changed since it was cached."
+  (let* ((file (expand-file-name agent-file))
+         (mtime (gptel-agent--file-mtime file))
+         (entry (alist-get file gptel-agent--file-cache nil nil #'string-equal))
+         (same-mtime (and entry (equal mtime (plist-get entry :mtime))))
+         (slot (if full :full :metadata)))
+    (if (and same-mtime (plist-member entry slot))
+        (cons (plist-get entry :name) (plist-get entry slot))
+      (let ((parsed (gptel-agent-read-file file nil (not full))))
+        (when parsed
+          (let* ((name (car parsed))
+                 (plist (cdr parsed))
+                 (new-entry (if same-mtime entry (list :mtime mtime :name name))))
+            (setq new-entry (plist-put new-entry :mtime mtime))
+            (setq new-entry (plist-put new-entry :name name))
+            (setq new-entry (plist-put new-entry slot plist))
+            (when full
+              (setq new-entry
+                    (plist-put new-entry :metadata
+                               (gptel-agent--plist-without-system plist))))
+            (setf (alist-get file gptel-agent--file-cache nil nil #'string-equal)
+                  new-entry)))
+        parsed))))
+
+(defun gptel-agent--agent-plist (agent-name)
+  "Return the full plist for AGENT-NAME, loading it if needed."
+  (when-let* ((agent-file (alist-get agent-name gptel-agent--agent-files
+                                     nil nil #'equal)))
+    (cdr (gptel-agent--cached-read-file agent-file t))))
+
 ;;;###autoload
 (defun gptel-agent-read-file (agent-file &optional templates metadata-only)
   "Read a preset/agent from AGENT-FILE.
@@ -214,15 +270,20 @@ both non-nil, TEMPLATES will be ignored."
   "Update agent definitions from `gptel-agent-dirs'.
 Returns an alist of (agent-name . file-path)."
   (setq gptel-agent--agents nil)
+  (setq gptel-agent--agent-files nil)
   (let ((agent-files nil))               ; Alist of (agent-name . file-path)
     (mapc (lambda (dir)
-            (dolist (agent-file (cl-delete-if-not #'file-regular-p
-                                                  (directory-files dir 'full)))
-              (pcase-let ((`(,name . ,agent-plist) ;loading only metadata
-                           (gptel-agent-read-file agent-file nil t)))
-                (setf (alist-get name gptel-agent--agents nil t #'equal)
-                      agent-plist)
-                (push (cons name agent-file) agent-files))))
+            (when (file-directory-p dir)
+              (dolist (agent-file (cl-delete-if-not #'file-regular-p
+                                                    (directory-files dir 'full)))
+                (pcase-let ((`(,name . ,agent-plist)
+                             (gptel-agent--cached-read-file agent-file nil)))
+                  (when name
+                    (setf (alist-get name gptel-agent--agents nil t #'equal)
+                          agent-plist)
+                    (setf (alist-get name gptel-agent--agent-files nil t #'equal)
+                          agent-file)
+                    (push (cons name agent-file) agent-files))))))
           gptel-agent-dirs)
     agent-files))
 
@@ -233,8 +294,8 @@ Returns an alist of (agent-name . file-path)."
           (when (file-directory-p dir)
             (dolist (skill-file (directory-files-recursively
                                  dir "SKILL\\.md$" nil nil t))
-              (pcase-let ((`(,name . ,skill-plist) ;loading only metadata
-                           (gptel-agent-read-file skill-file nil t)))
+              (pcase-let ((`(,name . ,skill-plist)
+                           (gptel-agent--cached-read-file skill-file nil)))
                 ;; validating skill definition
                 (if (plist-get skill-plist :description)
                     (setf (alist-get name gptel-agent--skills nil nil #'string-equal)
@@ -319,13 +380,7 @@ AGENTS is an alist of agent names and associated plist as value
 ;;;###autoload
 (defun gptel-agent-update ()
   "Update agents."
-  (let ((agent-files (gptel-agent--update-agents)))
-    (dolist (agent-entry gptel-agent--agents)
-      (let* ((name (car agent-entry))
-             (agent-file (cdr (assoc name agent-files))))
-        (when agent-file
-          (setf (alist-get name gptel-agent--agents nil t #'equal)
-                (cdr (gptel-agent-read-file agent-file nil)))))))
+  (gptel-agent--update-agents)
 
   ;; Update skills and tools
   (gptel-agent--update-skills)
@@ -333,11 +388,11 @@ AGENTS is an alist of agent names and associated plist as value
   (gptel-agent--update-agent-tool)
 
   ;; Apply gptel-agent preset if it exists
-  (when-let* ((gptel-agent-plist (assoc-default "gptel-agent" gptel-agent--agents nil nil)))
+  (when-let* ((gptel-agent-plist (gptel-agent--agent-plist "gptel-agent")))
     (apply #'gptel-make-preset 'gptel-agent gptel-agent-plist))
-  (when-let* ((gptel-plan-plist (assoc-default "gptel-plan" gptel-agent--agents nil nil)))
+  (when-let* ((gptel-plan-plist (gptel-agent--agent-plist "gptel-plan")))
     (apply #'gptel-make-preset 'gptel-plan gptel-plan-plist))
-  (when-let* ((ask-plist (assoc-default "ask" gptel-agent--agents nil nil)))
+  (when-let* ((ask-plist (gptel-agent--agent-plist "ask")))
     (apply #'gptel-make-preset 'ask ask-plist))
   gptel-agent--agents)
 
@@ -411,6 +466,182 @@ Substitution happens in-place in the buffer."
 ;; - Markdown files with YAML frontmatter
 ;; - Org files with PROPERTIES blocks
 
+(defun gptel-agent--parse-yaml-frontmatter (frontmatter-str validator)
+  "Parse FRONTMATTER-STR as YAML and validate with VALIDATOR."
+  (let ((parsed-yaml (yaml-parse-string
+                      frontmatter-str
+                      :object-type 'plist
+                      :object-key-type 'keyword
+                      :sequence-type 'list)))
+    ;; Normalize property types and handle special keys.
+    (let ((tail parsed-yaml))
+      (while tail
+        (let ((key (pop tail))
+              (val (pop tail)))
+          (pcase key
+            ;; :pre and :post are Elisp expressions as strings.
+            ((or :pre :post) (plist-put parsed-yaml key (eval (read val) t)))
+            ;; :parents is a YAML list of strings read as a list.
+            (:parents (plist-put parsed-yaml key
+                                 (mapcar #'intern (ensure-list val))))
+            ;; :context and :tools: If a string (single-line YAML), split
+            ;; by spaces. If already a list (YAML sequence), keep as-is.
+            ((or :context :tools)
+             (plist-put parsed-yaml key
+                        (if (listp val) val (split-string val))))
+            ;; Numeric properties: YAML already handles these correctly
+            ;; (numbers become numbers), so no conversion needed.
+            ;; Boolean properties: YAML true -> t, YAML false -> :false.
+            ((or :stream :track-media :track-response
+                 :org-convert-response)
+             (plist-put parsed-yaml key (unless (eq val :false) val)))
+            ;; Include-reasoning can be true/t, false/nil, "ignore",
+            ;; or a string (buffer name).
+            (:include-reasoning
+             (plist-put parsed-yaml key (pcase val
+                                          (:false nil)
+                                          ("ignore" 'ignore)
+                                          (_ val))))
+            ;; Symbol properties (always a symbol or nil)
+            ((or :use-context :include-tool-results :confirm-tool-calls
+                 :use-tools :cache :model)
+             (plist-put parsed-yaml key
+                        (pcase val
+                          (:false nil)
+                          ((pred stringp) (intern val))
+                          (_ val))))))))
+
+    ;; Validate all keys in the parsed YAML
+    (let ((current-plist parsed-yaml))
+      (while current-plist
+        (let ((key (car current-plist)))
+          (unless (funcall validator key)
+            (error "Invalid frontmatter key: %s" key)))
+        (setq current-plist (cddr current-plist))))
+    parsed-yaml))
+
+(defun gptel-agent--read-markdown-frontmatter (file-path)
+  "Return FILE-PATH's YAML frontmatter without reading the full file."
+  (with-temp-buffer
+    (let* ((size (file-attribute-size (file-attributes file-path)))
+           (offset 0)
+           found
+           frontmatter-end
+           no-frontmatter)
+      (while (and (< offset size) (not found) (not no-frontmatter))
+        (let ((end (min size (+ offset gptel-agent--metadata-read-chunk-size))))
+          (goto-char (point-max))
+          (insert-file-contents file-path nil offset end)
+          (setq offset end))
+        (save-excursion
+          (goto-char (point-min))
+          (if (not (looking-at-p "^---[ \t]*$"))
+              (setq no-frontmatter t)
+            (forward-line 1)
+            (when (re-search-forward "^---[ \t]*$" nil t)
+              (setq found t
+                    frontmatter-end (match-beginning 0))))))
+      (cond
+       (no-frontmatter nil)
+       (found
+        (save-excursion
+          (goto-char (point-min))
+          (forward-line 1)
+          (buffer-substring-no-properties (point) frontmatter-end)))
+       (t
+        (error "Malformed frontmatter in \"%s\" : \
+opening delimiter '---' found but no closing delimiter" file-path))))))
+
+(defun gptel-agent--org-properties-alist-to-plist (props-alist validator)
+  "Convert Org PROPS-ALIST to a validated agent plist."
+  (let (props-plist)
+    (dolist (pair props-alist)
+      (let* ((key-str (downcase (car pair)))
+             (key-sym (intern (concat ":" key-str)))
+             (value (cdr pair)))
+        (pcase key-sym
+          ;; Properties that should remain as lists
+          ((or :context :tools)
+           (setq value (split-string value)))
+          ;; Numeric properties
+          ((or :temperature :max-tokens :num-messages-to-send)
+           (setq value (unless (string-equal value "nil")
+                         (string-to-number value))))
+          ;; Include-reasoning can also be a string (buffer name)
+          (:include-reasoning (setq value (pcase value
+                                            ("nil" nil)
+                                            ("t" t)
+                                            ("ignore" 'ignore)
+                                            (_ value))))
+          ;; Boolean properties
+          ((or :stream :track-media :track-response :org-convert-response)
+           (setq value (pcase value
+                         ("nil" nil)
+                         ("t" t)
+                         (_ value))))
+          ;; Symbol properties
+          ((or :use-context :include-tool-results :confirm-tool-calls
+               :use-tools :cache :model)
+           (setq value (intern value))))
+        ;; Skip CATEGORY property (added automatically by Org)
+        (unless (string-equal key-str "category")
+          ;; Validate the key
+          (unless (funcall validator key-sym)
+            (error "Invalid property key: %s" key-sym))
+          ;; Add to plist
+          (setq props-plist (plist-put props-plist key-sym value)))))
+    (let ((tail props-plist))
+      (while tail
+        (let ((key (pop tail))
+              (val (pop tail)))
+          (pcase key
+            ((or :pre :post) (plist-put props-plist key (eval (read val) t)))
+            (:parents (plist-put props-plist key
+                                 (mapcar #'intern
+                                         (ensure-list (read val)))))))))
+    props-plist))
+
+(defun gptel-agent--read-org-properties-metadata (file-path validator)
+  "Read FILE-PATH's top Org property drawer as metadata only."
+  (with-temp-buffer
+    (let* ((size (file-attribute-size (file-attributes file-path)))
+           (offset 0)
+           found
+           no-properties
+           props-start
+           props-end)
+      (while (and (< offset size) (not found) (not no-properties))
+        (let ((end (min size (+ offset gptel-agent--metadata-read-chunk-size))))
+          (goto-char (point-max))
+          (insert-file-contents file-path nil offset end)
+          (setq offset end))
+        (save-excursion
+          (goto-char (point-min))
+          (while (and (not (eobp)) (looking-at-p "^\\s-*$"))
+            (forward-line 1))
+          (if (not (looking-at-p "^\\s-*:PROPERTIES:\\s-*$"))
+              (setq no-properties t)
+            (setq props-start (line-end-position))
+            (when (re-search-forward "^\\s-*:END:\\s-*$" nil t)
+              (setq found t
+                    props-end (match-beginning 0))))))
+      (cond
+       (no-properties nil)
+       (found
+        (let (props-alist)
+          (save-excursion
+            (goto-char props-start)
+            (while (< (point) props-end)
+              (forward-line 1)
+              (when (looking-at "^\\s-*:\\([^: \t\n]+\\):\\s-*\\(.*\\)$")
+                (push (cons (match-string 1) (match-string 2))
+                      props-alist))))
+          (gptel-agent--org-properties-alist-to-plist
+           (nreverse props-alist) validator)))
+       (t
+        (error "Malformed Org property drawer in \"%s\": \
+opening :PROPERTIES: found but no :END:" file-path))))))
+
 (defun gptel-agent-parse-markdown-frontmatter (file-path &optional validator templates metadata-only)
   "Parse a markdown file with optional YAML frontmatter.
 
@@ -441,97 +672,46 @@ Signals an error if:
     (setq validator #'gptel-agent-validator-default))
   (require 'yaml)
 
-  (with-temp-buffer
-    (insert-file-contents file-path)
+  (if metadata-only
+      (when-let* ((frontmatter (gptel-agent--read-markdown-frontmatter file-path)))
+        (gptel-agent--parse-yaml-frontmatter frontmatter validator))
+    (with-temp-buffer
+      (insert-file-contents file-path)
 
-    ;; Check if file starts with frontmatter delimiter
-    (if (not (looking-at-p "^---[ \t]*$"))
-        ;; No frontmatter
-        (if metadata-only
-            nil  ; Requested only metadata but none exists -> return empty plist
-          ;; Return plist with :system key containing entire file content
+      ;; Check if file starts with frontmatter delimiter
+      (if (not (looking-at-p "^---[ \t]*$"))
+          ;; No frontmatter; return plist with :system key containing entire file
+          ;; content.
           (when templates               ;Apply template substitutions
             (gptel-agent--expand-templates (point-min) templates))
           (list :system (buffer-substring-no-properties
-                         (point-min) (point-max))))
-      ;; Move past opening delimiter
-      (forward-line 1)
-      (let ((frontmatter-start (point)))
+                         (point-min) (point-max)))
+        ;; Move past opening delimiter
+        (forward-line 1)
+        (let ((frontmatter-start (point)))
 
-        ;; Search for closing delimiter
-        (unless (re-search-forward "^---[ \t]*$" nil t)
-          (error "Malformed frontmatter in \"%s\" : \
+          ;; Search for closing delimiter
+          (unless (re-search-forward "^---[ \t]*$" nil t)
+            (error "Malformed frontmatter in \"%s\" : \
 opening delimiter '---' found but no closing delimiter" file-path))
 
-        ;; Extract frontmatter text (from start to beginning of closing delimiter)
-        (let* ((frontmatter-end (match-beginning 0))
-               (frontmatter-str (buffer-substring-no-properties
-                                 frontmatter-start frontmatter-end))
-               (body-start (1+ (match-end 0))))
-
-          ;; Parse YAML frontmatter
-          (let ((parsed-yaml (yaml-parse-string
-                              frontmatter-str
-                              :object-type 'plist
-                              :object-key-type 'keyword
-                              :sequence-type 'list)))
-            ;; Normalize property types and handle special keys.
-            (let ((tail parsed-yaml))
-              (while tail
-                (let ((key (pop tail))
-                      (val (pop tail)))
-                  (pcase key
-                    ;; :pre and :post are Elisp expressions as strings.
-                    ((or :pre :post) (plist-put parsed-yaml key (eval (read val) t)))
-                    ;; :parents is a YAML list of strings read as a list.
-                    (:parents (plist-put parsed-yaml key
-                                         (mapcar #'intern (ensure-list val))))
-                    ;; :context and :tools: If a string (single-line YAML), split
-                    ;; by spaces. If already a list (YAML sequence), keep as-is.
-                    ((or :context :tools)
-                     (plist-put parsed-yaml key
-                                (if (listp val) val (split-string val))))
-                    ;; Numeric properties: YAML already handles these correctly
-                    ;; (numbers become numbers), so no conversion needed.
-                    ;; Boolean properties: YAML true -> t, YAML false -> :false.
-                    ((or :stream :track-media :track-response
-                         :org-convert-response)
-                     (plist-put parsed-yaml key (unless (eq val :false) val)))
-                    ;; Include-reasoning can be true/t, false/nil, "ignore",
-                    ;; or a string (buffer name).
-                    (:include-reasoning
-                     (plist-put parsed-yaml key (pcase val
-                                                  (:false nil)
-                                                  ("ignore" 'ignore)
-                                                  (_ val))))
-                    ;; Symbol properties (always a symbol or nil)
-                    ((or :use-context :include-tool-results :confirm-tool-calls
-                         :use-tools :cache :model)
-                     (plist-put parsed-yaml key
-                                (pcase val
-                                  (:false nil)
-                                  ((pred stringp) (intern val))
-                                  (_ val))))))))
-
-            ;; Validate all keys in the parsed YAML
-            (let ((current-plist parsed-yaml))
-              (while current-plist
-                (let ((key (car current-plist)))
-                  (unless (funcall validator key)
-                    (error "Invalid frontmatter key: %s" key)))
-                (setq current-plist (cddr current-plist))))
-
-            (if metadata-only
-                parsed-yaml
-              (when templates
-                ;; Apply template substitutions in place, then extract body text
-                (gptel-agent--expand-templates body-start templates))
-              ;; Extract the expanded body text
-              (if-let* ((expanded-body (buffer-substring-no-properties
-                                        body-start (point-max)))
-                        ((not (string-blank-p expanded-body))))
-                  (plist-put parsed-yaml :system expanded-body)
-                parsed-yaml))))))))
+          ;; Extract frontmatter text (from start to beginning of closing delimiter)
+          (let* ((frontmatter-end (match-beginning 0))
+                 (frontmatter-str (buffer-substring-no-properties
+                                   frontmatter-start frontmatter-end))
+                 (body-start (1+ (match-end 0)))
+                 (parsed-yaml
+                  (gptel-agent--parse-yaml-frontmatter
+                   frontmatter-str validator)))
+            (when templates
+              ;; Apply template substitutions in place, then extract body text
+              (gptel-agent--expand-templates body-start templates))
+            ;; Extract the expanded body text
+            (if-let* ((expanded-body (buffer-substring-no-properties
+                                      body-start (point-max)))
+                      ((not (string-blank-p expanded-body))))
+                (plist-put parsed-yaml :system expanded-body)
+              parsed-yaml)))))))
 
 (defun gptel-agent-parse-org-properties (file-path &optional validator templates metadata-only)
   "Parse an Org file with properties in a :PROPERTIES: drawer.
@@ -565,84 +745,32 @@ Signals an error if:
   (unless validator
     (setq validator #'gptel-agent-validator-default))
 
-  (with-temp-buffer
-    (insert-file-contents file-path)
-    (let ((org-inhibit-startup t))
-      (delay-mode-hooks (org-mode)))
+  (if metadata-only
+      (gptel-agent--read-org-properties-metadata file-path validator)
+    (with-temp-buffer
+      (insert-file-contents file-path)
+      (let ((org-inhibit-startup t))
+        (delay-mode-hooks (org-mode)))
 
-    ;; Try to get the property block at this position
-    (let ((prop-range (org-get-property-block)))
-      (if (not prop-range)
-          ;; No property block
-          (if metadata-only
-              nil ; Requested only metadata but none exists -> return empty plist (nil)
-            ;; Return body as :system, applying templates only when metadata-only is nil
-            (when templates             ;Apply template substitutions
-              (gptel-agent--expand-templates (point-min) templates))
-            (list :system (buffer-substring-no-properties
-                           (point-min) (point-max))))
-        ;; Extract properties as an alist
-        (let* ((props-alist (org-entry-properties (point-min) 'standard))
-               (props-plist nil)
-               (body-start (save-excursion
-                             (goto-char (cdr prop-range))
-                             (forward-line 1) ; Move past the :END: line
-                             (while (and (not (eobp)) (looking-at-p "^\\s-*$"))
-                               (forward-line 1))
-                             (point))))
-
-          ;; Normalize property types and handle special keys.
-          (dolist (pair props-alist)
-            (let* ((key-str (downcase (car pair)))
-                   (key-sym (intern (concat ":" key-str)))
-                   (value (cdr pair)))
-
-              (pcase key-sym
-                ;; Properties that should remain as lists
-                ((or :context :tools)
-                 (setq value (split-string value)))
-                ;; Numeric properties
-                ((or :temperature :max-tokens :num-messages-to-send)
-                 (setq value (unless (string-equal value "nil")
-                               (string-to-number value))))
-                ;; Include-reasoning can also be a string (buffer name)
-                (:include-reasoning (setq value (pcase value
-                                                  ("nil" nil)
-                                                  ("t" t)
-                                                  ("ignore" 'ignore)
-                                                  (_ value))))
-                ;; Boolean properties
-                ((or :stream :track-media :track-response :org-convert-response)
-                 (setq value (pcase value
-                               ("nil" nil)
-                               ("t" t)
-                               (_ value))))
-                ;; Symbol properties
-                ((or :use-context :include-tool-results :confirm-tool-calls
-                     :use-tools :cache :model)
-                 (setq value (intern value))))
-
-              ;; Skip CATEGORY property (added automatically by Org)
-              (unless (string-equal key-str "category")
-                ;; Validate the key
-                (unless (funcall validator key-sym)
-                  (error "Invalid property key: %s" key-sym))
-
-                ;; Add to plist
-                (setq props-plist (plist-put props-plist key-sym value)))))
-
-          (let ((tail props-plist))
-            (while tail
-              (let ((key (pop tail))
-                    (val (pop tail)))
-                (pcase key
-                  ((or :pre :post) (plist-put props-plist key (eval (read val) t)))
-                  (:parents (plist-put props-plist key
-                                       (mapcar #'intern (ensure-list (read val)))))))))
-
-          ;; If only metadata requested, return the props plist (ignore templates)
-          (if metadata-only
-              props-plist
+      ;; Try to get the property block at this position
+      (let ((prop-range (org-get-property-block)))
+        (if (not prop-range)
+            ;; No property block; return body as :system.
+            (progn
+              (when templates             ;Apply template substitutions
+                (gptel-agent--expand-templates (point-min) templates))
+              (list :system (buffer-substring-no-properties
+                             (point-min) (point-max))))
+          (let* ((props-alist (org-entry-properties (point-min) 'standard))
+                 (props-plist
+                  (gptel-agent--org-properties-alist-to-plist
+                   props-alist validator))
+                 (body-start (save-excursion
+                               (goto-char (cdr prop-range))
+                               (forward-line 1) ; Move past the :END: line
+                               (while (and (not (eobp)) (looking-at-p "^\\s-*$"))
+                                 (forward-line 1))
+                               (point))))
             (when templates
               ;; Apply template substitutions in place, then extract body text
               (gptel-agent--expand-templates body-start templates))

@@ -48,7 +48,8 @@
 (require 'cl-lib)
 
 (declare-function org-escape-code-in-region "org-src")
-(declare-function gptel-agent-read-file "gptel-agent")
+(declare-function gptel-agent--cached-read-file "gptel-agent")
+(declare-function gptel-agent--agent-plist "gptel-agent")
 (declare-function gptel-agent--skills-system-message "gptel-agent")
 (declare-function gptel-agent--agents-tool-message "gptel-agent")
 
@@ -1538,8 +1539,8 @@ the known skills as string ready to be included to the context."
                        full-path))
                (directory-files-recursively skill-dir-expanded ".*")))
              (body (plist-get
-                    (cdr (gptel-agent-read-file
-                          (expand-file-name "SKILL.md" skill-dir)))
+                    (cdr (gptel-agent--cached-read-file
+                          (expand-file-name "SKILL.md" skill-dir) t))
                     :system)))
         (if body
             (let (start)
@@ -1724,7 +1725,7 @@ PROMPT is the detailed prompt instructing the agent on what is required."
                     (cl-etypecase gptel-agent-preset
                       (symbol (gptel-get-preset gptel-agent-preset))
                       (plist gptel-agent-preset))))
-              (cdr (assoc agent-type gptel-agent--agents)))
+              (gptel-agent--agent-plist agent-type))
     (let* ((info (gptel-fsm-info gptel--fsm-last))
            (where (or (plist-get info :tracking-marker)
                       (plist-get info :position)))
