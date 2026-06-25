@@ -1994,12 +1994,15 @@ after %d seconds. The %s agent did not complete in time."
               (sel-idx (overlay-get ov 'gptel-ask--selection))
               (choice (nth sel-idx choices))
               (val (plist-get choice :value)))
-    (gptel-agent--ask-teardown ov)
     ;; Treat the appended custom option (always the last in CHOICES)
     ;; as the free-text sentinel, instead of relying on VAL being \"Custom\".
     (if (= sel-idx (1- (length choices)))
-        (let ((custom-response (read-string "Enter your custom response: ")))
+        (let (custom-response)
+          (unwind-protect
+              (setq custom-response (read-string "Enter your custom response: "))
+            (gptel-agent--ask-teardown ov))
           (funcall callback custom-response))
+      (gptel-agent--ask-teardown ov)
       (funcall callback val))))
 
 (defun gptel-agent--ask-cancel ()
