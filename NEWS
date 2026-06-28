@@ -4,6 +4,11 @@
 
 ** New features and UI changes
 
+- gptel-agent now works over TRAMP.  This means it can run processes on
+  remote servers, grep and edit files and so on without the need to
+  install Emacs or an agent harness.  This involves calling command line
+  programs on the remote, so it requires a POSIX-y remote environment.
+
 - New user option ~gptel-agent-preset~ to specify additional gptel
   settings for sub-agents.  This is a preset that applies to all
   sub-agent calls, before any agent-specific settings.

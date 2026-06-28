@@ -532,6 +532,7 @@ COMMAND is the bash command string to execute."
                 :buffer output-buffer
                 :command (list "bash" "-c" command)
                 :connection-type 'pipe
+                :file-handler t
                 :sentinel
                 (lambda (process _event)
                   (when (memq (process-status process) '(exit signal))
@@ -1041,65 +1042,66 @@ Consider providing more context for the replacement, or a unified diff")
             (error "Error: Could not find old_str \"%s\" in file %s"
                    (truncate-string-to-width old-str 20) path))))
     ;; Replacement by Diff
-    (unless (executable-find "patch")
-      (error "Error: Command \"patch\" not available, cannot apply diffs.\
+    (let ((default-directory (file-name-directory (expand-file-name path))))
+      (unless (executable-find "patch" t)
+        (error "Error: Command \"patch\" not available, cannot apply diffs.\
 Use string replacement instead"))
-    (let* ((out-buf-name (generate-new-buffer-name "*patch-stdout*"))
-           ;; (err-buf-name (generate-new-buffer-name "*patch-stderr*"))
-           (target-file (expand-file-name path))
-           (exit-status -1)             ; Initialize to a known non-zero value
-           (result-output "")
-           ;; (result-error "")
-           )
-      (unwind-protect
-          (let ((default-directory (file-name-directory (expand-file-name path)))
-                (patch-options    '("--forward" "--verbose")))
-
-            (with-temp-message
-                (format "Applying diff to: `%s` with options: %s"
-                        target-file patch-options)
-              (with-temp-buffer
-                (insert new-str-or-diff)
-                ;; Insert trailing newline, required by patch
-                (unless (eq (char-before (point-max)) ?\n)
-                  (goto-char (point-max))
-                  (insert "\n"))
-                (goto-char (point-min))
-                ;; Remove code fences, if present
-                (when (looking-at-p "^ *```diff\n")
-                  (save-excursion
-                    (delete-line)
+      (let* ((out-buf-name (generate-new-buffer-name "*patch-stdout*"))
+             ;; (err-buf-name (generate-new-buffer-name "*patch-stderr*"))
+             (target-file (expand-file-name path))
+             (diff-file (make-nearby-temp-file "gptel-agent-diff-" nil ".patch"))
+             (exit-status -1)           ; Initialize to a known non-zero value
+             ;; (result-error "")
+             (result-output ""))
+        (unwind-protect
+            (let ((patch-options '("--forward" "--verbose")))
+              (with-temp-message
+                  (format "Applying diff to: `%s` with options: %s"
+                          target-file patch-options)
+                (with-temp-buffer
+                  (insert new-str-or-diff)
+                  ;; Insert trailing newline, required by patch
+                  (unless (eq (char-before (point-max)) ?\n)
                     (goto-char (point-max))
-                    (forward-line -1)   ;guaranteed to be at a blank newline
-                    (when (looking-at-p "^ *```") (delete-line))))
-                ;; Fix line numbers in hunk headers
-                (gptel-agent--fix-patch-headers)
+                    (insert "\n"))
+                  (goto-char (point-min))
+                  ;; Remove code fences, if present
+                  (when (looking-at-p "^ *```diff\n")
+                    (save-excursion
+                      (delete-line)
+                      (goto-char (point-max))
+                      (forward-line -1) ;guaranteed to be at a blank newline
+                      (when (looking-at-p "^ *```") (delete-line))))
+                  ;; Fix line numbers in hunk headers
+                  (gptel-agent--fix-patch-headers)
+                  (write-region nil nil diff-file nil 'silent))
 
                 (setq exit-status
-                      (apply #'call-process-region (point-min) (point-max)
-                             "patch" nil (list out-buf-name t) ; stdout/stderr buffer names
-                             nil patch-options))))
+                      (apply #'process-file "patch" (file-local-name diff-file)
+                             (list out-buf-name t) ; stdout/stderr buffer name
+                             nil patch-options)))
 
-            ;; Retrieve content from buffers using their names
-            (when-let* ((stdout-buf (get-buffer out-buf-name)))
-              (when (buffer-live-p stdout-buf)
-                (with-current-buffer stdout-buf
-                  (setq result-output (buffer-string)))))
+              ;; Retrieve content from buffers using their names
+              (when-let* ((stdout-buf (get-buffer out-buf-name)))
+                (when (buffer-live-p stdout-buf)
+                  (with-current-buffer stdout-buf
+                    (setq result-output (buffer-string)))))
 
-            (if (= exit-status 0)
-                (format "Diff successfully applied to %s.
+              (if (= exit-status 0)
+                  (format "Diff successfully applied to %s.
 Patch command options: %s
 Patch STDOUT:\n%s"
-                        target-file patch-options result-output)
-              ;; Signal an Elisp error, which gptel will catch and display.
-              ;; The arguments to 'error' become the error message.
-              (error "Error: Failed to apply diff to %s (exit status %s).
+                          target-file patch-options result-output)
+                ;; Signal an Elisp error, which gptel will catch and display.
+                ;; The arguments to 'error' become the error message.
+                (error "Error: Failed to apply diff to %s (exit status %s).
 Patch command options: %s
 Patch STDOUT:\n%s"
-                     target-file exit-status patch-options
-                     result-output)))
-        (let ((stdout-buf-obj (get-buffer out-buf-name))) ;Clean up
-          (when (buffer-live-p stdout-buf-obj) (kill-buffer stdout-buf-obj)))))))
+                       target-file exit-status patch-options
+                       result-output)))
+          (let ((stdout-buf-obj (get-buffer out-buf-name))) ;Clean up
+            (when (buffer-live-p stdout-buf-obj) (kill-buffer stdout-buf-obj)))
+          (when (file-exists-p diff-file) (delete-file diff-file)))))))
 
 (defun gptel-agent--insert-in-file-preview-setup (arg-values _info)
   "Preview setup for Insert.
@@ -1213,6 +1215,8 @@ error if writing fails.
 PATH, FILENAME, and CONTENT must all be strings."
   (unless (and (stringp path) (stringp filename) (stringp content))
     (error "PATH, FILENAME or CONTENT is not a string, cancelling action"))
+  (when-let* ((remote (file-remote-p default-directory)))
+    (setq path (concat remote path)))
   (let ((full-path (expand-file-name filename path)))
     (condition-case errdata
         (with-temp-buffer
@@ -1233,19 +1237,12 @@ MAX-LINES is the number of lines to keep, defaulting to 50."
   ;; Too large - save to temp file and return truncated info
   (when (> (buffer-size) 20000)
     (let* ((max-lines (or max-lines 50))
-           (temp-dir (expand-file-name "gptel-agent-temp"
-                                       (temporary-file-directory)))
-           (temp-file (expand-file-name
-                       (format "%s-%s-%s.txt"
-                               prefix
-                               (format-time-string "%Y%m%d-%H%M%S")
-                               (random 10000))
-                       temp-dir))
+           (temp-file (make-nearby-temp-file
+                       (format "gptel-agent-%s-%s" prefix
+                               (format-time-string "%Y%m%d-%H%M%S"))
+                       nil ".txt"))
            (orig-size (buffer-size))
            (orig-lines (line-number-at-pos (point-max))))
-      ;; Create temp directory if needed
-      (unless (file-directory-p temp-dir)
-        (make-directory temp-dir t))
       ;; Save full content
       (write-region nil nil temp-file)
       ;; Insert truncated header
@@ -1281,17 +1278,18 @@ Raises an error if PATTERN is empty, PATH is not readable, or the
       (unless (and (file-readable-p path) (file-directory-p path))
         (error "Error: path %s is not readable" path))
     (setq path "."))
-  (unless (executable-find "tree")
+  (unless (executable-find "tree" t)
     (error "Error: Executable `tree` not found.  This tool cannot be used"))
   (let ((full-path (expand-file-name path)))
     (with-temp-buffer
       (let* ((args (list "-l" "-f" "-i" "-I" ".git"
                          "--sort=mtime" "--ignore-case"
-                         "--prune" "-P" pattern full-path))
+                         "--prune" "-P" pattern
+                         (file-local-name full-path)))
              (args (if (natnump depth)
                        (nconc args (list "-L" (number-to-string depth)))
                      args))
-             (exit-code (apply #'call-process "tree" nil t nil args)))
+             (exit-code (apply #'process-file "tree" nil t nil args)))
         (when (/= exit-code 0)
           (goto-char (point-min))
           (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
@@ -1375,11 +1373,15 @@ file.  Results are sorted by modification time."
   (unless (file-readable-p path)
     (error "Error: File or directory %s is not readable" path))
   (let* ((full-path (expand-file-name (substitute-in-file-name path)))
-         (git-root (and (executable-find "git") (locate-dominating-file full-path ".git")))
+         ;; Explicitly set remote to save ourselves multiple file-remote-p
+         ;; checks inside `executable-find'
+         (remote (file-remote-p default-directory))
+         (git-root (and (executable-find "git" remote)
+                        (locate-dominating-file full-path ".git")))
          (grepper (cond
                    (git-root "git")
-                   ((executable-find "rg") "rg")
-                   ((executable-find "grep") "grep")
+                   ((executable-find "rg" remote) "rg")
+                   ((executable-find "grep" remote) "grep")
                    (t (error "Error: ripgrep/grep/git-grep not available, \
 this tool cannot be used")))))
     (with-temp-buffer
@@ -1412,7 +1414,7 @@ this tool cannot be used")))))
                                 ;; "--files-with-matches"
                                 "--max-count=1000"
                                 "--heading" "--line-number" "-e" regex
-                                full-path)))
+                                (file-local-name full-path))))
                ((string= "grep" grepper)
                 (delq nil (list "--recursive"
                                 (and (natnump context-lines)
@@ -1420,8 +1422,8 @@ this tool cannot be used")))))
                                 (and glob (format "--include=%s" glob))
                                 "--max-count=1000"
                                 "--line-number" "--regexp" regex
-                                full-path)))))
-             (exit-code (apply #'call-process grepper nil '(t t) nil args)))
+                                (file-local-name full-path))))))
+             (exit-code (apply #'process-file grepper nil '(t t) nil args)))
         (when (/= exit-code 0)
           (goto-char (point-min))
           (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code)))
@@ -1698,7 +1700,7 @@ ARG-VALUES is a list: (type description prompt)"
                "\n" gptel-agent--hrule
                (propertize (concat (capitalize agent-type) " Task: ")
                            'face 'font-lock-escape-face)
-               (propertize description 'face 'font-lock-doc-face)
+               (propertize (or description "(no description)") 'face 'font-lock-doc-face)
                (propertize
                 " " 'display
                 (if (and (display-graphic-p) (fboundp 'string-pixel-width))
@@ -2431,7 +2433,7 @@ Only one todo can be `in_progress` at a time."
         :status
         ( :type string
           :enum ["pending" "in_progress" "completed"]
-          :description "Task status: pending, in_progress (exactly one), or completed")
+          :description "Task status: pending, in_progress, or completed (exactly one)")
         :activeForm
         ( :type string :minLength 1
           :description "Present continuous form shown during execution (e.g., 'Running tests')")))))
