@@ -174,13 +174,15 @@ The Agent task overlay includes an =[Inspect sub-agent]= action.  Its buffer
 shows the prompt, model rounds, streamed output, tool arguments and results,
 retries, and terminal reason.  Non-completed runs keep this buffer by default; set
 =gptel-agent-keep-failed-run-buffers= to nil to clean them up immediately.
-Repeated similar/cyclic calls are blocked and returned to the model as
-actionable errors; they do not terminate the sub-agent.  After
-=gptel-agent-max-loop-violations= the feedback explicitly directs the model to
-report with the evidence it has.  Web-heavy sub-agents have a separate
-=gptel-agent-max-web-tool-calls= budget; calls beyond it are likewise blocked
-without ending the run.  Round limits still return an explicit inconclusive
-report with the attempts made, reason and confidence.  Web searches default to
+Repeated similar/cyclic calls are skipped once so the model can change
+strategy.  At =gptel-agent-max-loop-violations= the same sub-agent enters a
+tool-free finalization turn: it keeps its complete tool transcript and system
+prompt, interprets the evidence it gathered, and returns the final answer
+itself.  Web-heavy sub-agents have a separate
+=gptel-agent-max-web-tool-calls= budget; exceeding it triggers the same
+synthesis turn instead of returning raw tool results to the parent.  Round
+limits reserve this finalization turn, then return an explicit inconclusive
+report only if the model still produces no usable answer.  Web searches default to
 =gptel-agent-web-search-default-count= results and are capped by
 =gptel-agent-web-search-max-count=.
 

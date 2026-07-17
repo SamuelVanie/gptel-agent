@@ -67,10 +67,16 @@
 
 - Sub-agents now receive an explicit completion contract: negative and
   inconclusive findings are valid outcomes and must include attempts,
-  limitations and confidence.  Repeated/cyclic calls and exhausted web
-  budgets are blocked with actionable feedback but no longer terminate
-  the run, leaving the model able to return its supported or
-  inconclusive result.  The overall round limit remains a final fallback.
+  limitations and confidence.  A repeated/cyclic call is blocked once
+  to allow a strategy change; continued looping or an exhausted web
+  budget now closes exploration and gives the same sub-agent a tool-free
+  finalization turn.  The sub-agent retains its full transcript and must
+  interpret the evidence and return its own final answer; raw tool output
+  is not substituted for an agent response.
+
+- The built-in researcher now prefers the current workspace for codebase
+  tasks, treats sufficient successful results as a stop signal, and uses
+  GitHub repository metadata instead of guessing branch names.
 
 - ~WebSearch~ now defaults to 10 results, supports a configurable bound
   with ~gptel-agent-web-search-default-count~ and

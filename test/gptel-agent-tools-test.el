@@ -49,13 +49,15 @@
   (should-not (gptel-agent--transient-request-error-p
                '(:http-status "400" :error "Stream must be set to true"))))
 
-(ert-deftest gptel-agent-similar-tool-loop-blocks-without-stopping ()
+(ert-deftest gptel-agent-similar-tool-loop-escalates-to-finalization ()
   (with-temp-buffer
     (gptel-agent--reset-tool-call-counts)
-    (let ((gptel-agent-max-tool-repetitions 20)
+    (let ((run (gptel-agent--make-run :tool-calls 0 :web-tool-calls 0))
+          (gptel-agent-max-tool-repetitions 20)
           (gptel-agent-max-similar-tool-calls 4)
           (gptel-agent-max-loop-violations 2)
           results)
+      (setq-local gptel-agent--supervised-run run)
       (dolist (suffix '("one" "two" "three" "four" "five"))
         (push (gptel-agent--detect-repetition
                (list :name "WebSearch"
@@ -63,27 +65,34 @@
                                  (format "alpha beta gamma %s" suffix))))
               results))
       (setq results (nreverse results))
-      (should (plist-get (nth 3 results) :block))
-      (should (plist-get (nth 4 results) :block))
+      (should (plist-get (nth 3 results) :result))
+      (should (string-match-p "strategy warning"
+                              (plist-get (nth 3 results) :result)))
+      (should (plist-get (nth 4 results) :result))
+      (should (string-match-p "return the requested final answer"
+                              (plist-get (nth 4 results) :result)))
+      (should (gptel-agent--run-finalization-reason run))
       (should-not (cl-find-if (lambda (result) (plist-get result :stop))
-                              results))
-      (should (string-match-p
-               "return a negative or inconclusive report now"
-               (plist-get (nth 4 results) :block))))))
+                              results)))))
 
-(ert-deftest gptel-agent-exact-repetition-remains-blocked-not-terminal ()
+(ert-deftest gptel-agent-exact-repetition-forces-finalization ()
   (with-temp-buffer
     (gptel-agent--reset-tool-call-counts)
-    (let ((gptel-agent-max-tool-repetitions 3)
+    (let ((run (gptel-agent--make-run :tool-calls 0 :web-tool-calls 0))
+          (gptel-agent-max-tool-repetitions 3)
           (gptel-agent-max-similar-tool-calls nil)
           results)
+      (setq-local gptel-agent--supervised-run run)
       (dotimes (_ 5)
         (push (gptel-agent--detect-repetition
                '(:name "WebFetch" :args (:url "https://example.com")))
               results))
       (setq results (nreverse results))
-      (should (plist-get (nth 2 results) :block))
-      (should (plist-get (nth 4 results) :block))
+      (should (plist-get (nth 2 results) :result))
+      (should (plist-get (nth 4 results) :result))
+      (should (string-match-p
+               "identical arguments"
+               (gptel-agent--run-finalization-reason run)))
       (should-not (cl-find-if (lambda (result) (plist-get result :stop))
                               results)))))
 
@@ -155,8 +164,11 @@
       (let ((result
              (gptel-agent--detect-repetition
               '(:name "YouTube" :args (:url "https://youtube.test/1")))))
-        (should (plist-get result :block))
-        (should-not (plist-get result :stop)))
+        (should (plist-get result :result))
+        (should (string-match-p "Tool exploration is now closed"
+                                (plist-get result :result)))
+        (should (string-match-p "web tool budget"
+                                (gptel-agent--run-finalization-reason run))))
       (should (= (gptel-agent--run-web-tool-calls run) 3)))))
 
 (ert-deftest gptel-agent-web-parser-exception-completes-callback-once ()
@@ -314,6 +326,64 @@
     (should (string-match-p "limit of 1 model/tool rounds" (car received)))
     (should (string-match-p "Confidence: low" (car received)))))
 
+(ert-deftest gptel-agent-finalization-disables-tools-and-injects-synthesis-turn ()
+  (gptel-agent-test--with-run (run fsm received)
+    (let* ((data '(:input [existing-transcript]
+                  :tools [tool-schema] :tool_choice "required"
+                  :toolConfig (:mode "AUTO")))
+           (info (list :context run :backend 'fake-backend
+                       :data data :tools '(tool-spec)))
+           injected)
+      (setf (gptel-agent--run-description run) "summarize repository"
+            (gptel-agent--run-finalization-reason run)
+            "the same WebFetch call kept repeating.")
+      (cl-letf (((symbol-function 'gptel--parse-list)
+                 (lambda (_backend prompts) (list :parsed prompts)))
+                ((symbol-function 'gptel--inject-prompt)
+                 (lambda (_backend request-data prompt &optional _position)
+                   (setq injected (list request-data prompt)))))
+        (should (gptel-agent--begin-finalization run info)))
+      (should (gptel-agent--run-finalization-requested run))
+      (should-not (plist-get info :tools))
+      (should-not (plist-member (plist-get info :data) :tools))
+      (should-not (plist-member (plist-get info :data) :tool_choice))
+      (should-not (plist-member (plist-get info :data) :toolConfig))
+      (should injected)
+      (should (string-match-p
+               "return your final answer"
+               (prin1-to-string injected)))
+      (with-current-buffer (gptel-agent--run-child-buffer run)
+        (should-not gptel-use-tools)
+        (should-not gptel-tools))
+      ;; Only the model's interpreted response is delivered to the parent.
+      (setf (gptel-fsm-info fsm) (list :context run)
+            (gptel-agent--run-response run) "interpreted final answer")
+      (gptel-agent--handle-task-done fsm)
+      (should (eq (gptel-agent--run-state run) 'completed))
+      (should (= (length received) 1))
+      (should (string-match-p "interpreted final answer" (car received)))
+      (should-not (string-match-p "existing-transcript" (car received))))))
+
+(ert-deftest gptel-agent-finalization-gets-a-turn-at-the-round-limit ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-agent--run-rounds run) 1
+          (gptel-agent--run-finalization-requested run) t)
+    (let ((gptel-agent-max-request-rounds 1)
+          handled)
+      (cl-letf (((symbol-function 'gptel--handle-wait)
+                 (lambda (_fsm) (setq handled t))))
+        (gptel-agent--handle-task-wait fsm))
+      (should handled)
+      (should (gptel-agent--run-finalization-started run))
+      (should (= (gptel-agent--run-rounds run) 2))
+      (should-not received))))
+
+(ert-deftest gptel-agent-researcher-prompt-is-local-first-and-metadata-aware ()
+  (let ((prompt (gptel-agent-test--agent-prompt "researcher")))
+    (should (string-match-p "current workspace is the primary source" prompt))
+    (should (string-match-p "default_branch" prompt))
+    (should (string-match-p "successful result.*stop signal" prompt))))
+
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))
          (global-args (copy-tree (gptel-tool-args global-tool)))
@@ -447,7 +517,14 @@
             (should (eq gptel-include-reasoning t)))
           (should (string-match-p
                    "Inspect sub-agent"
-                   (overlay-get (gptel-agent--run-overlay run) 'msg))))
+                   (overlay-get (gptel-agent--run-overlay run) 'msg)))
+          (let (finalized-run)
+            (cl-letf (((symbol-function 'gptel-agent--begin-finalization)
+                       (lambda (owned-run _info)
+                         (setq finalized-run owned-run))))
+              (funcall (plist-get captured :callback)
+                       '(tool-result) '(:backend test)))
+            (should (eq finalized-run run))))
       (when (and run (gptel-agent--run-active-p run))
         (gptel-agent--run-finish run 'cancelled "cleanup" 'test-cleanup t))
       (when (and run (buffer-live-p (gptel-agent--run-child-buffer run)))

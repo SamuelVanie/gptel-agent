@@ -91,11 +91,12 @@ parameters take precedence over this value."
   :group 'gptel-agent)
 
 (defcustom gptel-agent-max-tool-repetitions 5
-  "Max times a tool can be called with identical arguments before blocking.
+  "Max times a tool can be called identically before forcing synthesis.
 
 When a subagent calls the same tool with the same arguments this many
-times consecutively, the call is blocked with an error message asking the
-LLM to change its approach.  Set to nil to disable repetition detection."
+times consecutively, tool exploration is closed and the same sub-agent gets a
+tool-free turn to synthesize its answer.  Set to nil to disable repetition
+detection."
   :type '(choice (natnum :tag "Max repetitions")
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
@@ -125,11 +126,11 @@ to disable alternating-cycle detection."
   :group 'gptel-agent)
 
 (defcustom gptel-agent-max-loop-violations 2
-  "Number of detected similar/cyclic tool loops before escalating feedback.
+  "Number of detected similar/cyclic loops before forcing synthesis.
 
-Violating calls are always blocked rather than terminating the sub-agent.  At
-this threshold the blocked result explicitly directs the model to stop using
-the stalled approach and return its best supported outcome."
+The first violation skips the redundant call and asks the model to change
+strategy.  At this threshold, the same sub-agent gets a tool-free turn to
+interpret the evidence it gathered and return its final answer."
   :type 'natnum
   :group 'gptel-agent)
 
@@ -137,7 +138,9 @@ the stalled approach and return its best supported outcome."
   "Maximum web tool calls allowed in one supervised sub-agent run.
 
 This counts calls to WebSearch, WebFetch and YouTube, not asynchronous
-callbacks.  Set to nil to disable the separate web-call budget."
+callbacks.  Exceeding the budget closes tool exploration and gives the same
+sub-agent a tool-free synthesis turn.  Set to nil to disable the separate
+web-call budget."
   :type '(choice (natnum :tag "Maximum calls")
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
@@ -245,7 +248,8 @@ from the Agent overlay until the user kills the buffer."
   parent-fsm parent-buffer child-buffer overlay callback
   fsm response response-checkpoint rounds retries retry-timer timeout-timer
   parent-kill-hook terminal-reason started-at configuration
-  tool-calls web-tool-calls)
+  tool-calls web-tool-calls finalization-reason
+  finalization-requested finalization-started)
 
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
@@ -422,22 +426,39 @@ Each entry is a plist with at least :name, :args and :signature.")
                     gptel-agent--tool-call-history)
             nil)))
 
+(defun gptel-agent--request-finalization (message)
+  "Close exploration after MESSAGE and require the same agent to synthesize."
+  (if-let* ((run gptel-agent--supervised-run))
+      (progn
+        (unless (gptel-agent--run-finalization-reason run)
+          (setf (gptel-agent--run-finalization-reason run) message))
+        (list
+         :result
+         (concat
+          "Supervisor recovery notice: this tool call was not run because "
+          message
+          " Tool exploration is now closed. Review all successful and failed "
+          "tool results already in the conversation, interpret that evidence, "
+          "and return the requested final answer now. Do not call another tool.")))
+    ;; Outside a supervised sub-agent there is no owned finalization turn.
+    (list :block (concat "Error: " message " Change strategy before retrying."))))
+
 (defun gptel-agent--loop-violation (message)
-  "Block a stalled tool call with increasingly explicit MESSAGE feedback."
+  "Skip a stalled call with MESSAGE, then force synthesis if it continues."
   (cl-incf gptel-agent--tool-loop-violations)
-  (list
-   :block
-   (if (>= gptel-agent--tool-loop-violations
-           (max 1 gptel-agent-max-loop-violations))
-       (concat message
-               "\nThis stalled call was blocked and will remain blocked. "
-               "Do not try it again. Use evidence already collected, choose "
-               "a materially different approach, or return a negative or "
-               "inconclusive report now.")
-     message)))
+  (if (>= gptel-agent--tool-loop-violations
+          (max 1 gptel-agent-max-loop-violations))
+      (gptel-agent--request-finalization message)
+    (list
+     :result
+     (concat
+      "Supervisor strategy warning: this redundant tool call was skipped. "
+      message
+      " Reassess the results already returned, then either answer the task or "
+      "choose a materially different source or local tool."))))
 
 (defun gptel-agent--detect-repetition (tool-call-info)
-  "Pre-tool-call hook that detects and blocks repeated identical tool calls.
+  "Pre-tool-call hook that detects repeated calls and initiates recovery.
 
 TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
   (let* ((name (plist-get tool-call-info :name))
@@ -470,20 +491,14 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
       ((and run web-tool-p gptel-agent-max-web-tool-calls
             (> (gptel-agent--run-web-tool-calls run)
                gptel-agent-max-web-tool-calls))
-       (list :block
-             (format "Error: The web tool budget of %d calls is exhausted. \
-This call was not run. Do not call another web tool in this task; use the \
-evidence already collected and return the best supported result, including an \
-inconclusive result and confidence when necessary."
-                     gptel-agent-max-web-tool-calls)))
+       (gptel-agent--request-finalization
+        (format "the web tool budget was exhausted after %d calls."
+                gptel-agent-max-web-tool-calls)))
       ((and gptel-agent-max-tool-repetitions
             (>= count gptel-agent-max-tool-repetitions))
-       (list :block
-             (format "Error: You have called tool \"%s\" %d times with identical \
-arguments. This call was blocked because it is not making progress. Do not try \
-it again. Change approach or return the best supported negative/inconclusive \
-report with attempts, limitations, and confidence."
-                     name count)))
+       (gptel-agent--request-finalization
+        (format "tool \"%s\" was requested %d times with identical arguments."
+                name count)))
       ((gptel-agent--alternating-cycle-p gptel-agent--tool-call-history)
        (gptel-agent--loop-violation
         "Error: Tool calls are alternating in a repeated A-B-A-B pattern. \
@@ -2148,6 +2163,52 @@ This is a valid negative/inconclusive task outcome; do not repeat the same deleg
               (format "Partial output:\n%s"
                       (truncate-string-to-width partial 2000 nil nil t))))))
 
+(defun gptel-agent--plist-without-keys (plist keys)
+  "Return PLIST without entries whose keys are members of KEYS."
+  (let (result)
+    (while plist
+      (unless (memq (car plist) keys)
+        (setq result (nconc result (list (car plist) (cadr plist)))))
+      (setq plist (cddr plist)))
+    result))
+
+(defun gptel-agent--begin-finalization (run info)
+  "Give RUN one tool-free synthesis turn using request state INFO.
+
+Tool results have already been injected into the request transcript when this
+function runs.  Removing tool schemas prevents another exploration loop while
+leaving the same sub-agent, system prompt and complete evidence context intact."
+  (when (and (gptel-agent--run-finalization-reason run)
+             (not (gptel-agent--run-finalization-requested run)))
+    (setf (gptel-agent--run-finalization-requested run) t)
+    (let* ((backend (plist-get info :backend))
+           (data (gptel-agent--plist-without-keys
+                  (plist-get info :data)
+                  '(:tools :tool_choice :toolChoice :tool_config :toolConfig)))
+           (prompt
+            (format
+             "Exploration is complete because %s You remain responsible for the assigned task %S. Review the full tool transcript, distinguish successful evidence from failed attempts, and now return your final answer in your required return format. Do not call tools and do not return raw tool output without interpreting it."
+             (gptel-agent--run-finalization-reason run)
+             (gptel-agent--run-description run))))
+      (plist-put info :tools nil)
+      (plist-put info :data data)
+      (when (buffer-live-p (gptel-agent--run-child-buffer run))
+        (with-current-buffer (gptel-agent--run-child-buffer run)
+          (setq-local gptel-use-tools nil
+                      gptel-tools nil)
+          ;; The synthetic tool result already requests synthesis, so a backend
+          ;; prompt-injection incompatibility is recoverable rather than fatal.
+          (condition-case err
+              (gptel--inject-prompt
+               backend data (gptel--parse-list backend (list prompt)))
+            (error
+             (gptel-agent--run-log
+              run "FINALIZATION PROMPT FALLBACK error=%S" err)))))
+      (gptel-agent--run-log
+       run "FINALIZATION requested; tools disabled: %s"
+       (gptel-agent--run-finalization-reason run))
+      t)))
+
 (defun gptel-agent--transient-request-error-p (info)
   "Return non-nil when failed request INFO is safe to retry."
   (let* ((text (gptel-agent--error-text info))
@@ -2255,9 +2316,14 @@ This is a valid negative/inconclusive task outcome; do not repeat the same deleg
 (defun gptel-agent--handle-task-wait (fsm)
   "Send the next request for FSM while enforcing RUN's round budget."
   (let* ((run (gptel-agent--run-from-fsm fsm))
-         (retryp (and run (eq (gptel-agent--run-state run) 'retry-wait))))
+         (retryp (and run (eq (gptel-agent--run-state run) 'retry-wait)))
+         (finalization-turn-p
+          (and run
+               (gptel-agent--run-finalization-requested run)
+               (not (gptel-agent--run-finalization-started run)))))
     (when (and run (gptel-agent--run-active-p run))
       (if (and (not retryp)
+               (not finalization-turn-p)
                gptel-agent-max-request-rounds
                (>= (gptel-agent--run-rounds run)
                    gptel-agent-max-request-rounds))
@@ -2271,6 +2337,8 @@ This is a valid negative/inconclusive task outcome; do not repeat the same deleg
           (cl-incf (gptel-agent--run-rounds run))
           (setf (gptel-agent--run-response-checkpoint run)
                 (length (gptel-agent--run-response run))))
+        (when finalization-turn-p
+          (setf (gptel-agent--run-finalization-started run) t))
         (gptel-agent--run-log
          run "%s round %d/%s"
          (if retryp "RETRYING REQUEST" "REQUEST")
@@ -2510,6 +2578,8 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                    :parent-buffer parent-buffer :child-buffer child-buffer
                    :callback main-cb :response "" :response-checkpoint 0
                    :rounds 0 :retries 0 :tool-calls 0 :web-tool-calls 0
+                   :finalization-reason nil :finalization-requested nil
+                   :finalization-started nil
                    :started-at (float-time))))
         (condition-case err
             (progn
@@ -2602,6 +2672,8 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                                  (unless (plist-get info :tracking-marker)
                                    (plist-put info :tracking-marker where))
                                  (gptel--display-tool-calls calls info))
+                                (`(tool-result . ,_results)
+                                 (gptel-agent--begin-finalization run info))
                                 ;; ERRS, DONE and ABRT handlers own terminal
                                 ;; completion.  Other callback events are data.
                                 (_ nil))
