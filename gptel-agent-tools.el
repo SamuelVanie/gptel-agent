@@ -2470,8 +2470,11 @@ button for its live diagnostic buffer."
                 (cons (1- (point)) (point))
               (cons (line-beginning-position) (line-end-position)))))
          (ov (make-overlay (car bounds) (cdr bounds) nil t))
+         (configuration (and run (gptel-agent--run-configuration run)))
          (model
-          (propertize (concat (gptel--model-name gptel-model))
+          (propertize (concat (gptel--model-name
+                               (or (plist-get configuration :model)
+                                   gptel-model)))
                       'face 'font-lock-comment-face))
          (msg (concat
                (unless (eq (char-after (car bounds)) 10) "\n")

@@ -518,6 +518,12 @@
           (should (string-match-p
                    "Inspect sub-agent"
                    (overlay-get (gptel-agent--run-overlay run) 'msg)))
+          (should (string-match-p
+                   "preset-model"
+                   (overlay-get (gptel-agent--run-overlay run) 'msg)))
+          (should-not (string-match-p
+                       "test-model"
+                       (overlay-get (gptel-agent--run-overlay run) 'msg)))
           (let (finalized-run)
             (cl-letf (((symbol-function 'gptel-agent--begin-finalization)
                        (lambda (owned-run _info)
