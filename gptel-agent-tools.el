@@ -1955,6 +1955,29 @@ the known skills as string ready to be included to the context."
       (pop-to-buffer (gptel-agent--run-child-buffer run))
     (user-error "This sub-agent diagnostic buffer is no longer available")))
 
+(defun gptel-agent--confirm-child-buffer-kill ()
+  "Confirm before killing the current buffer while its sub-agent is active."
+  (let ((run gptel-agent--supervised-run))
+    (or (not (and run (gptel-agent--run-active-p run)))
+        (y-or-n-p
+         (format "Sub-agent %s is still running; kill its buffer and cancel the task? "
+                 (gptel-agent--run-agent run))))))
+
+(defun gptel-agent--handle-child-buffer-kill ()
+  "Cancel the active sub-agent owned by the current buffer before it is killed."
+  (when-let* ((run gptel-agent--supervised-run))
+    (when (gptel-agent--run-active-p run)
+      ;; The outer `kill-buffer' owns buffer destruction.  Retaining the buffer
+      ;; here prevents `gptel-agent--run-finish' from recursively killing it.
+      (let ((gptel-agent-keep-failed-run-buffers t))
+        (gptel-agent--run-finish
+         run 'cancelled
+         "Error: Sub-agent request buffer was killed; its task was cancelled."
+         'child-buffer-killed)))
+    (unless (gptel-agent--run-active-p run)
+      (gptel-agent--task-cleanup-overlay
+       (gptel-agent--run-overlay run)))))
+
 (defun gptel-agent--run-inspect-button (run)
   "Return a clickable string that displays RUN's diagnostic buffer."
   (propertize
@@ -2628,18 +2651,10 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                 (with-current-buffer parent-buffer
                   (add-hook 'kill-buffer-hook parent-kill-hook nil t)))
               (with-current-buffer child-buffer
-                (add-hook
-                 'kill-buffer-hook
-                 (lambda ()
-                   (when (gptel-agent--run-active-p run)
-                     (gptel-agent--run-finish
-                      run 'failed
-                      "Error: Sub-agent request buffer was killed."
-                      'child-buffer-killed))
-                   (unless (gptel-agent--run-active-p run)
-                     (gptel-agent--task-cleanup-overlay
-                      (gptel-agent--run-overlay run))))
-                 nil t))
+                (add-hook 'kill-buffer-query-functions
+                          #'gptel-agent--confirm-child-buffer-kill nil t)
+                (add-hook 'kill-buffer-hook
+                          #'gptel-agent--handle-child-buffer-kill nil t))
               (when gptel-agent-task-timeout
                 (setf (gptel-agent--run-timeout-timer run)
                       (run-at-time

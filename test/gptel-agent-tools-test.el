@@ -249,6 +249,55 @@
     (should (string-match-p "Inspect sub-agent" link))
     (should (text-property-not-all 0 (length link) 'keymap nil link))))
 
+(ert-deftest gptel-agent-active-child-buffer-kill-requires-confirmation ()
+  (let* ((child (generate-new-buffer " *gptel-agent-kill-guard*"))
+         (run (gptel-agent--make-run
+               :id "kill-guard" :state 'requesting :agent "researcher"
+               :child-buffer child)))
+    (unwind-protect
+        (with-current-buffer child
+          (setq-local gptel-agent--supervised-run run)
+          (add-hook 'kill-buffer-query-functions
+                    #'gptel-agent--confirm-child-buffer-kill nil t)
+          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
+            (should-not (kill-buffer child)))
+          (should (buffer-live-p child)))
+      (when (buffer-live-p child)
+        (with-current-buffer child
+          (setq-local kill-buffer-query-functions nil))
+        (kill-buffer child)))))
+
+(ert-deftest gptel-agent-killing-active-child-cancels-owned-request ()
+  (let* ((parent (generate-new-buffer " *gptel-agent-kill-parent*"))
+         (child (generate-new-buffer " *gptel-agent-kill-child*"))
+         delivered aborted-buffer
+         (run (gptel-agent--make-run
+               :id "kill-child" :state 'requesting :agent "researcher"
+               :parent-buffer parent :child-buffer child
+               :callback (lambda (result) (setq delivered result)))))
+    (unwind-protect
+        (progn
+          (with-current-buffer child
+            (setq-local gptel-agent--supervised-run run)
+            (add-hook 'kill-buffer-query-functions
+                      #'gptel-agent--confirm-child-buffer-kill nil t)
+            (add-hook 'kill-buffer-hook
+                      #'gptel-agent--handle-child-buffer-kill nil t))
+          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                    ((symbol-function 'gptel-agent--run-abort-transport)
+                     (lambda (owned-run)
+                       (setq aborted-buffer
+                             (gptel-agent--run-child-buffer owned-run)))))
+            (should (kill-buffer child)))
+          (should (eq (gptel-agent--run-state run) 'cancelled))
+          (should (eq aborted-buffer child))
+          (should (string-match-p "task was cancelled" delivered)))
+      (when (buffer-live-p child)
+        (with-current-buffer child
+          (setq-local kill-buffer-query-functions nil))
+        (kill-buffer child))
+      (when (buffer-live-p parent) (kill-buffer parent)))))
+
 (ert-deftest gptel-agent-run-finishes-exactly-once ()
   (gptel-agent-test--with-run (run _fsm received)
     (should (gptel-agent--run-finish run 'completed "first" 'done))
