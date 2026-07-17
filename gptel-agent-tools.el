@@ -3119,7 +3119,7 @@ Consider using the more granular tools \"Insert\" or \"Edit\" first."
 - Returns matching file paths at all depths sorted by modification time.
   Limit the depth of the search by providing the `depth` argument.
 - When you are doing an open ended search that may require multiple rounds
-  of globbing and grepping, use the \"task\" tool instead
+  of globbing and grepping, use the \"Agent\" tool instead
 - You can call multiple tools in a single response.  It is always better to
   speculatively perform multiple searches in parallel if they are potentially useful."
  :function #'gptel-agent--glob

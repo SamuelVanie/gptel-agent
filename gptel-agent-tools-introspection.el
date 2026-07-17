@@ -57,9 +57,14 @@
 (defun gptel-agent--introspect-symbol-in-manual (symbol)
   "Return the Info documentation for SYMBOL, if it exists."
   (when-let* ((symbol (intern-soft symbol)))
-    (save-window-excursion
+    (let* (buf
+           (remember (lambda (buffer alist)
+                       (display-buffer-no-window (setq buf buffer) alist)))
+           (display-buffer-overriding-action
+            `(,remember (allow-no-window . t))))
       (info-lookup-symbol symbol #'emacs-lisp-mode)
-      (buffer-substring-no-properties (point-min) (point-max)))))
+      (with-current-buffer buf
+        (buffer-substring-no-properties (point-min) (point-max))))))
 
 (defun gptel-agent--introspect-library-source (library-name)
   "Return the source code of LIBRARY-NAME as a string."
