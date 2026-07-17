@@ -184,6 +184,13 @@ report with the attempts made, reason and confidence.  Web searches default to
 =gptel-agent-web-search-default-count= results and are capped by
 =gptel-agent-web-search-max-count=.
 
+=WebFetch= handles HTML and common textual content types directly.  HTML uses
+readability extraction with full-page and decoded-body fallbacks; binary or
+client-rendered resources return an explicit limitation.  Responses default to
+=gptel-agent-web-fetch-max-chars= characters and request timeout is controlled
+by =gptel-agent-web-request-timeout=.  The tool's optional =max_chars= argument
+can raise the per-call output size for a known large textual resource.
+
 #+html: </details>
 #+html: <details><summary>
 **** Agents from Markdown files

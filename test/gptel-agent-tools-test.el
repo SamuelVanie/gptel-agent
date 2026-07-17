@@ -5,6 +5,8 @@
 (require 'gptel-agent)
 
 (defvar url-http-end-of-headers)
+(defvar url-http-content-type)
+(defvar url-http-response-status)
 
 (defun gptel-agent-test--agent-prompt (name)
   "Return the built-in agent prompt named NAME."
@@ -171,6 +173,63 @@
        "Test fetch"))
     (should (= (length results) 1))
     (should (string-match-p "could not be parsed" (car results)))))
+
+(ert-deftest gptel-agent-web-fetch-preserves-json-and-plain-text ()
+  (let (result)
+    (with-temp-buffer
+      (insert "{\"default_branch\":\"master\"}")
+      (let ((url-http-end-of-headers (point-min))
+            (url-http-content-type "application/json; charset=utf-8"))
+        (gptel-agent--web-fetch-callback
+         (lambda (value) (setq result value)) nil)))
+    (should (equal result "{\"default_branch\":\"master\"}"))))
+
+(ert-deftest gptel-agent-web-fetch-falls-back-to-full-html-render ()
+  (let (result)
+    (with-temp-buffer
+      (insert "<html><body>source</body></html>")
+      (let ((url-http-end-of-headers (point-min))
+            (url-http-content-type "text/html; charset=utf-8"))
+        (cl-letf (((symbol-function 'libxml-parse-html-region)
+                   (lambda (&rest _) '(html (body "full"))))
+                  ((symbol-function 'eww-score-readability) #'ignore)
+                  ((symbol-function 'eww-highest-readability)
+                   (lambda (_dom) '(p "tiny")))
+                  ((symbol-function 'shr-insert-document)
+                   (lambda (dom)
+                     (insert (if (eq (car dom) 'p)
+                                 "tiny"
+                               "Full rendered page content")))))
+          (gptel-agent--web-fetch-callback
+           (lambda (value) (setq result value)) nil))))
+    (should (equal result "Full rendered page content"))))
+
+(ert-deftest gptel-agent-web-fetch-rejects-binary-content-clearly ()
+  (let (result)
+    (with-temp-buffer
+      (insert "%PDF binary data")
+      (let ((url-http-end-of-headers (point-min))
+            (url-http-content-type "application/pdf"))
+        (gptel-agent--web-fetch-callback
+         (lambda (value) (setq result value)) nil)))
+    (should (string-match-p "unsupported binary content-type application/pdf"
+                            result))))
+
+(ert-deftest gptel-agent-web-fetch-bounds-large-responses ()
+  (let ((result (gptel-agent--web-fetch-limit (make-string 1500 ?x) 1000)))
+    (should (string-prefix-p (make-string 1000 ?x) result))
+    (should (string-match-p "truncated 500 remaining characters" result))))
+
+(ert-deftest gptel-agent-web-request-error-includes-response-details ()
+  (with-temp-buffer
+    (insert "Not found on this branch")
+    (let ((url-http-end-of-headers (point-min))
+          (url-http-content-type "text/plain")
+          (url-http-response-status 404))
+      (let ((message (gptel-agent--web-request-error
+                      "Fetch for test" '(error http 404))))
+        (should (string-match-p "HTTP 404, content-type text/plain" message))
+        (should (string-match-p "Not found on this branch" message))))))
 
 (ert-deftest gptel-agent-inspect-link-is-clickable ()
   (let* ((run (gptel-agent--make-run))

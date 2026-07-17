@@ -52,6 +52,13 @@
 
 ** Notable bug fixes
 
+- ~WebFetch~ now handles textual responses according to their content
+  type instead of sending JSON, source files and plain text through the
+  HTML readability parser.  HTML extraction falls back to a full-page
+  render or the decoded response body, HTTP failures include status and
+  response excerpts, and oversized output is bounded with an explicit
+  truncation notice.
+
 - Restored ~gptel-agent-preset~ application for sub-agent requests.  The
   option is read from the owning parent buffer and applied independently
   before per-agent settings, preserving named-preset parents,

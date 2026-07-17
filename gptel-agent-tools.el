@@ -54,6 +54,8 @@
 (declare-function gptel-agent--agents-tool-message "gptel-agent")
 
 (defvar url-http-end-of-headers)
+(defvar url-http-content-type)
+(defvar url-http-response-status)
 (defvar gptel-agent--agents)
 (defvar gptel-agent--skills)
 (defvar gptel-agent--enabled-skills)
@@ -150,6 +152,19 @@ callbacks.  Set to nil to disable the separate web-call budget."
 
 Keeping this bounded prevents a single search-engine response from flooding
 the model context."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-web-request-timeout 30
+  "Timeout in seconds for each WebSearch or WebFetch request."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-web-fetch-max-chars 50000
+  "Default maximum characters returned by one WebFetch call.
+
+Longer textual responses are truncated with an explicit notice so a single
+page cannot consume the sub-agent context."
   :type 'natnum
   :group 'gptel-agent)
 
@@ -691,7 +706,7 @@ COMMAND is the bash command string to execute."
 Call TOOL-CB if there is an error or a timeout.  TOOL-CB and ARGS are
 passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  The tool
 callback is guaranteed to run at most once, including parser exceptions."
-  (let* ((timeout 30) timer done proc-buffer
+  (let* ((timeout gptel-agent-web-request-timeout) timer done proc-buffer
          (inherit-process-coding-system t)
          (finish
           (lambda (result)
@@ -700,26 +715,31 @@ callback is guaranteed to run at most once, including parser exceptions."
               (when timer (cancel-timer timer))
               (funcall tool-cb result)))))
     (condition-case err
-        (setq
-         proc-buffer
-         (url-retrieve
-          url
-          (lambda (status)
-            (unwind-protect
-                (if-let* ((request-error (plist-get status :error)))
-                    (funcall finish
-                             (format "Error: %s failed with error: %S"
-                                     failed-msg request-error))
-                  (condition-case parse-error
-                      (apply url-cb finish args)
-                    (error
-                     (funcall
-                      finish
-                      (format "Error: %s could not be parsed: %S"
-                              failed-msg parse-error)))))
-              (when (buffer-live-p (current-buffer))
-                (kill-buffer (current-buffer)))))
-          nil 'silent))
+        (let ((url-request-extra-headers
+               (append
+                '(("Accept" . "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5")
+                  ("Accept-Language" . "en-US,en;q=0.8"))
+                url-request-extra-headers)))
+          (setq
+           proc-buffer
+           (url-retrieve
+            url
+            (lambda (status)
+              (unwind-protect
+                  (if-let* ((request-error (plist-get status :error)))
+                      (funcall finish
+                               (gptel-agent--web-request-error
+                                failed-msg request-error))
+                    (condition-case parse-error
+                        (apply url-cb finish args)
+                      (error
+                       (funcall
+                        finish
+                        (format "Error: %s could not be parsed: %S"
+                                failed-msg parse-error)))))
+                (when (buffer-live-p (current-buffer))
+                  (kill-buffer (current-buffer)))))
+            nil 'silent)))
       (error
        (funcall finish
                 (format "Error: %s could not start: %S" failed-msg err))))
@@ -736,6 +756,54 @@ callback is guaranteed to run at most once, including parser exceptions."
                                  failed-msg timeout))))
              proc-buffer)))
     proc-buffer))
+
+(defun gptel-agent--web-response-body ()
+  "Return the current URL response body as decoded text."
+  (let* ((start (if (and (boundp 'url-http-end-of-headers)
+                         url-http-end-of-headers)
+                    (if (markerp url-http-end-of-headers)
+                        (marker-position url-http-end-of-headers)
+                      url-http-end-of-headers)
+                  (save-excursion
+                    (goto-char (point-min))
+                    (if (re-search-forward "\r?\n\r?\n" nil t)
+                        (point)
+                      (point-min)))))
+         (raw (buffer-substring-no-properties start (point-max)))
+         (content-type (and (boundp 'url-http-content-type)
+                            url-http-content-type))
+         (coding
+          (and content-type
+               (string-match
+                "charset=[\"']?\\([^;\"'[:space:]]+\\)" content-type)
+               (coding-system-from-name (match-string 1 content-type)))))
+    (if (multibyte-string-p raw)
+        raw
+      (decode-coding-string
+       raw (or coding (detect-coding-string raw t) 'utf-8) t))))
+
+(defun gptel-agent--web-request-error (failed-msg request-error)
+  "Format a useful FAILED-MSG diagnostic for REQUEST-ERROR."
+  (let* ((type (and (boundp 'url-http-content-type) url-http-content-type))
+         (body (ignore-errors (string-trim (gptel-agent--web-response-body))))
+         (excerpt (and body (not (string-empty-p body))
+                       (truncate-string-to-width body 500 nil nil t))))
+    (format "Error: %s failed%s%s with error: %S%s"
+            failed-msg
+            (if (and (boundp 'url-http-response-status)
+                     url-http-response-status)
+                (format " (HTTP %s" url-http-response-status)
+              "")
+            (cond
+             ((and (boundp 'url-http-response-status)
+                   url-http-response-status type)
+              (format ", content-type %s)" type))
+             ((and (boundp 'url-http-response-status)
+                   url-http-response-status) ")")
+             (type (format " (content-type %s)" type))
+             (t ""))
+            request-error
+            (if excerpt (format "\nResponse excerpt:\n%s" excerpt) ""))))
 
 ;;;; Web search
 (defun gptel-agent--shr-next-link ()
@@ -835,24 +903,104 @@ COUNT is the already normalized requested result count."
             :results results)))))
 
 ;;;; Read URLs
-(defun gptel-agent--read-url (tool-cb url)
-  "Fetch URL text and call TOOL-CB with it."
+(defun gptel-agent--web-fetch-limit (text max-chars)
+  "Limit fetched TEXT to MAX-CHARS with an explicit truncation notice."
+  (let ((max-chars (max 1000 (or max-chars
+                                 gptel-agent-web-fetch-max-chars))))
+    (if (<= (length text) max-chars)
+        text
+      (concat
+       (substring text 0 max-chars)
+       (format "\n\n[WebFetch truncated %d remaining characters. Fetch a more specific URL or request a larger max_chars value if needed.]"
+               (- (length text) max-chars))))))
+
+(defun gptel-agent--web-binary-content-p (content-type)
+  "Return non-nil when CONTENT-TYPE is not usefully representable as text."
+  (and content-type
+       (string-match-p
+        (rx string-start
+            (or "image/" "audio/" "video/" "font/"
+                "application/pdf" "application/zip"
+                "application/octet-stream"))
+        content-type)))
+
+(defun gptel-agent--web-html-content-p (content-type body)
+  "Return non-nil when CONTENT-TYPE or BODY identifies an HTML document."
+  (or (and content-type
+           (string-match-p (rx (or "text/html" "application/xhtml+xml"))
+                           content-type))
+      (and (or (null content-type) (string-empty-p content-type))
+           (string-match-p
+            (rx string-start (* space)
+                (or "<!doctype html" "<html" "<head" "<body"))
+            (downcase body)))))
+
+(defun gptel-agent--web-render-dom (dom)
+  "Render DOM as plain text with SHR."
+  (with-temp-buffer
+    (let ((shr-use-colors nil)
+          (shr-use-fonts nil))
+      (shr-insert-document dom)
+      (string-trim (buffer-substring-no-properties (point-min) (point-max))))))
+
+(defun gptel-agent--web-render-html (body)
+  "Render HTML BODY, falling back when readability extraction is unsuitable."
+  (condition-case parse-error
+      (with-temp-buffer
+        (insert body)
+        (let* ((dom (libxml-parse-html-region (point-min) (point-max)))
+               (full-dom (copy-tree dom))
+               readable)
+          (condition-case nil
+              (progn
+                (eww-score-readability dom)
+                (setq readable
+                      (gptel-agent--web-render-dom
+                       (eww-highest-readability dom))))
+            (error nil))
+          (if (and readable (>= (length readable) 200))
+              readable
+            (let ((full (gptel-agent--web-render-dom full-dom)))
+              (if (string-empty-p full)
+                  (or readable "")
+                full)))))
+    (error
+     (concat
+      (format "[HTML parsing failed (%S); returning the decoded response body.]\n\n"
+              parse-error)
+      body))))
+
+(defun gptel-agent--web-fetch-callback (cb max-chars)
+  "Parse the current WebFetch response and call CB.
+
+MAX-CHARS bounds the returned text."
+  (let* ((content-type
+          (downcase (or (and (boundp 'url-http-content-type)
+                             url-http-content-type)
+                        "")))
+         (body (gptel-agent--web-response-body))
+         (text
+          (cond
+           ((gptel-agent--web-binary-content-p content-type)
+            (format "Error: WebFetch received unsupported binary content-type %s. Use a specialized tool for this resource."
+                    content-type))
+           ((gptel-agent--web-html-content-p content-type body)
+            (gptel-agent--web-render-html body))
+           (t (string-trim body)))))
+    (funcall
+     cb
+     (if (string-empty-p text)
+         (format "Error: WebFetch received no readable text (content-type %s). The page may require JavaScript, authentication, or a specialized client."
+                 (if (string-empty-p content-type) "unknown" content-type))
+       (gptel-agent--web-fetch-limit text max-chars)))))
+
+(defun gptel-agent--read-url (tool-cb url &optional max-chars)
+  "Fetch URL text and call TOOL-CB with it.
+
+MAX-CHARS optionally overrides `gptel-agent-web-fetch-max-chars'."
   (gptel-agent--fetch-with-timeout
-   url
-   (lambda (cb)
-     (goto-char (point-min)) (forward-paragraph)
-     (condition-case errdata
-         (let ((dom (libxml-parse-html-region (point) (point-max))))
-           (with-temp-buffer
-             (eww-score-readability dom)
-             (shr-insert-document (eww-highest-readability dom))
-             (decode-coding-region (point-min) (point-max) 'utf-8)
-             (funcall
-              cb (buffer-substring-no-properties
-                  (point-min) (point-max)))))
-       (error (funcall cb (format "Error: Request failed with error data:\n%S"
-                                  errdata)))))
-   tool-cb (format "Fetch for \"%s\"" url)))
+   url #'gptel-agent--web-fetch-callback
+   tool-cb (format "Fetch for \"%s\"" url) max-chars))
 
 ;;;; Fetch youtube transcript
 (defun gptel-agent--yt-parse-captions (xml-string)
@@ -2813,11 +2961,21 @@ Use WebFetch to read a selected result.  It may not handle JavaScript-only pages
  :name "WebFetch"
  :description "Fetch and read the contents of a URL.
 
-- Returns the text of the URL (not HTML) formatted for reading.
-- Request times out after 30 seconds."
+- Handles HTML, JSON, source code, Markdown, Org, XML, and other textual responses according to content type.
+- HTML is reduced with readability extraction, with full-page and decoded-body fallbacks when extraction fails.
+- Binary resources and pages with no server-rendered text return an actionable error; JavaScript is not executed.
+- Output is bounded to protect context. Use `max_chars` only when more of a large response is needed.
+- One retry is reasonable for a timeout, network failure, HTTP 429, or HTTP 5xx. Do not retry the same URL after a deterministic HTTP 4xx; correct the URL, authentication, or access method.
+- Request timeout is controlled by `gptel-agent-web-request-timeout`."
  :args '(( :name "url"
            :type "string"
-           :description "The URL to read"))
+           :description "The URL to read")
+         ( :name "max_chars"
+           :type integer
+           :minimum 1000
+           :maximum 200000
+           :optional t
+           :description "Maximum returned characters (default 50000). Increase only for a known large textual resource."))
  :async t
  :include t
  :category "gptel-agent")
