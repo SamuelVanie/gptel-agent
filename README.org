@@ -164,10 +164,15 @@ and malformed-request errors are not retried.
 
 The Agent task overlay includes an =[Inspect sub-agent]= action.  Its buffer
 shows the prompt, model rounds, streamed output, tool arguments and results,
-retries, and terminal reason.  Failed runs keep this buffer by default; set
+retries, and terminal reason.  Non-completed runs keep this buffer by default; set
 =gptel-agent-keep-failed-run-buffers= to nil to clean them up immediately.
 Repeated similar/cyclic calls stop after =gptel-agent-max-loop-violations=, and
 web-heavy sub-agents have a separate =gptel-agent-max-web-tool-calls= budget.
+Safety stops and round limits are returned as explicit inconclusive reports
+with the attempts made, reason and confidence; they are not treated as a
+requirement to manufacture a positive answer.  Web searches default to
+=gptel-agent-web-search-default-count= results and are capped by
+=gptel-agent-web-search-max-count=.
 
 #+html: </details>
 #+html: <details><summary>

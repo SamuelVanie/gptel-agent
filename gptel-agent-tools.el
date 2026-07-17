@@ -25,8 +25,8 @@
 ;; - "Bash"           : Execute a Bash command.
 ;;
 ;; Web:
-;; - "WebSearch"             : Search the web for the first five results to a query.
-;; - "Read"               : Fetch and read the contents of a URL.
+;; - "WebSearch"     : Search the web and return a bounded result set with coverage metadata.
+;; - "WebFetch"       : Fetch and read the contents of a URL.
 ;; - "YouTube"       : Find the description and video transcript for a youtube video.
 ;;
 ;; Filesystem:
@@ -139,6 +139,19 @@ callbacks.  Set to nil to disable the separate web-call budget."
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
 
+(defcustom gptel-agent-web-search-default-count 10
+  "Default number of results returned by WebSearch."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-web-search-max-count 30
+  "Maximum number of results returned by one WebSearch call.
+
+Keeping this bounded prevents a single search-engine response from flooding
+the model context."
+  :type 'natnum
+  :group 'gptel-agent)
+
 (defcustom gptel-agent-task-timeout 700
   "Timeout in seconds for sub-agent tasks.
 
@@ -217,6 +230,9 @@ from the Agent overlay until the user kills the buffer."
   fsm response response-checkpoint rounds retries retry-timer timeout-timer
   parent-kill-hook terminal-reason started-at configuration
   tool-calls web-tool-calls)
+
+(defconst gptel-agent--safety-stop-prefix "gptel-agent safety stop: "
+  "Prefix used to distinguish supervised safety stops from request errors.")
 
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
@@ -398,7 +414,8 @@ Each entry is a plist with at least :name, :args and :signature.")
   (cl-incf gptel-agent--tool-loop-violations)
   (if (>= gptel-agent--tool-loop-violations
           (max 1 gptel-agent-max-loop-violations))
-      (list :stop t :stop-reason message)
+      (list :stop t
+            :stop-reason (concat gptel-agent--safety-stop-prefix message))
     (list :block message)))
 
 (defun gptel-agent--detect-repetition (tool-call-info)
@@ -437,14 +454,18 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
                gptel-agent-max-web-tool-calls))
        (list :stop t
              :stop-reason
-             (format "Agent stopped after exceeding the web tool budget (%d calls)."
-                     gptel-agent-max-web-tool-calls)))
+             (concat
+              gptel-agent--safety-stop-prefix
+              (format "web tool budget exceeded (%d calls)."
+                      gptel-agent-max-web-tool-calls))))
       ((and gptel-agent-max-tool-repetitions
             (> count gptel-agent-max-tool-repetitions))
        (list :stop t
              :stop-reason
-             (format "Agent stuck: tool \"%s\" called %d times with same arguments"
-                     name count)))
+             (concat
+              gptel-agent--safety-stop-prefix
+              (format "tool \"%s\" was called %d times with identical arguments."
+                      name count))))
       ((and gptel-agent-max-tool-repetitions
             (eq count gptel-agent-max-tool-repetitions))
        (list :block
@@ -462,8 +483,10 @@ and report what you have so far."))
        (gptel-agent--loop-violation
         (format "Error: You have made %d similar %s calls recently. \
 Repeated reads/searches with similar arguments are not making progress. \
-Use a different approach, broaden or narrow the query substantially, or stop \
-and report what you have so far."
+Use a different approach.  For WebSearch, construct and fetch a known URL when \
+the target is an exact identifier, change the query substantially, or increase \
+the result count once.  Otherwise stop and report the negative or inconclusive \
+outcome, the attempts made, and confidence."
                 similar-count name)))))
     (unless result
       (setq gptel-agent--tool-loop-violations 0))
@@ -735,11 +758,21 @@ callback is guaranteed to run at most once, including parser exceptions."
 
 (defvar gptel-agent--web-search-active nil)
 
+(defun gptel-agent--web-search-count (count)
+  "Return a safe effective WebSearch result COUNT."
+  (min (max 1 gptel-agent-web-search-max-count)
+       (max 1 (if (and (integerp count) (> count 0))
+                  count
+                gptel-agent-web-search-default-count))))
+
 (defun gptel-agent--web-search-eww (tool-cb query &optional count)
   "Search the web using eww's default search engine (usually DuckDuckGo).
 
 Call TOOL-CB with the results as a string.  QUERY is the search string.
-COUNT is the number of results to return (default 5)."
+COUNT is the requested number of results.  It defaults to
+`gptel-agent-web-search-default-count' and is capped by
+`gptel-agent-web-search-max-count'."
+  (setq count (gptel-agent--web-search-count count))
   ;; No more than two active searches at one time
   (setq gptel-agent--web-search-active
         (cl-delete-if-not
@@ -754,7 +787,7 @@ COUNT is the number of results to return (default 5)."
                  (gptel-agent--fetch-with-timeout
                   (concat eww-search-prefix (url-hexify-string query))
                   #'gptel-agent--web-search-eww-callback
-                  tool-cb (format "Web search for \"%s\"" query) count)))
+                  tool-cb (format "Web search for \"%s\"" query) query count)))
       (push buffer gptel-agent--web-search-active))))
 
 (defun gptel-agent--web-fix-unreadable ()
@@ -766,9 +799,11 @@ COUNT is the number of results to return (default 5)."
      (format "Invalid character in buffer \"%s\"" (buffer-name)))
     (delete-char 1) (insert "?")))
 
-(defun gptel-agent--web-search-eww-callback (cb &optional count)
-  "Extract website text and run callback CB with it."
-  (let* ((count (or count 5)) (results))
+(defun gptel-agent--web-search-eww-callback (cb query count)
+  "Extract search results for QUERY and run callback CB with them.
+
+COUNT is the already normalized requested result count."
+  (let (results)
     (goto-char (point-min))
     (goto-char url-http-end-of-headers)
     ;; (gptel-agent--web-fix-unreadable)
@@ -792,7 +827,16 @@ COUNT is the number of results to return (default 5)."
                           (string-trim
                            (buffer-substring-no-properties pos next-pos)))
                     results))))))
-    (funcall cb (prin1-to-string (nreverse results)))))
+    (setq results (nreverse results))
+    (funcall
+     cb
+     (prin1-to-string
+      (list :query query
+            :requested-count count
+            :returned-count (length results)
+            :coverage-note
+            "These are only the top results exposed by the current search page; absence is not proof that the target does not exist."
+            :results results)))))
 
 ;;;; Read URLs
 (defun gptel-agent--read-url (tool-cb url)
@@ -1699,6 +1743,18 @@ the known skills as string ready to be included to the context."
 
 ;;; Task tool (sub-agent)
 
+(defconst gptel-agent--subagent-completion-contract
+  "Completion contract:
+- Perform the assigned task; do not optimize for producing a positive answer.
+- A negative or inconclusive finding is a valid result.  Never repeat a substantially identical failed action just to manufacture an answer.
+- If the target cannot be verified or a required tool/source is unavailable, stop and report what was attempted, the precise limitation, and what evidence would be needed next.
+- Distinguish confirmed facts from inference.  End with high, medium, or low confidence and a short reason."
+  "Reliability contract appended to every delegated task.")
+
+(defun gptel-agent--prepare-task-prompt (prompt)
+  "Append the standard sub-agent completion contract to PROMPT."
+  (concat prompt "\n\n" gptel-agent--subagent-completion-contract))
+
 (defun gptel-agent--task-cleanup-overlay (ov)
   "Safely delete task overlay OV if it is still live."
   (when (and ov (overlay-buffer ov))
@@ -1722,7 +1778,7 @@ the known skills as string ready to be included to the context."
   "gptel settings copied into and owned by a sub-agent request buffer.")
 
 (defconst gptel-agent--terminal-run-states
-  '(completed failed timed-out cancelled)
+  '(completed inconclusive failed timed-out cancelled)
   "Terminal states of a `gptel-agent--run'.")
 
 (defun gptel-agent--run-active-p (run)
@@ -1781,8 +1837,10 @@ the known skills as string ready to be included to the context."
                (capitalize (symbol-name (gptel-agent--run-state run)))
                (or (gptel-agent--run-rounds run) 0)
                (or (gptel-agent--run-tool-calls run) 0))
-       'face (if (eq (gptel-agent--run-state run) 'completed)
-                 'success 'error))
+       'face (pcase (gptel-agent--run-state run)
+               ('completed 'success)
+               ('inconclusive 'warning)
+               (_ 'error)))
       (unless (eq (gptel-agent--run-state run) 'completed)
         (format "%s\n"
                 (truncate-string-to-width
@@ -1922,6 +1980,36 @@ ABRT after its children have stopped."
                               (plist-get info :error)))
               " ")))
 
+(defun gptel-agent--safety-stop-p (info)
+  "Return non-nil when INFO describes a gptel-agent safety stop."
+  (string-prefix-p gptel-agent--safety-stop-prefix
+                   (gptel--to-string (or (plist-get info :error) ""))))
+
+(defun gptel-agent--inconclusive-response (run reason)
+  "Build an audit-ready inconclusive report for RUN stopped for REASON."
+  (let* ((reason (string-remove-prefix gptel-agent--safety-stop-prefix
+                                       (gptel--to-string reason)))
+         (partial (string-trim (or (gptel-agent--run-response run) ""))))
+    (format "%s result for task: %s
+
+Outcome: inconclusive.
+Reason: %s
+Work performed: %d model rounds, %d tool calls (%d web calls).
+%s
+Confidence: low — the run ended before the target could be verified.
+
+This is a valid negative/inconclusive task outcome; do not repeat the same delegation or searches without a materially different source or strategy."
+            (capitalize (gptel-agent--run-agent run))
+            (gptel-agent--run-description run)
+            reason
+            (or (gptel-agent--run-rounds run) 0)
+            (or (gptel-agent--run-tool-calls run) 0)
+            (or (gptel-agent--run-web-tool-calls run) 0)
+            (if (string-blank-p partial)
+                "Partial output: none. Inspect the retained sub-agent buffer for tool arguments and results."
+              (format "Partial output:\n%s"
+                      (truncate-string-to-width partial 2000 nil nil t))))))
+
 (defun gptel-agent--transient-request-error-p (info)
   "Return non-nil when failed request INFO is safe to retry."
   (let* ((text (gptel-agent--error-text info))
@@ -1980,21 +2068,27 @@ ABRT after its children have stopped."
       (gptel-agent--run-log
        run "REQUEST ERROR status=%s error=%S"
        (or (plist-get info :status) "unknown") (plist-get info :error))
-      (if (and (< (gptel-agent--run-retries run)
+      (cond
+       ((gptel-agent--safety-stop-p info)
+        (gptel-agent--run-finish
+         run 'inconclusive
+         (gptel-agent--inconclusive-response run (plist-get info :error))
+         (plist-get info :error)))
+       ((and (< (gptel-agent--run-retries run)
                   gptel-agent-max-request-retries)
                (gptel-agent--transient-request-error-p info))
-          (progn
-            (gptel-agent--run-log
-             run "RETRY %d/%d scheduled"
-             (1+ (gptel-agent--run-retries run))
-             gptel-agent-max-request-retries)
-            (gptel-agent--retry-request run fsm))
+        (gptel-agent--run-log
+         run "RETRY %d/%d scheduled"
+         (1+ (gptel-agent--run-retries run))
+         gptel-agent-max-request-retries)
+        (gptel-agent--retry-request run fsm))
+       (t
         (gptel-agent--run-finish
          run 'failed
          (format "Error: Sub-agent request failed. Status: %s, Error: %S"
                  (or (plist-get info :status) "unknown")
                  (plist-get info :error))
-         (or (plist-get info :error) (plist-get info :status)))))))
+         (or (plist-get info :error) (plist-get info :status))))))))
 
 (defun gptel-agent--handle-task-done (fsm)
   "Complete a sub-agent FSM only when it enters DONE."
@@ -2004,9 +2098,10 @@ ABRT after its children have stopped."
     (when (and run (gptel-agent--run-active-p run))
       (if (string-blank-p (or response ""))
           (gptel-agent--run-finish
-           run 'failed
-           (format "Error: Sub-agent completed but produced no usable output. \
-Status: %s" (or (plist-get info :status) "unknown"))
+           run 'inconclusive
+           (gptel-agent--inconclusive-response
+            run (format "the model completed with no usable output (status: %s)."
+                        (or (plist-get info :status) "unknown")))
            'empty-response)
         (gptel-agent--run-finish
          run 'completed
@@ -2035,9 +2130,10 @@ Status: %s" (or (plist-get info :status) "unknown"))
                (>= (gptel-agent--run-rounds run)
                    gptel-agent-max-request-rounds))
           (gptel-agent--run-finish
-           run 'failed
-           (format "Error: Sub-agent exceeded the limit of %d model/tool rounds."
-                   gptel-agent-max-request-rounds)
+           run 'inconclusive
+           (gptel-agent--inconclusive-response
+            run (format "the run reached its limit of %d model/tool rounds."
+                        gptel-agent-max-request-rounds))
            'round-limit)
         (unless retryp
           (cl-incf (gptel-agent--run-rounds run))
@@ -2252,10 +2348,11 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
              (configuration
               (append (list :include-reasoning nil :use-tools t :context nil)
                       preset (copy-tree agent-plist)))
+             (task-prompt (gptel-agent--prepare-task-prompt prompt))
              (run (gptel-agent--make-run
                    :id (format "agent-%d" (cl-incf gptel-agent--run-counter))
                    :state 'created :agent agent-type :description description
-                   :prompt prompt :parent-fsm parent-fsm
+                   :prompt task-prompt :parent-fsm parent-fsm
                    :parent-buffer parent-buffer :child-buffer child-buffer
                    :callback main-cb :response "" :response-checkpoint 0
                    :rounds 0 :retries 0 :tool-calls 0 :web-tool-calls 0
@@ -2285,7 +2382,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                   (erase-buffer)
                   (insert (format "Sub-agent run: %s\nAgent: %s\nTask: %s\nModel: %s\n\nPrompt:\n%s\n\n"
                                   (gptel-agent--run-id run) agent-type description
-                                  (gptel--model-name gptel-model) prompt)))
+                                  (gptel--model-name gptel-model) task-prompt)))
                 (setq buffer-read-only t))
               (with-current-buffer parent-buffer
                 (gptel--update-status " Calling Agent..."
@@ -2362,7 +2459,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                                       description callback-error)
                               callback-error)))))
                        (fsm
-                        (gptel-request prompt
+                        (gptel-request task-prompt
                           :buffer child-buffer
                           ;; Keep confirmation UI in the visible parent while
                           ;; all request configuration and tool execution stay
@@ -2686,17 +2783,21 @@ demonstrate something to the user."
 (gptel-make-tool
  :name "WebSearch"
  :function 'gptel-agent--web-search-eww
- :description "Search the web for the first five results to a query.  The query can be an arbitrary string.  Returns the top five results from the search engine as a list of plists.  Each object has the keys `:url` and `:excerpt` for the corresponding search result.
+ :description "Discover web pages matching a query.  Returns a plist containing the query, requested and returned result counts, a coverage warning, and a `:results` list.  Each result has `:url` and `:excerpt` keys.
 
 This tool uses the Emacs web browser (eww) with its default search engine (typically DuckDuckGo) to perform searches. No API key is required.
 
-If required, consider using the url as the input to the `Read` tool to get the contents of the url.  Note that this might not work as the `Read` tool does not handle javascript-enabled pages."
+Use WebSearch for discovery, not as proof that a target does not exist.  If the user supplies a structured identifier that determines a URL (for example GitHub owner/repository), construct that URL and use WebFetch directly.  If a relevant result is absent, do not repeat the same call: make at most one materially different exact/site-qualified query or increase `count` once, then report the negative or inconclusive outcome and confidence.
+
+Use WebFetch to read a selected result.  It may not handle JavaScript-only pages."
  :args '((:name "query"
                 :type string
                 :description "The natural language search query, can be multiple words.")
          (:name "count"
                 :type integer
-                :description "Number of results to return (default 5)"
+                :minimum 1
+                :maximum 30
+                :description "Number of top results to return (default 10, maximum 30). Increase once when broader coverage is useful; do not repeat the same count."
                 :optional t))
  :include t
  :async t
@@ -3010,7 +3111,9 @@ Use for open-ended searches, complex research, exploration tasks, \
 or when a task matches an available agent's description.  \
 You can launch multiple agents in parallel for independent tasks.  \
 Treat agent results as evidence reports: inspect their evidence, assumptions, \
-verification gaps and confidence before relying on them."
+verification gaps and confidence before relying on them.  A negative or \
+inconclusive report is a valid completed outcome; do not repeat the same \
+delegation unless a materially different source or strategy is available."
   "Base description for the Agent tool, without the available agents list.")
 
 (defun gptel-agent--full-agent-definitions ()
@@ -3105,7 +3208,9 @@ The registered tool is deliberately immutable.  See
          ( :name "prompt"
            :type "string"
            :description "The detailed task for the agent to perform autonomously.  \
-Should include exactly what information the agent should return."))
+Should include exactly what information the agent should return.  A standard \
+contract requiring honest negative/inconclusive outcomes and confidence is \
+automatically appended."))
  :category "gptel-agent"
  :async t
  :confirm t

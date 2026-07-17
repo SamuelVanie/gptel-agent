@@ -4,6 +4,8 @@
 (require 'cl-lib)
 (require 'gptel-agent)
 
+(defvar url-http-end-of-headers)
+
 (cl-defmacro gptel-agent-test--with-run ((run fsm received) &body body)
   "Create an owned RUN and FSM, bind callback results to RECEIVED, then run BODY."
   (declare (indent 1))
@@ -52,7 +54,44 @@
               results))
       (setq results (nreverse results))
       (should (plist-get (nth 3 results) :block))
-      (should (plist-get (nth 4 results) :stop)))))
+      (should (plist-get (nth 4 results) :stop))
+      (should (string-prefix-p
+               gptel-agent--safety-stop-prefix
+               (plist-get (nth 4 results) :stop-reason))))))
+
+(ert-deftest gptel-agent-web-search-count-is-bounded-and-configurable ()
+  (let ((gptel-agent-web-search-default-count 10)
+        (gptel-agent-web-search-max-count 30))
+    (should (= (gptel-agent--web-search-count nil) 10))
+    (should (= (gptel-agent--web-search-count 20) 20))
+    (should (= (gptel-agent--web-search-count 100) 30))
+    (should (= (gptel-agent--web-search-count 0) 10))))
+
+(ert-deftest gptel-agent-web-search-result-reports-coverage ()
+  (let (result)
+    (with-temp-buffer
+      (let ((url-http-end-of-headers (point-min)))
+        (cl-letf (((symbol-function 'libxml-parse-html-region)
+                   (lambda (&rest _) 'document))
+                  ((symbol-function 'eww-score-readability) #'identity)
+                  ((symbol-function 'eww-highest-readability) #'identity)
+                  ((symbol-function 'shr-insert-document)
+                   (lambda (_dom) (insert "no result links"))))
+          (gptel-agent--web-search-eww-callback
+           (lambda (value) (setq result (read value)))
+           "SamuelVanie/gptel-agent" 10))))
+    (should (equal (plist-get result :query) "SamuelVanie/gptel-agent"))
+    (should (= (plist-get result :requested-count) 10))
+    (should (= (plist-get result :returned-count) 0))
+    (should (string-match-p "absence is not proof"
+                            (plist-get result :coverage-note)))))
+
+(ert-deftest gptel-agent-task-prompt-allows-inconclusive-results ()
+  (let ((prompt (gptel-agent--prepare-task-prompt "Find the repository")))
+    (should (string-prefix-p "Find the repository" prompt))
+    (should (string-match-p "negative or inconclusive finding is a valid result"
+                            prompt))
+    (should (string-match-p "high, medium, or low confidence" prompt))))
 
 (ert-deftest gptel-agent-web-budget-counts-calls-not-callbacks ()
   (with-temp-buffer
@@ -167,9 +206,29 @@
     (setf (gptel-agent--run-rounds run) 1)
     (let ((gptel-agent-max-request-rounds 1))
       (gptel-agent--handle-task-wait fsm))
-    (should (eq (gptel-agent--run-state run) 'failed))
+    (should (eq (gptel-agent--run-state run) 'inconclusive))
     (should (= (length received) 1))
-    (should (string-match-p "limit of 1 model/tool rounds" (car received)))))
+    (should (string-match-p "limit of 1 model/tool rounds" (car received)))
+    (should (string-match-p "Confidence: low" (car received)))))
+
+(ert-deftest gptel-agent-safety-stop-returns-inconclusive-report ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-agent--run-rounds run) 3
+          (gptel-agent--run-tool-calls run) 5
+          (gptel-agent--run-web-tool-calls run) 5
+          (gptel-agent--run-response run) "The exact target was not in the results.")
+    (setf (gptel-fsm-info fsm)
+          (list :context run :status "Stopped by hook"
+                :error (concat gptel-agent--safety-stop-prefix
+                               "repeated WebSearch calls made no progress.")))
+    (gptel-agent--handle-task-error fsm)
+    (should (eq (gptel-agent--run-state run) 'inconclusive))
+    (should (= (length received) 1))
+    (should (string-match-p "Outcome: inconclusive" (car received)))
+    (should (string-match-p "5 tool calls (5 web calls)" (car received)))
+    (should (string-match-p "Confidence: low" (car received)))
+    (should (string-match-p "do not repeat the same delegation"
+                            (car received)))))
 
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))
@@ -223,7 +282,7 @@
 (ert-deftest gptel-agent-task-pins-stream-and-child-buffer ()
   (let* ((parent (generate-new-buffer " *gptel-agent-config-parent*"))
          (parent-fsm (gptel-make-fsm))
-         captured run)
+         captured requested-prompt run)
     (unwind-protect
         (progn
           (with-current-buffer parent
@@ -234,8 +293,9 @@
                   (list :buffer parent :position (point-marker))))
           (cl-letf (((symbol-function 'gptel--update-status) #'ignore)
                     ((symbol-function 'gptel-request)
-                     (lambda (_prompt &rest args)
-                       (setq captured args)
+                     (lambda (prompt &rest args)
+                       (setq requested-prompt prompt
+                             captured args)
                        (let ((fsm (plist-get args :fsm)))
                          (setf (gptel-fsm-info fsm)
                                (list :buffer (plist-get args :buffer)
@@ -251,6 +311,9 @@
           (should-not (eq (plist-get captured :buffer) parent))
           (should (eq (marker-buffer (plist-get captured :position)) parent))
           (should (equal (plist-get captured :system) "Pinned system"))
+          (should (string-match-p
+                   "negative or inconclusive finding is a valid result"
+                   requested-prompt))
           (should (eq (gptel-agent--run-parent-fsm run) parent-fsm))
           (with-current-buffer (gptel-agent--run-child-buffer run)
             (should (string-match-p "Sub-agent run: agent-" (buffer-string)))

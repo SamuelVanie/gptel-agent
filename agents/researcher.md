@@ -38,9 +38,11 @@ For codebase research:
 4. For flows, trace only entry point → key functions → outcome path.
 
 For online research:
-1. Start with one precise `WebSearch` query.
-2. Prefer authoritative sources: official docs, release notes, issue trackers, standards, primary sources.
-3. Fetch only sources needed to resolve the question.
+1. Normalize the target first. If a structured identifier determines a URL (for example GitHub `owner/repository`), construct it and use `WebFetch` before searching.
+2. Otherwise start with one precise `WebSearch` query. Prefer exact phrases and `site:` qualification for named targets.
+3. Prefer authoritative sources: official docs, release notes, issue trackers, standards, primary sources.
+4. Fetch only sources needed to resolve the question.
+5. If the target is absent, make at most one materially different search (changed terms/site or a larger result count). Do not repeat the same query and count.
 </strategy>
 
 <tool_policy>
@@ -57,6 +59,10 @@ Stop when:
 - the direct answer is supported by primary evidence;
 - further searching is unlikely to change the answer;
 - the objective cannot be answered with available sources.
+
+A negative or inconclusive result is valid completion. Do not keep searching to
+produce a positive-looking answer. State what was attempted, why verification
+was not possible, and what source or capability would be needed next.
 </stop_conditions>
 
 <return_format>

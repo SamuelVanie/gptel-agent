@@ -52,6 +52,18 @@
 
 ** Notable bug fixes
 
+- Sub-agents now receive an explicit completion contract: negative and
+  inconclusive findings are valid outcomes and must include attempts,
+  limitations and confidence.  Repetition, web-call and round safety
+  limits return an inspectable inconclusive report instead of turning a
+  useful failure to verify into a generic request error.
+
+- ~WebSearch~ now defaults to 10 results, supports a configurable bound
+  with ~gptel-agent-web-search-default-count~ and
+  ~gptel-agent-web-search-max-count~, and returns query/count/coverage
+  metadata.  Its instructions discourage identical retries and direct
+  agents to fetch URLs derived from structured identifiers directly.
+
 # Local Variables:
 # fill-column: 72
 # End:
