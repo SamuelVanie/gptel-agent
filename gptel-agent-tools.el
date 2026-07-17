@@ -122,6 +122,23 @@ to disable alternating-cycle detection."
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
 
+(defcustom gptel-agent-max-loop-violations 2
+  "Number of detected similar/cyclic tool loops before stopping a sub-agent.
+
+The first violation is returned to the model as a blocked tool result so it
+can change strategy.  A consecutive violation stops the run."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-max-web-tool-calls 12
+  "Maximum web tool calls allowed in one supervised sub-agent run.
+
+This counts calls to WebSearch, WebFetch and YouTube, not asynchronous
+callbacks.  Set to nil to disable the separate web-call budget."
+  :type '(choice (natnum :tag "Maximum calls")
+                 (const :tag "Disable" nil))
+  :group 'gptel-agent)
+
 (defcustom gptel-agent-task-timeout 700
   "Timeout in seconds for sub-agent tasks.
 
@@ -163,6 +180,14 @@ Set to nil to disable this limit."
   :type 'natnum
   :group 'gptel-agent)
 
+(defcustom gptel-agent-keep-failed-run-buffers t
+  "Whether to keep failed, timed-out and cancelled sub-agent buffers.
+
+Kept buffers contain the live diagnostic transcript and remain accessible
+from the Agent overlay until the user kills the buffer."
+  :type 'boolean
+  :group 'gptel-agent)
+
 (defvar-local gptel-agent--current-agent nil
   "Name of the agent represented by the current buffer.")
 
@@ -171,6 +196,9 @@ Set to nil to disable this limit."
 
 (defvar-local gptel-agent--registry-snapshot nil
   "Project-local snapshot of all discovered agent definitions.")
+
+(defvar-local gptel-agent--supervised-run nil
+  "The `gptel-agent--run' owned by this sub-agent buffer.")
 
 (defvar gptel-agent--run-counter 0
   "Monotonic counter used to assign identifiers to sub-agent runs.")
@@ -187,7 +215,8 @@ Set to nil to disable this limit."
   id state agent description prompt
   parent-fsm parent-buffer child-buffer overlay callback
   fsm response response-checkpoint rounds retries retry-timer timeout-timer
-  parent-kill-hook terminal-reason started-at configuration)
+  parent-kill-hook terminal-reason started-at configuration
+  tool-calls web-tool-calls)
 
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
@@ -202,11 +231,15 @@ The key is a cons cell (NAME . ARGS).")
 
 Each entry is a plist with at least :name, :args and :signature.")
 
+(defvar-local gptel-agent--tool-loop-violations 0
+  "Number of consecutive tool loop detections in the current run.")
+
 (defun gptel-agent--reset-tool-call-counts (&rest _)
   "Reset the tool call repetition tracker."
   (setq gptel-agent--last-tool-call-key nil
         gptel-agent--tool-call-streak 0
-        gptel-agent--tool-call-history nil))
+        gptel-agent--tool-call-history nil
+        gptel-agent--tool-loop-violations 0))
 
 (defun gptel-agent--arg (args key)
   "Return KEY from ARGS, accepting plist or alist shapes."
@@ -360,6 +393,14 @@ Each entry is a plist with at least :name, :args and :signature.")
                     gptel-agent--tool-call-history)
             nil)))
 
+(defun gptel-agent--loop-violation (message)
+  "Block with MESSAGE once, then stop after repeated loop violations."
+  (cl-incf gptel-agent--tool-loop-violations)
+  (if (>= gptel-agent--tool-loop-violations
+          (max 1 gptel-agent-max-loop-violations))
+      (list :stop t :stop-reason message)
+    (list :block message)))
+
 (defun gptel-agent--detect-repetition (tool-call-info)
   "Pre-tool-call hook that detects and blocks repeated identical tool calls.
 
@@ -377,37 +418,56 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
          (similar-count
           (and gptel-agent-max-similar-tool-calls
                (gptel-agent--similar-call-count
-                entry gptel-agent--tool-call-history))))
+                entry gptel-agent--tool-call-history)))
+         (run gptel-agent--supervised-run)
+         (web-tool-p (member name '("WebSearch" "WebFetch" "YouTube")))
+         result)
     (setq gptel-agent--last-tool-call-key key
           gptel-agent--tool-call-streak count)
     (gptel-agent--push-tool-call-history entry)
-    (cond
-     ((and gptel-agent-max-tool-repetitions
-           (> count gptel-agent-max-tool-repetitions))
-      (list :stop t
-            :stop-reason
-            (format "Agent stuck: tool \"%s\" called %d times with same arguments"
-                    name count)))
-     ((and gptel-agent-max-tool-repetitions
-           (eq count gptel-agent-max-tool-repetitions))
-      (list :block
-            (format "Error: You have called tool \"%s\" %d times with identical \
+    (when run
+      (cl-incf (gptel-agent--run-tool-calls run))
+      (when web-tool-p
+        (cl-incf (gptel-agent--run-web-tool-calls run))))
+    (setq
+     result
+     (cond
+      ((and run web-tool-p gptel-agent-max-web-tool-calls
+            (> (gptel-agent--run-web-tool-calls run)
+               gptel-agent-max-web-tool-calls))
+       (list :stop t
+             :stop-reason
+             (format "Agent stopped after exceeding the web tool budget (%d calls)."
+                     gptel-agent-max-web-tool-calls)))
+      ((and gptel-agent-max-tool-repetitions
+            (> count gptel-agent-max-tool-repetitions))
+       (list :stop t
+             :stop-reason
+             (format "Agent stuck: tool \"%s\" called %d times with same arguments"
+                     name count)))
+      ((and gptel-agent-max-tool-repetitions
+            (eq count gptel-agent-max-tool-repetitions))
+       (list :block
+             (format "Error: You have called tool \"%s\" %d times with identical \
 arguments. This is not making progress. Change your approach, use different \
 parameters, or stop and report what you have so far."
-                    name count)))
-     ((gptel-agent--alternating-cycle-p gptel-agent--tool-call-history)
-      (list :block
-            "Error: Tool calls are alternating in a repeated A-B-A-B pattern. \
+                     name count)))
+      ((gptel-agent--alternating-cycle-p gptel-agent--tool-call-history)
+       (gptel-agent--loop-violation
+        "Error: Tool calls are alternating in a repeated A-B-A-B pattern. \
 This is not making progress. Change strategy, use different evidence, or stop \
 and report what you have so far."))
-     ((and similar-count
-           (>= similar-count gptel-agent-max-similar-tool-calls))
-      (list :block
-            (format "Error: You have made %d similar %s calls recently. \
+      ((and similar-count
+            (>= similar-count gptel-agent-max-similar-tool-calls))
+       (gptel-agent--loop-violation
+        (format "Error: You have made %d similar %s calls recently. \
 Repeated reads/searches with similar arguments are not making progress. \
 Use a different approach, broaden or narrow the query substantially, or stop \
 and report what you have so far."
-                    similar-count name))))))
+                similar-count name)))))
+    (unless result
+      (setq gptel-agent--tool-loop-violations 0))
+    result))
 
 ;;; Tool use preview
 (defun gptel-agent--confirm-overlay (from to &optional no-hide)
@@ -610,32 +670,52 @@ COMMAND is the bash command string to execute."
   "Fetch URL and call URL-CB in the result buffer.
 
 Call TOOL-CB if there is an error or a timeout.  TOOL-CB and ARGS are
-passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  Handles
-cleanup."
-  (let* ((timeout 30) timer done
+passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  The tool
+callback is guaranteed to run at most once, including parser exceptions."
+  (let* ((timeout 30) timer done proc-buffer
          (inherit-process-coding-system t)
-         (proc-buffer
-          (url-retrieve
-           url (lambda (status)
-                 (setq done t)
-                 (when timer (cancel-timer timer))
-                 (if-let* ((err (plist-get status :error)))
-                     (funcall tool-cb
-                              (format "Error: %s failed with error: %S" failed-msg err))
-                   (apply url-cb tool-cb args))
-                 (kill-buffer (current-buffer)))
-           args 'silent)))
-    (setq timer
-          (run-at-time
-           timeout nil
-           (lambda (buf cb)
-             (unless done
-               (setq done t)
-               (let ((kill-buffer-query-functions)) (kill-buffer buf))
-               (funcall
-                cb (format "Error: %s timed out after %d seconds."
-                           failed-msg timeout))))
-           proc-buffer tool-cb))
+         (finish
+          (lambda (result)
+            (unless done
+              (setq done t)
+              (when timer (cancel-timer timer))
+              (funcall tool-cb result)))))
+    (condition-case err
+        (setq
+         proc-buffer
+         (url-retrieve
+          url
+          (lambda (status)
+            (unwind-protect
+                (if-let* ((request-error (plist-get status :error)))
+                    (funcall finish
+                             (format "Error: %s failed with error: %S"
+                                     failed-msg request-error))
+                  (condition-case parse-error
+                      (apply url-cb finish args)
+                    (error
+                     (funcall
+                      finish
+                      (format "Error: %s could not be parsed: %S"
+                              failed-msg parse-error)))))
+              (when (buffer-live-p (current-buffer))
+                (kill-buffer (current-buffer)))))
+          nil 'silent))
+      (error
+       (funcall finish
+                (format "Error: %s could not start: %S" failed-msg err))))
+    (when (and proc-buffer (not done))
+      (setq timer
+            (run-at-time
+             timeout nil
+             (lambda (buf)
+               (unless done
+                 (when (buffer-live-p buf)
+                   (let ((kill-buffer-query-functions)) (kill-buffer buf)))
+                 (funcall
+                  finish (format "Error: %s timed out after %d seconds."
+                                 failed-msg timeout))))
+             proc-buffer)))
     proc-buffer))
 
 ;;;; Web search
@@ -670,11 +750,12 @@ COUNT is the number of results to return (default 5)."
       (progn (message "Web search: waiting for turn")
              (run-at-time 5 nil #'gptel-agent--web-search-eww
                           tool-cb query count))
-    (push (gptel-agent--fetch-with-timeout
-           (concat eww-search-prefix (url-hexify-string query))
-           #'gptel-agent--web-search-eww-callback
-           tool-cb (format "Web search for \"%s\"" query))
-          gptel-agent--web-search-active)))
+    (when-let* ((buffer
+                 (gptel-agent--fetch-with-timeout
+                  (concat eww-search-prefix (url-hexify-string query))
+                  #'gptel-agent--web-search-eww-callback
+                  tool-cb (format "Web search for \"%s\"" query) count)))
+      (push buffer gptel-agent--web-search-active))))
 
 (defun gptel-agent--web-fix-unreadable ()
   "Replace invalid characters from point to end in current buffer."
@@ -685,9 +766,9 @@ COUNT is the number of results to return (default 5)."
      (format "Invalid character in buffer \"%s\"" (buffer-name)))
     (delete-char 1) (insert "?")))
 
-(defun gptel-agent--web-search-eww-callback (cb)
+(defun gptel-agent--web-search-eww-callback (cb &optional count)
   "Extract website text and run callback CB with it."
-  (let* ((count 5) (results))
+  (let* ((count (or count 5)) (results))
     (goto-char (point-min))
     (goto-char url-http-end-of-headers)
     ;; (gptel-agent--web-fix-unreadable)
@@ -706,12 +787,12 @@ COUNT is the number of results to return (default 5)."
                         (idx (string-search "http" url))
                         (url-fmt (url-unhex-string (substring url idx))))
               (cl-incf result-count)
-              (push (concat url-fmt "\n\n"
-                            (string-trim
-                             (buffer-substring-no-properties pos next-pos))
-                            "\n\n----\n")
+              (push (list :url url-fmt
+                          :excerpt
+                          (string-trim
+                           (buffer-substring-no-properties pos next-pos)))
                     results))))))
-    (funcall cb (apply #'concat (nreverse results)))))
+    (funcall cb (prin1-to-string (nreverse results)))))
 
 ;;;; Read URLs
 (defun gptel-agent--read-url (tool-cb url)
@@ -1653,6 +1734,61 @@ the known skills as string ready to be included to the context."
   "Return the sub-agent run owned by FSM."
   (plist-get (gptel-fsm-info fsm) :context))
 
+(defun gptel-agent--display-run-buffer (run &rest _)
+  "Display RUN's live diagnostic buffer."
+  (if (buffer-live-p (gptel-agent--run-child-buffer run))
+      (pop-to-buffer (gptel-agent--run-child-buffer run))
+    (user-error "This sub-agent diagnostic buffer is no longer available")))
+
+(defun gptel-agent--run-inspect-button (run)
+  "Return a clickable string that displays RUN's diagnostic buffer."
+  (propertize
+   (buttonize "[Inspect sub-agent]"
+              (lambda (&rest _)
+                (gptel-agent--display-run-buffer run)))
+   'help-echo "Open the live sub-agent request and tool transcript"))
+
+(defun gptel-agent--run-log (run format-string &rest args)
+  "Append a timestamped event to RUN using FORMAT-STRING and ARGS."
+  (when (buffer-live-p (gptel-agent--run-child-buffer run))
+    (with-current-buffer (gptel-agent--run-child-buffer run)
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (unless (or (bobp) (bolp)) (insert "\n"))
+        (insert (format "[%s] " (format-time-string "%H:%M:%S"))
+                (apply #'format format-string args))
+        (unless (bolp) (insert "\n"))))))
+
+(defun gptel-agent--run-append-model-output (run text)
+  "Append streamed model TEXT to RUN's diagnostic buffer."
+  (when (and (stringp text)
+             (buffer-live-p (gptel-agent--run-child-buffer run)))
+    (with-current-buffer (gptel-agent--run-child-buffer run)
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert text)))))
+
+(defun gptel-agent--run-update-terminal-overlay (run result)
+  "Show RUN's terminal RESULT and inspection action in its overlay."
+  (when-let* ((overlay (gptel-agent--run-overlay run))
+              ((overlay-buffer overlay)))
+    (overlay-put
+     overlay 'after-string
+     (concat
+      (overlay-get overlay 'msg)
+      (propertize
+       (format "%s after %d rounds and %d tool calls.\n"
+               (capitalize (symbol-name (gptel-agent--run-state run)))
+               (or (gptel-agent--run-rounds run) 0)
+               (or (gptel-agent--run-tool-calls run) 0))
+       'face (if (eq (gptel-agent--run-state run) 'completed)
+                 'success 'error))
+      (unless (eq (gptel-agent--run-state run) 'completed)
+        (format "%s\n"
+                (truncate-string-to-width
+                 (gptel--to-string result) 500 nil nil t)))
+      gptel-agent--hrule))))
+
 (defun gptel-agent--run-cancel-timer (run accessor setter)
   "Cancel RUN timer returned by ACCESSOR and clear it with SETTER."
   (when-let* ((timer (funcall accessor run)))
@@ -1679,6 +1815,8 @@ the known skills as string ready to be included to the context."
                 :description (gptel-agent--run-description run)
                 :terminal-reason (gptel-agent--run-terminal-reason run)
                 :rounds (gptel-agent--run-rounds run)
+                :tool-calls (gptel-agent--run-tool-calls run)
+                :web-tool-calls (gptel-agent--run-web-tool-calls run)
                 :retries (gptel-agent--run-retries run)
                 :backend (and backend (gptel-backend-name backend))
                 :model (plist-get configuration :model)
@@ -1705,6 +1843,8 @@ not send RESULT to the parent tool callback."
   (when (gptel-agent--run-active-p run)
     (setf (gptel-agent--run-state run) state
           (gptel-agent--run-terminal-reason run) reason)
+    (gptel-agent--run-log
+     run "TERMINAL %s: %s" state (gptel--to-string result))
     (gptel-agent--run-cancel-timer
      run #'gptel-agent--run-timeout-timer
      (lambda (value object)
@@ -1716,7 +1856,7 @@ not send RESULT to the parent tool callback."
     (when (memq state '(timed-out cancelled))
       (gptel-agent--run-abort-transport run))
     (gptel-agent--record-terminal-run run result)
-    (gptel-agent--task-cleanup-overlay (gptel-agent--run-overlay run))
+    (gptel-agent--run-update-terminal-overlay run result)
     (when (buffer-live-p (gptel-agent--run-parent-buffer run))
       (with-current-buffer (gptel-agent--run-parent-buffer run)
         (when-let* ((hook (gptel-agent--run-parent-kill-hook run)))
@@ -1733,8 +1873,17 @@ not send RESULT to the parent tool callback."
           (error
            (message "gptel-agent: parent callback for run %s failed: %S"
                     (gptel-agent--run-id run) err)))))
-    (when (buffer-live-p (gptel-agent--run-child-buffer run))
-      (kill-buffer (gptel-agent--run-child-buffer run)))
+    (if (and gptel-agent-keep-failed-run-buffers
+             (not (eq state 'completed))
+             (buffer-live-p (gptel-agent--run-child-buffer run)))
+        (with-current-buffer (gptel-agent--run-child-buffer run)
+          (rename-buffer
+           (format "*gptel-agent-run:%s:%s*"
+                   (gptel-agent--run-id run) state)
+           t))
+      (gptel-agent--task-cleanup-overlay (gptel-agent--run-overlay run))
+      (when (buffer-live-p (gptel-agent--run-child-buffer run))
+        (kill-buffer (gptel-agent--run-child-buffer run))))
     t))
 
 (defun gptel-agent--cancel-runs-for-buffer (parent-buffer)
@@ -1828,10 +1977,18 @@ ABRT after its children have stopped."
   (let* ((info (gptel-fsm-info fsm))
          (run (gptel-agent--run-from-fsm fsm)))
     (when (and run (gptel-agent--run-active-p run))
+      (gptel-agent--run-log
+       run "REQUEST ERROR status=%s error=%S"
+       (or (plist-get info :status) "unknown") (plist-get info :error))
       (if (and (< (gptel-agent--run-retries run)
                   gptel-agent-max-request-retries)
                (gptel-agent--transient-request-error-p info))
-          (gptel-agent--retry-request run fsm)
+          (progn
+            (gptel-agent--run-log
+             run "RETRY %d/%d scheduled"
+             (1+ (gptel-agent--run-retries run))
+             gptel-agent-max-request-retries)
+            (gptel-agent--retry-request run fsm))
         (gptel-agent--run-finish
          run 'failed
          (format "Error: Sub-agent request failed. Status: %s, Error: %S"
@@ -1886,6 +2043,11 @@ Status: %s" (or (plist-get info :status) "unknown"))
           (cl-incf (gptel-agent--run-rounds run))
           (setf (gptel-agent--run-response-checkpoint run)
                 (length (gptel-agent--run-response run))))
+        (gptel-agent--run-log
+         run "%s round %d/%s"
+         (if retryp "RETRYING REQUEST" "REQUEST")
+         (gptel-agent--run-rounds run)
+         (or gptel-agent-max-request-rounds "unlimited"))
         (unless (eq (gptel-agent--run-state run) 'requesting-after-tool)
           (setf (gptel-agent--run-state run) 'requesting))
         ;; `gptel--handle-wait' consults buffer-local transport settings.
@@ -1897,6 +2059,10 @@ Status: %s" (or (plist-get info :status) "unknown"))
   (when-let* ((run (gptel-agent--run-from-fsm fsm))
               ((gptel-agent--run-active-p run)))
     (setf (gptel-agent--run-state run) 'waiting-for-tool)
+    (dolist (call (plist-get (gptel-fsm-info fsm) :tool-use))
+      (gptel-agent--run-log
+       run "TOOL CALL %s %S"
+       (plist-get call :name) (plist-get call :args)))
     (gptel-agent--indicate-tool-call fsm)
     (gptel--handle-tool-use fsm)))
 
@@ -1905,6 +2071,13 @@ Status: %s" (or (plist-get info :status) "unknown"))
   (when-let* ((run (gptel-agent--run-from-fsm fsm))
               ((gptel-agent--run-active-p run)))
     (setf (gptel-agent--run-state run) 'requesting-after-tool)
+    (pcase-dolist (`(,tool ,args ,result)
+                   (plist-get (gptel-fsm-info fsm) :tool-result))
+      (gptel-agent--run-log
+       run "TOOL RESULT %s %S\n%s"
+       (if tool (gptel-tool-name tool) "unknown") args
+       (truncate-string-to-width
+        (gptel--to-string result) 4000 nil nil t)))
     (gptel--handle-post-tool fsm)
     (gptel--handle-tool-result fsm)))
 
@@ -1988,8 +2161,11 @@ ARG-VALUES is a list: (type description prompt)"
       (overlay-put ov 'count (+ info-count (length tool-use)))
       (overlay-put ov 'after-string new-info-msg))))
 
-(defun gptel-agent--task-overlay (where &optional agent-type description)
-  "Create overlay for agent task at WHERE with AGENT-TYPE and DESCRIPTION."
+(defun gptel-agent--task-overlay (where &optional agent-type description run)
+  "Create an Agent task overlay at WHERE.
+
+AGENT-TYPE and DESCRIPTION identify the task.  RUN supplies the inspection
+button for its live diagnostic buffer."
   (let* ((bounds                  ;where to place the overlay, handle edge cases
           (save-excursion
             (goto-char where)
@@ -2012,7 +2188,9 @@ ARG-VALUES is a list: (type description prompt)"
                 (if (and (display-graphic-p) (fboundp 'string-pixel-width))
                     `(space :align-to (- right (,(string-pixel-width model))))
                   `(space :align-to (- right ,(+ 5 (string-width model))))))
-               model "\n")))
+               model
+               (when run (concat " " (gptel-agent--run-inspect-button run)))
+               "\n")))
     (prog1 ov
       (overlay-put ov 'gptel-agent t)
       (overlay-put ov 'count 0)
@@ -2080,7 +2258,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                    :prompt prompt :parent-fsm parent-fsm
                    :parent-buffer parent-buffer :child-buffer child-buffer
                    :callback main-cb :response "" :response-checkpoint 0
-                   :rounds 0 :retries 0
+                   :rounds 0 :retries 0 :tool-calls 0 :web-tool-calls 0
                    :started-at (float-time))))
         (condition-case err
             (progn
@@ -2091,6 +2269,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                       (buffer-local-value 'default-directory parent-buffer))
                 (setq-local gptel-agent--current-agent agent-type
                             gptel-agent--agent-snapshot agent-snapshot
+                            gptel-agent--supervised-run run
                             gptel--preset nil)
                 (gptel--apply-preset
                  configuration
@@ -2101,13 +2280,19 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                       (list :backend gptel-backend :model gptel-model
                             :stream gptel-stream :system gptel-system-prompt
                             :tools (copy-sequence gptel-tools)
-                            :request-params (copy-tree gptel--request-params))))
+                            :request-params (copy-tree gptel--request-params)))
+                (let ((inhibit-read-only t))
+                  (erase-buffer)
+                  (insert (format "Sub-agent run: %s\nAgent: %s\nTask: %s\nModel: %s\n\nPrompt:\n%s\n\n"
+                                  (gptel-agent--run-id run) agent-type description
+                                  (gptel--model-name gptel-model) prompt)))
+                (setq buffer-read-only t))
               (with-current-buffer parent-buffer
                 (gptel--update-status " Calling Agent..."
                                       'font-lock-escape-face)
                 (setf (gptel-agent--run-overlay run)
                       (gptel-agent--task-overlay
-                       where agent-type description)))
+                       where agent-type description run)))
               (puthash (gptel-agent--run-id run) run gptel-agent--runs)
               (let ((parent-kill-hook
                      (lambda ()
@@ -2127,7 +2312,10 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                      (gptel-agent--run-finish
                       run 'failed
                       "Error: Sub-agent request buffer was killed."
-                      'child-buffer-killed)))
+                      'child-buffer-killed))
+                   (unless (gptel-agent--run-active-p run)
+                     (gptel-agent--task-cleanup-overlay
+                      (gptel-agent--run-overlay run))))
                  nil t))
               (when gptel-agent-task-timeout
                 (setf (gptel-agent--run-timeout-timer run)
@@ -2158,7 +2346,8 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                                 ((pred stringp)
                                  (setf (gptel-agent--run-response run)
                                        (concat
-                                        (gptel-agent--run-response run) resp)))
+                                        (gptel-agent--run-response run) resp))
+                                 (gptel-agent--run-append-model-output run resp))
                                 (`(tool-call . ,calls)
                                  (unless (plist-get info :tracking-marker)
                                    (plist-put info :tracking-marker where))

@@ -37,6 +37,64 @@
   (should-not (gptel-agent--transient-request-error-p
                '(:http-status "400" :error "Stream must be set to true"))))
 
+(ert-deftest gptel-agent-similar-tool-loop-escalates-from-block-to-stop ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 20)
+          (gptel-agent-max-similar-tool-calls 4)
+          (gptel-agent-max-loop-violations 2)
+          results)
+      (dolist (suffix '("one" "two" "three" "four" "five"))
+        (push (gptel-agent--detect-repetition
+               (list :name "WebSearch"
+                     :args (list :query
+                                 (format "alpha beta gamma %s" suffix))))
+              results))
+      (setq results (nreverse results))
+      (should (plist-get (nth 3 results) :block))
+      (should (plist-get (nth 4 results) :stop)))))
+
+(ert-deftest gptel-agent-web-budget-counts-calls-not-callbacks ()
+  (with-temp-buffer
+    (let ((run (gptel-agent--make-run :tool-calls 0 :web-tool-calls 0))
+          (gptel-agent-max-web-tool-calls 2)
+          (gptel-agent-max-similar-tool-calls nil)
+          (gptel-agent-max-tool-repetitions nil))
+      (setq-local gptel-agent--supervised-run run)
+      (gptel-agent--reset-tool-call-counts)
+      (should-not
+       (gptel-agent--detect-repetition
+        '(:name "WebSearch" :args (:query "first topic"))))
+      (should-not
+       (gptel-agent--detect-repetition
+        '(:name "WebFetch" :args (:url "https://example.com"))))
+      (let ((result
+             (gptel-agent--detect-repetition
+              '(:name "YouTube" :args (:url "https://youtube.test/1")))))
+        (should (plist-get result :stop)))
+      (should (= (gptel-agent--run-web-tool-calls run) 3)))))
+
+(ert-deftest gptel-agent-web-parser-exception-completes-callback-once ()
+  (let (results)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (_url callback &rest _)
+                 (let ((buffer (generate-new-buffer " *web-parser-test*")))
+                   (with-current-buffer buffer (funcall callback nil))
+                   buffer))))
+      (gptel-agent--fetch-with-timeout
+       "https://example.test"
+       (lambda (_callback) (error "parser exploded"))
+       (lambda (result) (push result results))
+       "Test fetch"))
+    (should (= (length results) 1))
+    (should (string-match-p "could not be parsed" (car results)))))
+
+(ert-deftest gptel-agent-inspect-link-is-clickable ()
+  (let* ((run (gptel-agent--make-run))
+         (link (gptel-agent--run-inspect-button run)))
+    (should (string-match-p "Inspect sub-agent" link))
+    (should (text-property-not-all 0 (length link) 'keymap nil link))))
+
 (ert-deftest gptel-agent-run-finishes-exactly-once ()
   (gptel-agent-test--with-run (run _fsm received)
     (should (gptel-agent--run-finish run 'completed "first" 'done))
@@ -170,12 +228,11 @@
         (progn
           (with-current-buffer parent
             (insert "prompt\n")
-            (setq-local gptel-stream t)
+            (setq-local gptel-stream t
+                        gptel-model 'test-model)
             (setf (gptel-fsm-info parent-fsm)
                   (list :buffer parent :position (point-marker))))
           (cl-letf (((symbol-function 'gptel--update-status) #'ignore)
-                    ((symbol-function 'gptel-agent--task-overlay)
-                     (lambda (&rest _) nil))
                     ((symbol-function 'gptel-request)
                      (lambda (_prompt &rest args)
                        (setq captured args)
@@ -194,9 +251,17 @@
           (should-not (eq (plist-get captured :buffer) parent))
           (should (eq (marker-buffer (plist-get captured :position)) parent))
           (should (equal (plist-get captured :system) "Pinned system"))
-          (should (eq (gptel-agent--run-parent-fsm run) parent-fsm)))
+          (should (eq (gptel-agent--run-parent-fsm run) parent-fsm))
+          (with-current-buffer (gptel-agent--run-child-buffer run)
+            (should (string-match-p "Sub-agent run: agent-" (buffer-string)))
+            (should (string-match-p "perform task" (buffer-string))))
+          (should (string-match-p
+                   "Inspect sub-agent"
+                   (overlay-get (gptel-agent--run-overlay run) 'msg))))
       (when (and run (gptel-agent--run-active-p run))
         (gptel-agent--run-finish run 'cancelled "cleanup" 'test-cleanup t))
+      (when (and run (buffer-live-p (gptel-agent--run-child-buffer run)))
+        (kill-buffer (gptel-agent--run-child-buffer run)))
       (when (buffer-live-p parent) (kill-buffer parent)))))
 
 (provide 'gptel-agent-tools-test)

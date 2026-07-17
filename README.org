@@ -162,6 +162,13 @@ options are =gptel-agent-task-timeout=, =gptel-agent-max-request-rounds=,
 =gptel-agent-max-request-retries= and =gptel-agent-retry-delay=.  Authentication
 and malformed-request errors are not retried.
 
+The Agent task overlay includes an =[Inspect sub-agent]= action.  Its buffer
+shows the prompt, model rounds, streamed output, tool arguments and results,
+retries, and terminal reason.  Failed runs keep this buffer by default; set
+=gptel-agent-keep-failed-run-buffers= to nil to clean them up immediately.
+Repeated similar/cyclic calls stop after =gptel-agent-max-loop-violations=, and
+web-heavy sub-agents have a separate =gptel-agent-max-web-tool-calls= budget.
+
 #+html: </details>
 #+html: <details><summary>
 **** Agents from Markdown files
