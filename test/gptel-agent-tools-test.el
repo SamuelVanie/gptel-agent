@@ -522,9 +522,15 @@
 (ert-deftest gptel-agent-finalization-gets-a-turn-at-the-round-limit ()
   (gptel-agent-test--with-run (run fsm received)
     (setf (gptel-agent--run-rounds run) 1
+<<<<<<< HEAD
           (gptel-agent--run-finalization-requested run) t
           (gptel-agent--run-max-request-rounds run) 1)
     (let (handled)
+=======
+          (gptel-agent--run-finalization-requested run) t)
+    (let ((gptel-agent-max-request-rounds 1)
+          handled)
+>>>>>>> b0faae3 (feat: researcher should interpret its own tool calls and work and return answer)
       (cl-letf (((symbol-function 'gptel--handle-wait)
                  (lambda (_fsm) (setq handled t))))
         (gptel-agent--handle-task-wait fsm))
@@ -539,6 +545,7 @@
     (should (string-match-p "default_branch" prompt))
     (should (string-match-p "successful result.*stop signal" prompt))))
 
+<<<<<<< HEAD
 (ert-deftest gptel-agent-built-in-supervision-policy-is-role-specific ()
   (let ((researcher (gptel-agent-test--agent-prompt "researcher"))
         (executor (gptel-agent-test--agent-prompt "executor"))
@@ -552,6 +559,8 @@
     (should-not (string-match-p "task-timeout:" introspector))
     (should-not (string-match-p "max-request-rounds:" introspector))))
 
+=======
+>>>>>>> b0faae3 (feat: researcher should interpret its own tool calls and work and return answer)
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))
          (global-args (copy-tree (gptel-tool-args global-tool)))
@@ -705,12 +714,15 @@
           (should (string-match-p
                    "Inspect sub-agent"
                    (overlay-get (gptel-agent--run-overlay run) 'msg)))
+<<<<<<< HEAD
           (should (string-match-p
                    "preset-model"
                    (overlay-get (gptel-agent--run-overlay run) 'msg)))
           (should-not (string-match-p
                        "test-model"
                        (overlay-get (gptel-agent--run-overlay run) 'msg)))
+=======
+>>>>>>> b0faae3 (feat: researcher should interpret its own tool calls and work and return answer)
           (let (finalized-run)
             (cl-letf (((symbol-function 'gptel-agent--begin-finalization)
                        (lambda (owned-run _info)
