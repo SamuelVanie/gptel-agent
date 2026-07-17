@@ -930,6 +930,8 @@ this session, which defaults to the default `gptel-agent'."
                   (gptel--apply-preset
                    (car (nth current modes))
                    (lambda (sym val) (set (make-local-variable sym) val)))
+                  (setq-local gptel-agent--current-agent
+                              (symbol-name (car (nth current modes))))
                   (force-mode-line-update)))
                (display-mode
                 (lambda ()
