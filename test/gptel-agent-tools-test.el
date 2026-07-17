@@ -1,0 +1,203 @@
+;;; gptel-agent-tools-test.el --- Agent supervisor tests -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'cl-lib)
+(require 'gptel-agent)
+
+(cl-defmacro gptel-agent-test--with-run ((run fsm received) &body body)
+  "Create an owned RUN and FSM, bind callback results to RECEIVED, then run BODY."
+  (declare (indent 1))
+  `(let* ((parent (generate-new-buffer " *gptel-agent-test-parent*"))
+          (child (generate-new-buffer " *gptel-agent-test-child*"))
+          (,received nil)
+          (,run (gptel-agent--make-run
+                 :id "test-run" :state 'created :agent "researcher"
+                 :description "test task" :parent-buffer parent
+                 :child-buffer child :response "" :response-checkpoint 0
+                 :rounds 0 :retries 0
+                 :callback (lambda (value) (push value ,received))))
+          (,fsm (gptel-make-fsm :info (list :context ,run))))
+     (setf (gptel-agent--run-fsm ,run) ,fsm)
+     (unwind-protect
+         (progn ,@body)
+       (when (timerp (gptel-agent--run-retry-timer ,run))
+         (cancel-timer (gptel-agent--run-retry-timer ,run)))
+       (when (buffer-live-p parent) (kill-buffer parent))
+       (when (buffer-live-p child) (kill-buffer child)))))
+
+(ert-deftest gptel-agent-transient-errors-are-classified-conservatively ()
+  (should (gptel-agent--transient-request-error-p
+           '(:status "Curl failure" :error "Curl failed with exit code 56")))
+  (should (gptel-agent--transient-request-error-p
+           '(:http-status "429" :status "Too many requests")))
+  (should (gptel-agent--transient-request-error-p
+           '(:http-status "503" :status "Unavailable")))
+  (should-not (gptel-agent--transient-request-error-p
+               '(:http-status "401" :error "Unauthorized")))
+  (should-not (gptel-agent--transient-request-error-p
+               '(:http-status "400" :error "Stream must be set to true"))))
+
+(ert-deftest gptel-agent-run-finishes-exactly-once ()
+  (gptel-agent-test--with-run (run _fsm received)
+    (should (gptel-agent--run-finish run 'completed "first" 'done))
+    (should-not (gptel-agent--run-finish run 'failed "second" 'late-error))
+    (should (eq (gptel-agent--run-state run) 'completed))
+    (should (equal received '("first")))
+    (should-not (buffer-live-p (gptel-agent--run-child-buffer run)))))
+
+(ert-deftest gptel-agent-timeout-aborts-the-owned-child-request ()
+  (gptel-agent-test--with-run (run _fsm received)
+    (let (aborted-buffer)
+      (cl-letf (((symbol-function 'gptel-abort)
+                 (lambda (buffer) (setq aborted-buffer buffer))))
+        (gptel-agent--run-finish run 'timed-out "timeout" 'timeout))
+      (should (eq aborted-buffer (gptel-agent--run-child-buffer run)))
+      (should-not (eq aborted-buffer (gptel-agent--run-parent-buffer run)))
+      (should (equal received '("timeout"))))))
+
+(ert-deftest gptel-agent-parent-abort-cancels-child-and-parent-fsm ()
+  (gptel-agent-test--with-run (run _child-fsm received)
+    (let ((parent-fsm (gptel-make-fsm :state 'TOOL :handlers nil)))
+      (setf (gptel-agent--run-parent-fsm run) parent-fsm)
+      (puthash (gptel-agent--run-id run) run gptel-agent--runs)
+      (cl-letf (((symbol-function 'gptel-agent--run-abort-transport) #'ignore))
+        (should (= (gptel-agent--cancel-runs-for-buffer
+                    (gptel-agent--run-parent-buffer run))
+                   1)))
+      (should (eq (gptel-agent--run-state run) 'cancelled))
+      (should (eq (gptel-fsm-state parent-fsm) 'ABRT))
+      (should-not received))))
+
+(ert-deftest gptel-agent-done-state-owns-completion ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-agent--run-response run) "final evidence")
+    (gptel-agent--handle-task-done fsm)
+    (should (eq (gptel-agent--run-state run) 'completed))
+    (should (= (length received) 1))
+    (should (string-match-p "Researcher result for task: test task"
+                            (car received)))
+    (should (string-match-p "final evidence" (car received)))))
+
+(ert-deftest gptel-agent-transient-error-schedules-bounded-retry ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-fsm-info fsm)
+          (list :context run :status "Curl failure"
+                :error "Curl failed with exit code 56"))
+    (setf (gptel-agent--run-response run) "kept partial-duplicate"
+          (gptel-agent--run-response-checkpoint run) 4)
+    (let ((gptel-agent-max-request-retries 1)
+          (gptel-agent-retry-delay 60))
+      (gptel-agent--handle-task-error fsm))
+    (should (eq (gptel-agent--run-state run) 'retry-wait))
+    (should (= (gptel-agent--run-retries run) 1))
+    (should (equal (gptel-agent--run-response run) "kept"))
+    (should (timerp (gptel-agent--run-retry-timer run)))
+    (should-not received)))
+
+(ert-deftest gptel-agent-auth-error-is-terminal-without-retry ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-fsm-info fsm)
+          (list :context run :status "Unauthorized" :http-status "401"
+                :error "Invalid API key"))
+    (gptel-agent--handle-task-error fsm)
+    (should (eq (gptel-agent--run-state run) 'failed))
+    (should (= (gptel-agent--run-retries run) 0))
+    (should (= (length received) 1))))
+
+(ert-deftest gptel-agent-round-budget-is-terminal ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-agent--run-rounds run) 1)
+    (let ((gptel-agent-max-request-rounds 1))
+      (gptel-agent--handle-task-wait fsm))
+    (should (eq (gptel-agent--run-state run) 'failed))
+    (should (= (length received) 1))
+    (should (string-match-p "limit of 1 model/tool rounds" (car received)))))
+
+(ert-deftest gptel-agent-tool-schema-is-request-local ()
+  (let* ((global-tool (gptel-get-tool "Agent"))
+         (global-args (copy-tree (gptel-tool-args global-tool)))
+         (fsm (gptel-make-fsm))
+         captured local-tool)
+    (with-temp-buffer
+      (setq-local
+       gptel-tools (list global-tool)
+       gptel-agent--current-agent nil
+       gptel-agent--agent-snapshot
+       '(("executor" :description "Executes work" :system "execute")
+         ("researcher" :description "Finds evidence" :system "research")))
+      (gptel-agent--localize-agent-tool fsm)
+      (setq local-tool (car gptel-tools)))
+    (let ((local-tool local-tool))
+      (should-not (eq local-tool global-tool))
+      (should (equal (append (plist-get (car (gptel-tool-args local-tool)) :enum)
+                             nil)
+                     '("executor" "researcher")))
+      (should (equal (gptel-tool-args global-tool) global-args))
+      (cl-letf (((symbol-function 'gptel-agent--task)
+                 (lambda (&rest args) (setq captured args))))
+        (funcall (gptel-tool-function local-tool)
+                 #'ignore "executor" "do work" "details"))
+      (should (eq (nth 4 captured) fsm))
+      (should (equal (mapcar #'car (nth 5 captured))
+                     '("executor" "researcher"))))))
+
+(ert-deftest gptel-agent-project-registry-snapshot-is-isolated ()
+  (let ((gptel-agent--agents
+         '(("other-project" :description "Wrong project")))
+        (source (generate-new-buffer " *gptel-agent-project-source*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer source
+            (setq-local
+             gptel-agent--registry-snapshot
+             '(("this-project" :description "Right project" :system "local"))))
+          (with-temp-buffer
+            (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+            (let ((fsm (gptel-make-fsm :info (list :buffer source))))
+              (gptel-agent--localize-agent-tool fsm))
+            (should
+             (equal (append
+                     (plist-get (car (gptel-tool-args (car gptel-tools))) :enum)
+                     nil)
+                    '("this-project")))))
+      (when (buffer-live-p source) (kill-buffer source)))))
+
+(ert-deftest gptel-agent-task-pins-stream-and-child-buffer ()
+  (let* ((parent (generate-new-buffer " *gptel-agent-config-parent*"))
+         (parent-fsm (gptel-make-fsm))
+         captured run)
+    (unwind-protect
+        (progn
+          (with-current-buffer parent
+            (insert "prompt\n")
+            (setq-local gptel-stream t)
+            (setf (gptel-fsm-info parent-fsm)
+                  (list :buffer parent :position (point-marker))))
+          (cl-letf (((symbol-function 'gptel--update-status) #'ignore)
+                    ((symbol-function 'gptel-agent--task-overlay)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'gptel-request)
+                     (lambda (_prompt &rest args)
+                       (setq captured args)
+                       (let ((fsm (plist-get args :fsm)))
+                         (setf (gptel-fsm-info fsm)
+                               (list :buffer (plist-get args :buffer)
+                                     :context (plist-get args :context)
+                                     :callback (plist-get args :callback)))
+                         fsm))))
+            (gptel-agent--task
+             #'ignore "researcher" "pin config" "perform task" parent-fsm
+             '(("researcher" :description "Research" :system "Pinned system"))))
+          (setq run (plist-get captured :context))
+          (should (eq (plist-get captured :stream) t))
+          (should (buffer-live-p (plist-get captured :buffer)))
+          (should-not (eq (plist-get captured :buffer) parent))
+          (should (eq (marker-buffer (plist-get captured :position)) parent))
+          (should (equal (plist-get captured :system) "Pinned system"))
+          (should (eq (gptel-agent--run-parent-fsm run) parent-fsm)))
+      (when (and run (gptel-agent--run-active-p run))
+        (gptel-agent--run-finish run 'cancelled "cleanup" 'test-cleanup t))
+      (when (buffer-live-p parent) (kill-buffer parent)))))
+
+(provide 'gptel-agent-tools-test)
+;;; gptel-agent-tools-test.el ends here

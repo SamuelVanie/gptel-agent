@@ -155,6 +155,13 @@ Sub-agents can be configured to use specific models or other API parameters
 (like the level of reasoning) independent of gptel-agent.  They are essentially
 gptel presets.
 
+Each delegation snapshots its backend, model, streaming mode, system prompt,
+tools and request parameters.  It also has an overall timeout, a model/tool
+round limit and bounded retries for transient transport failures.  The relevant
+options are =gptel-agent-task-timeout=, =gptel-agent-max-request-rounds=,
+=gptel-agent-max-request-retries= and =gptel-agent-retry-delay=.  Authentication
+and malformed-request errors are not retried.
+
 #+html: </details>
 #+html: <details><summary>
 **** Agents from Markdown files

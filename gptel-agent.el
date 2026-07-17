@@ -75,6 +75,7 @@
 (declare-function org-entry-properties "org")
 (declare-function gptel-agent--update-skill-tool "gptel-agent-tools")
 (declare-function gptel-agent--update-agent-tool "gptel-agent-tools")
+(declare-function gptel-agent--full-agent-definitions "gptel-agent-tools")
 (declare-function gptel-agent--skill-tool-base-desc "gptel-agent-tools")
 (declare-function gptel-tool-description "gptel-request")
 (defvar org-inhibit-startup)
@@ -381,6 +382,9 @@ AGENTS is an alist of agent names and associated plist as value
 (defun gptel-agent-update ()
   "Update agents."
   (gptel-agent--update-agents)
+  ;; Keep this buffer/project independent from registry updates elsewhere.
+  (setq-local gptel-agent--registry-snapshot
+              (gptel-agent--full-agent-definitions))
 
   ;; Update skills and tools
   (gptel-agent--update-skills)
@@ -401,8 +405,9 @@ AGENTS is an alist of agent names and associated plist as value
   "Toggle which agents are enabled for the Agent tool.
 
 Prompts for agents to enable.  Agents not selected will be disabled.
-The Agent tool's description and enum are updated immediately without
-requiring `gptel-agent-update'."
+New requests receive an invocation-specific Agent schema immediately,
+without requiring `gptel-agent-update'.  Requests already in flight keep
+their original schema and registry snapshot."
   (interactive)
   (unless gptel-agent--agents
     (gptel-agent--update-agents))
@@ -902,6 +907,8 @@ this session, which defaults to the default `gptel-agent'."
       (gptel--apply-preset              ;Apply the gptel-agent preset
        (or agent-preset 'gptel-agent)
        (lambda (sym val) (set (make-local-variable sym) val)))
+      (setq-local gptel-agent--current-agent
+                  (symbol-name (or agent-preset 'gptel-agent)))
       (unless gptel-max-tokens              ;Agent tasks typically need
         (setq-local gptel-max-tokens 8192)) ;a higher than usual value
       (when gptel-use-header-line
@@ -918,6 +925,8 @@ this session, which defaults to the default `gptel-agent'."
                   (gptel--apply-preset
                    (car (nth current modes))
                    (lambda (sym val) (set (make-local-variable sym) val)))
+                  (setq-local gptel-agent--current-agent
+                              (symbol-name (car (nth current modes))))
                   (force-mode-line-update)))
                (display-mode
                 (lambda ()

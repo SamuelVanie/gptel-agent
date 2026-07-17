@@ -132,6 +132,63 @@ Set to nil to disable the timeout."
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
 
+(defcustom gptel-agent-max-request-retries 2
+  "Maximum transient transport retries for one sub-agent run.
+
+Retries reuse the request FSM and payload, so completed tool calls are not
+repeated.  Authentication, malformed-request and unsupported-parameter
+errors are never retried."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-retry-delay 1.0
+  "Initial delay in seconds before retrying a transient request failure.
+
+Successive retries use exponential backoff."
+  :type 'number
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-max-request-rounds 30
+  "Maximum model request rounds in a sub-agent run.
+
+The initial model request is one round and every request following tool
+results is another.  Transport retries do not consume additional rounds.
+Set to nil to disable this limit."
+  :type '(choice (natnum :tag "Maximum rounds")
+                 (const :tag "Disable" nil))
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-run-history-size 20
+  "Number of terminal sub-agent run summaries retained for diagnostics."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defvar-local gptel-agent--current-agent nil
+  "Name of the agent represented by the current buffer.")
+
+(defvar-local gptel-agent--agent-snapshot nil
+  "Request-stable snapshot of agent definitions available in this buffer.")
+
+(defvar-local gptel-agent--registry-snapshot nil
+  "Project-local snapshot of all discovered agent definitions.")
+
+(defvar gptel-agent--run-counter 0
+  "Monotonic counter used to assign identifiers to sub-agent runs.")
+
+(defvar gptel-agent--runs (make-hash-table :test #'equal)
+  "Live sub-agent runs keyed by run identifier.")
+
+(defvar gptel-agent--run-history nil
+  "Recent terminal sub-agent run summaries, newest first.")
+
+(cl-defstruct (gptel-agent--run
+               (:constructor gptel-agent--make-run))
+  "Owned state for one delegated Agent tool invocation."
+  id state agent description prompt
+  parent-fsm parent-buffer child-buffer overlay callback
+  fsm response response-checkpoint rounds retries retry-timer timeout-timer
+  parent-kill-hook terminal-reason started-at configuration)
+
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
   "Last tool call key tracked for repetition detection.
@@ -1572,44 +1629,291 @@ the known skills as string ready to be included to the context."
       (funcall transformer partial)
     partial))
 
+(defconst gptel-agent--request-config-variables
+  '(gptel-backend gptel-model gptel-stream gptel-system-prompt
+    gptel-tools gptel-use-tools gptel-use-context gptel-context
+    gptel--request-params gptel-temperature gptel-max-tokens
+    gptel-include-reasoning gptel-cache gptel-use-curl
+    gptel-confirm-tool-calls gptel-prompt-transform-functions
+    gptel-pre-tool-call-functions gptel-post-tool-call-functions
+    gptel-org-convert-response gptel-track-media
+    gptel--num-messages-to-send)
+  "gptel settings copied into and owned by a sub-agent request buffer.")
+
+(defconst gptel-agent--terminal-run-states
+  '(completed failed timed-out cancelled)
+  "Terminal states of a `gptel-agent--run'.")
+
+(defun gptel-agent--run-active-p (run)
+  "Return non-nil when RUN has not reached a terminal state."
+  (not (memq (gptel-agent--run-state run)
+             gptel-agent--terminal-run-states)))
+
+(defun gptel-agent--run-from-fsm (fsm)
+  "Return the sub-agent run owned by FSM."
+  (plist-get (gptel-fsm-info fsm) :context))
+
+(defun gptel-agent--run-cancel-timer (run accessor setter)
+  "Cancel RUN timer returned by ACCESSOR and clear it with SETTER."
+  (when-let* ((timer (funcall accessor run)))
+    (cancel-timer timer)
+    (funcall setter nil run)))
+
+(defun gptel-agent--run-abort-transport (run)
+  "Abort RUN's exact child request, if it still has an active transport."
+  (when-let* ((fsm (gptel-agent--run-fsm run))
+              (info (gptel-fsm-info fsm)))
+    ;; Avoid a second semantic completion through gptel's abort callback.
+    (plist-put info :callback #'ignore))
+  (when (buffer-live-p (gptel-agent--run-child-buffer run))
+    (ignore-errors (gptel-abort (gptel-agent--run-child-buffer run)))))
+
+(defun gptel-agent--record-terminal-run (run result)
+  "Retain a bounded diagnostic summary of terminal RUN and RESULT."
+  (let* ((configuration (gptel-agent--run-configuration run))
+         (backend (plist-get configuration :backend))
+         (summary
+          (list :id (gptel-agent--run-id run)
+                :state (gptel-agent--run-state run)
+                :agent (gptel-agent--run-agent run)
+                :description (gptel-agent--run-description run)
+                :terminal-reason (gptel-agent--run-terminal-reason run)
+                :rounds (gptel-agent--run-rounds run)
+                :retries (gptel-agent--run-retries run)
+                :backend (and backend (gptel-backend-name backend))
+                :model (plist-get configuration :model)
+                :stream (plist-get configuration :stream)
+                :started-at (gptel-agent--run-started-at run)
+                :ended-at (float-time)
+                :result (and (not (eq (gptel-agent--run-state run) 'completed))
+                             (truncate-string-to-width
+                              (gptel--to-string result) 1000 nil nil t)))))
+    (if (zerop gptel-agent-run-history-size)
+        (setq gptel-agent--run-history nil)
+      (push summary gptel-agent--run-history)
+      (when (> (length gptel-agent--run-history)
+               gptel-agent-run-history-size)
+        (setcdr (nthcdr (1- gptel-agent-run-history-size)
+                        gptel-agent--run-history)
+                nil)))))
+
+(defun gptel-agent--run-finish (run state result &optional reason suppress-delivery)
+  "Finish RUN exactly once in terminal STATE with RESULT.
+
+REASON is retained for diagnostics.  When SUPPRESS-DELIVERY is non-nil, do
+not send RESULT to the parent tool callback."
+  (when (gptel-agent--run-active-p run)
+    (setf (gptel-agent--run-state run) state
+          (gptel-agent--run-terminal-reason run) reason)
+    (gptel-agent--run-cancel-timer
+     run #'gptel-agent--run-timeout-timer
+     (lambda (value object)
+       (setf (gptel-agent--run-timeout-timer object) value)))
+    (gptel-agent--run-cancel-timer
+     run #'gptel-agent--run-retry-timer
+     (lambda (value object)
+       (setf (gptel-agent--run-retry-timer object) value)))
+    (when (memq state '(timed-out cancelled))
+      (gptel-agent--run-abort-transport run))
+    (gptel-agent--record-terminal-run run result)
+    (gptel-agent--task-cleanup-overlay (gptel-agent--run-overlay run))
+    (when (buffer-live-p (gptel-agent--run-parent-buffer run))
+      (with-current-buffer (gptel-agent--run-parent-buffer run)
+        (when-let* ((hook (gptel-agent--run-parent-kill-hook run)))
+          (remove-hook 'kill-buffer-hook hook t))))
+    (remhash (gptel-agent--run-id run) gptel-agent--runs)
+    (when (and (not suppress-delivery)
+               (buffer-live-p (gptel-agent--run-parent-buffer run)))
+      ;; Async tool callbacks can arrive from a Curl/process buffer.  Resume
+      ;; the parent FSM in its own buffer so its buffer-local gptel settings
+      ;; cannot be taken from an unrelated concurrent request.
+      (with-current-buffer (gptel-agent--run-parent-buffer run)
+        (condition-case err
+            (funcall (gptel-agent--run-callback run) result)
+          (error
+           (message "gptel-agent: parent callback for run %s failed: %S"
+                    (gptel-agent--run-id run) err)))))
+    (when (buffer-live-p (gptel-agent--run-child-buffer run))
+      (kill-buffer (gptel-agent--run-child-buffer run)))
+    t))
+
+(defun gptel-agent--cancel-runs-for-buffer (parent-buffer)
+  "Cancel live sub-agent runs owned by PARENT-BUFFER.
+
+Return the number cancelled.  Each distinct parent FSM is transitioned to
+ABRT after its children have stopped."
+  (let (runs parent-fsms)
+    ;; `gptel-agent--run-finish' removes entries, so collect before iterating.
+    (maphash
+     (lambda (_id run)
+       (when (eq (gptel-agent--run-parent-buffer run) parent-buffer)
+         (push run runs)))
+     gptel-agent--runs)
+    (dolist (run runs)
+      (cl-pushnew (gptel-agent--run-parent-fsm run) parent-fsms :test #'eq)
+      (gptel-agent--run-finish
+       run 'cancelled "Error: Parent request was aborted." 'parent-abort t))
+    (dolist (fsm parent-fsms)
+      (when (and (gptel-fsm-p fsm)
+                 (not (memq (gptel-fsm-state fsm) '(DONE ERRS ABRT))))
+        (gptel--fsm-transition fsm 'ABRT)))
+    (length runs)))
+
+(defun gptel-agent--abort-with-owned-runs (original buffer)
+  "Around advice for `gptel-abort' that also cancels BUFFER's children."
+  (gptel-agent--cancel-runs-for-buffer buffer)
+  (funcall original buffer))
+
+(defun gptel-agent--error-text (info)
+  "Return a normalized diagnostic string for failed request INFO."
+  (downcase
+   (mapconcat #'gptel--to-string
+              (delq nil (list (plist-get info :status)
+                              (plist-get info :http-status)
+                              (plist-get info :error)))
+              " ")))
+
+(defun gptel-agent--transient-request-error-p (info)
+  "Return non-nil when failed request INFO is safe to retry."
+  (let* ((text (gptel-agent--error-text info))
+         (http-raw (plist-get info :http-status))
+         (http (cond ((numberp http-raw) http-raw)
+                     ((stringp http-raw) (string-to-number http-raw))
+                     (t 0))))
+    (and
+     ;; Deterministic client/configuration failures must remain terminal.
+     (not (string-match-p
+           (concat "auth\\|unauthori[sz]ed\\|forbidden\\|invalid api\\|"
+                   "malformed\\|unsupported\\|unknown parameter\\|"
+                   "invalid_request\\|bad request\\|stream must be")
+           text))
+     (or (memq http '(408 409 425 429))
+         (>= http 500)
+         (string-match-p
+          (concat "curl failure\\|curl failed\\|timed? out\\|timeout\\|"
+                  "temporar\\|connection reset\\|connection refused\\|"
+                  "connection closed\\|network\\|dns\\|name resolution\\|"
+                  "empty reply\\|recv failure\\|send failure")
+          text)))))
+
+(defun gptel-agent--retry-request (run fsm)
+  "Retry RUN's current request payload through FSM after backoff."
+  (let* ((retry (1+ (gptel-agent--run-retries run)))
+         (delay (* gptel-agent-retry-delay (expt 2 (1- retry)))))
+    ;; Streaming failures may have delivered a partial response.  Replaying
+    ;; the same payload must replace those chunks, not duplicate them.
+    (setf (gptel-agent--run-response run)
+          (substring (gptel-agent--run-response run) 0
+                     (gptel-agent--run-response-checkpoint run)))
+    (setf (gptel-agent--run-retries run) retry
+          (gptel-agent--run-state run) 'retry-wait
+          (gptel-agent--run-retry-timer run)
+          (run-at-time
+           delay nil
+           (lambda (owned-run owned-fsm)
+             (setf (gptel-agent--run-retry-timer owned-run) nil)
+             (when (and (gptel-agent--run-active-p owned-run)
+                        (buffer-live-p
+                         (gptel-agent--run-child-buffer owned-run)))
+               (let ((info (gptel-fsm-info owned-fsm)))
+                 (dolist (key '(:error :status :http-status))
+                   (plist-put info key nil)))
+               (with-current-buffer
+                   (gptel-agent--run-child-buffer owned-run)
+                 (gptel--fsm-transition owned-fsm 'WAIT))))
+           run fsm))))
+
 (defun gptel-agent--handle-task-error (fsm)
-  "Handle ERRS state for a sub-agent task FSM.
-Ensures the parent callback is called with an error message."
-  (when-let* ((info (gptel-fsm-info fsm))
-              (cb (plist-get info :gptel-agent-finish)))
-    (funcall cb
-             (format "Error: Sub-agent request failed. Status: %s, Error: %S"
-                     (plist-get info :status)
-                     (plist-get info :error)))))
+  "Retry or terminate a sub-agent FSM in ERRS state."
+  (let* ((info (gptel-fsm-info fsm))
+         (run (gptel-agent--run-from-fsm fsm)))
+    (when (and run (gptel-agent--run-active-p run))
+      (if (and (< (gptel-agent--run-retries run)
+                  gptel-agent-max-request-retries)
+               (gptel-agent--transient-request-error-p info))
+          (gptel-agent--retry-request run fsm)
+        (gptel-agent--run-finish
+         run 'failed
+         (format "Error: Sub-agent request failed. Status: %s, Error: %S"
+                 (or (plist-get info :status) "unknown")
+                 (plist-get info :error))
+         (or (plist-get info :error) (plist-get info :status)))))))
 
 (defun gptel-agent--handle-task-done (fsm)
-  "Handle DONE state for a sub-agent task FSM.
-If the parent callback was not yet called (e.g. empty response),
-call it with a fallback message."
-  (when-let* ((info (gptel-fsm-info fsm))
-              (cb (plist-get info :gptel-agent-finish)))
-    ;; If we reach DONE, the callback should have been called already via
-    ;; the stringp branch.  This is a safety net for empty responses.
-    (funcall cb
-             (format "Error: Sub-agent completed but produced no usable output. \
-Status: %s"
-                     (or (plist-get info :status) "unknown")))))
+  "Complete a sub-agent FSM only when it enters DONE."
+  (let* ((info (gptel-fsm-info fsm))
+         (run (gptel-agent--run-from-fsm fsm))
+         (response (and run (gptel-agent--run-response run))))
+    (when (and run (gptel-agent--run-active-p run))
+      (if (string-blank-p (or response ""))
+          (gptel-agent--run-finish
+           run 'failed
+           (format "Error: Sub-agent completed but produced no usable output. \
+Status: %s" (or (plist-get info :status) "unknown"))
+           'empty-response)
+        (gptel-agent--run-finish
+         run 'completed
+         (gptel-agent--task-finish-response
+          (format "%s result for task: %s\n\n%s"
+                  (capitalize (gptel-agent--run-agent run))
+                  (gptel-agent--run-description run)
+                  response)
+          info)
+         'done)))))
 
 (defun gptel-agent--handle-task-abort (fsm)
-  "Handle ABRT state for a sub-agent task FSM.
-Ensures the parent callback is called with an abort message."
-  (when-let* ((info (gptel-fsm-info fsm))
-              (cb (plist-get info :gptel-agent-finish)))
-    (funcall cb "Error: Sub-agent request was aborted.")))
+  "Terminate a sub-agent FSM that enters ABRT."
+  (when-let* ((run (gptel-agent--run-from-fsm fsm))
+              ((gptel-agent--run-active-p run)))
+    (gptel-agent--run-finish
+     run 'cancelled "Error: Sub-agent request was aborted." 'aborted)))
+
+(defun gptel-agent--handle-task-wait (fsm)
+  "Send the next request for FSM while enforcing RUN's round budget."
+  (let* ((run (gptel-agent--run-from-fsm fsm))
+         (retryp (and run (eq (gptel-agent--run-state run) 'retry-wait))))
+    (when (and run (gptel-agent--run-active-p run))
+      (if (and (not retryp)
+               gptel-agent-max-request-rounds
+               (>= (gptel-agent--run-rounds run)
+                   gptel-agent-max-request-rounds))
+          (gptel-agent--run-finish
+           run 'failed
+           (format "Error: Sub-agent exceeded the limit of %d model/tool rounds."
+                   gptel-agent-max-request-rounds)
+           'round-limit)
+        (unless retryp
+          (cl-incf (gptel-agent--run-rounds run))
+          (setf (gptel-agent--run-response-checkpoint run)
+                (length (gptel-agent--run-response run))))
+        (unless (eq (gptel-agent--run-state run) 'requesting-after-tool)
+          (setf (gptel-agent--run-state run) 'requesting))
+        ;; `gptel--handle-wait' consults buffer-local transport settings.
+        (with-current-buffer (gptel-agent--run-child-buffer run)
+          (gptel--handle-wait fsm))))))
+
+(defun gptel-agent--handle-task-tool (fsm)
+  "Run tools for FSM and record that its supervisor is waiting on them."
+  (when-let* ((run (gptel-agent--run-from-fsm fsm))
+              ((gptel-agent--run-active-p run)))
+    (setf (gptel-agent--run-state run) 'waiting-for-tool)
+    (gptel-agent--indicate-tool-call fsm)
+    (gptel--handle-tool-use fsm)))
+
+(defun gptel-agent--handle-task-tool-result (fsm)
+  "Process tool results for FSM unless its owner is already terminal."
+  (when-let* ((run (gptel-agent--run-from-fsm fsm))
+              ((gptel-agent--run-active-p run)))
+    (setf (gptel-agent--run-state run) 'requesting-after-tool)
+    (gptel--handle-post-tool fsm)
+    (gptel--handle-tool-result fsm)))
 
 (defvar gptel-agent-request--handlers
   `((WAIT ,#'gptel-agent--indicate-wait
-          ,#'gptel--handle-wait)
+          ,#'gptel-agent--handle-task-wait)
     (TPRE ,#'gptel--handle-pre-tool ,#'gptel--fsm-transition)
-    (TOOL ,#'gptel-agent--indicate-tool-call
-          ,#'gptel--handle-tool-use)
-    (TRET ,#'gptel--handle-post-tool
-          ,#'gptel--handle-tool-result)
+    (TOOL ,#'gptel-agent--handle-task-tool)
+    (TRET ,#'gptel-agent--handle-task-tool-result)
     (ERRS ,#'gptel-agent--handle-task-error)
     (DONE ,#'gptel-agent--handle-task-done)
     (ABRT ,#'gptel-agent--handle-task-abort))
@@ -1638,7 +1942,8 @@ ARG-VALUES is a list: (type description prompt)"
 (defun gptel-agent--indicate-wait (fsm)
   "Display waiting indicator for agent task FSM."
   (when-let* ((info (gptel-fsm-info fsm))
-              (info-ov (plist-get info :context))
+              (run (plist-get info :context))
+              (info-ov (gptel-agent--run-overlay run))
               ((overlayp info-ov))
               ((overlay-buffer info-ov))
               (count (overlay-get info-ov 'count)))
@@ -1661,7 +1966,8 @@ ARG-VALUES is a list: (type description prompt)"
   "Display tool call indicator for agent task FSM."
   (when-let* ((info (gptel-fsm-info fsm))
               (tool-use (plist-get info :tool-use))
-              (ov (plist-get info :context))
+              (run (plist-get info :context))
+              (ov (gptel-agent--run-overlay run))
               ((overlayp ov))
               ((overlay-buffer ov)))
     ;; Update overlay with tool calls
@@ -1717,155 +2023,177 @@ ARG-VALUES is a list: (type description prompt)"
        (concat msg (propertize "Waiting..." 'face 'warning) "\n"
                gptel-agent--hrule)))))
 
-(defun gptel-agent--task (main-cb agent-type description prompt)
+(defun gptel-agent--copy-parent-request-config (parent-buffer child-buffer)
+  "Copy owned gptel request settings from PARENT-BUFFER to CHILD-BUFFER."
+  (dolist (symbol gptel-agent--request-config-variables)
+    (when (boundp symbol)
+      (let ((value (buffer-local-value symbol parent-buffer)))
+        (with-current-buffer child-buffer
+          (set (make-local-variable symbol)
+               (if (consp value) (copy-tree value) value)))))))
+
+(defun gptel-agent--task (main-cb agent-type description prompt
+                                  &optional parent-fsm agent-snapshot)
   "Call a gptel agent to do specific compound tasks.
 
 MAIN-CB is the main callback to return a value to the main loop.
 AGENT-TYPE is the name of the agent.
 DESCRIPTION is a short description of the task.
-PROMPT is the detailed prompt instructing the agent on what is required."
-  (gptel-with-preset
-      (nconc (list :include-reasoning nil
-                   :use-tools t
-                   :context nil)       ;Can be overriden by agent
-              (and gptel-agent-preset
-                   (copy-sequence
-                    (cl-etypecase gptel-agent-preset
-                      (symbol (gptel-get-preset gptel-agent-preset))
-                      (plist gptel-agent-preset))))
-              (gptel-agent--agent-plist agent-type))
-    (let* ((info (gptel-fsm-info gptel--fsm-last))
-           (parent-buffer (plist-get info :buffer))
-           (where (or (plist-get info :tracking-marker)
-                      (plist-get info :position)))
-           (partial (format "%s result for task: %s\n\n"
-                            (capitalize agent-type) description))
-           (saved-last-tool-call-key gptel-agent--last-tool-call-key)
-           (saved-tool-call-streak gptel-agent--tool-call-streak)
-           ;; Once-only wrapper: ensures main-cb is called at most once.
-           ;; After the first call, subsequent calls are no-ops.
-           (done nil)
-           (timeout-timer nil)
-           (parent-killed nil)
-           (parent-kill-hook nil)
-           (finish
-             (lambda (result)
-               (unless done
-                 (setq done t)
-                 (when timeout-timer
-                   (cancel-timer timeout-timer)
-                   (setq timeout-timer nil))
-                 (when (buffer-live-p parent-buffer)
-                   (with-current-buffer parent-buffer
-                     (when parent-kill-hook
-                       (remove-hook 'kill-buffer-hook parent-kill-hook t))))
-                 (setq gptel-agent--last-tool-call-key saved-last-tool-call-key
-                       gptel-agent--tool-call-streak saved-tool-call-streak)
-                 (unless parent-killed
-                   (if (buffer-live-p parent-buffer)
-                       (condition-case err
-                           (funcall main-cb result)
-                         (error
-                          (message "gptel-agent: error in main-cb: %S" err)))
-                     (message
-                      "gptel-agent: parent buffer killed; dropping result for task \"%s\""
-                      description)))))))
-      (gptel-agent--reset-tool-call-counts)
-      (gptel--update-status " Calling Agent..." 'font-lock-escape-face)
-      (let* ((task-ov (gptel-agent--task-overlay where agent-type description))
-             (task-callback
-              (lambda (resp info)
-                (condition-case err
-                    (let ((ov (plist-get info :context)))
-                      (pcase resp
-                        ('nil
-                         (gptel-agent--task-cleanup-overlay ov)
-                         (funcall finish
-                                  (format "Error: Task %s could not finish task \"%s\". \
-Error details: %S"
-                                          agent-type description
-                                          (plist-get info :error))))
-                        ('t
-                         (unless (plist-get info :tool-use)
-                           (gptel-agent--task-cleanup-overlay ov)
-                           (funcall finish
-                                    (gptel-agent--task-finish-response
-                                     partial info))))
-                        (`(tool-call . ,calls)
-                         (unless (plist-get info :tracking-marker)
-                           (plist-put info :tracking-marker where))
-                         (gptel--display-tool-calls calls info))
-                        ((pred stringp)
-                         (setq partial (concat partial resp))
-                         ;; If tool use is pending, the agent isn't done, so we
-                         ;; just accumulate output without printing it.  For
-                         ;; streaming, finish on the final t callback.
-                         (unless (or (plist-get info :tool-use)
-                                     (plist-get info :stream))
-                           (gptel-agent--task-cleanup-overlay ov)
-                           (funcall finish
-                                    (gptel-agent--task-finish-response
-                                     partial info))))
-                        ('abort
-                         (gptel-agent--task-cleanup-overlay ov)
-                         (funcall finish
-                                  (format "Error: Task \"%s\" was aborted by the user. \
-%s could not finish."
-                                          description agent-type)))
-                        ;; Reasoning chunks — accumulate silently
-                        (`(reasoning . ,_) nil)
-                        ;; Tool results — ignore, FSM handles continuation
-                        (`(tool-result . ,_) nil)
-                        ;; Catch-all for unexpected response types
-                        (_
-                         (message "gptel-agent: unexpected callback response type: %S"
-                                  (type-of resp)))))
-                  (error
-                   (message "gptel-agent: callback error for task \"%s\": %S"
-                            description err)
-                   (gptel-agent--task-cleanup-overlay (plist-get info :context))
-                   (funcall finish
-                            (format "Error: Internal error in sub-agent task \"%s\": %S"
-                                    description err))))))
-             (task-fsm
-              (gptel-request prompt
-                :context task-ov
-                :fsm (gptel-make-fsm :table gptel-send--transitions
-                                     :handlers gptel-agent-request--handlers)
-                :transforms (list #'gptel--transform-add-context)
-                :callback task-callback)))
-        (setq parent-kill-hook
-              (lambda ()
-                (setq parent-killed t
-                      done t)
-                (when timeout-timer
-                  (cancel-timer timeout-timer)
-                  (setq timeout-timer nil))
-                (setq gptel-agent--last-tool-call-key saved-last-tool-call-key
-                      gptel-agent--tool-call-streak saved-tool-call-streak)
-                (ignore-errors
-                  (gptel-abort parent-buffer))))
-        (when (buffer-live-p parent-buffer)
-          (with-current-buffer parent-buffer
-            (add-hook 'kill-buffer-hook parent-kill-hook nil t)))
-        ;; Start timeout timer
-        (when gptel-agent-task-timeout
-          (setq timeout-timer
-                (run-at-time
-                 gptel-agent-task-timeout nil
-                 (lambda (ov)
-                   (unless done
-                     (gptel-agent--task-cleanup-overlay ov)
-                     (funcall finish
-                              (format "Error: Sub-agent task \"%s\" timed out \
-after %d seconds. The %s agent did not complete in time."
-                                      description gptel-agent-task-timeout
-                                      agent-type))))
-                 task-ov)))
-        ;; Store the finish function in the FSM info so ERRS/DONE/ABRT
-        ;; handlers can call it as a fallback.
-        (when task-fsm
-          (plist-put (gptel-fsm-info task-fsm) :gptel-agent-finish finish))))))
+PROMPT is the detailed prompt instructing the agent on what is required.
+PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
+  (let* ((parent-info (and (gptel-fsm-p parent-fsm)
+                           (gptel-fsm-info parent-fsm)))
+         (parent-buffer (and parent-info (plist-get parent-info :buffer)))
+         (agent-snapshot (or agent-snapshot gptel-agent--agent-snapshot
+                             (gptel-agent--snapshot-agent-definitions)))
+         (agent-plist (cdr (assoc-string agent-type agent-snapshot t))))
+    (cond
+     ((not (buffer-live-p parent-buffer))
+      (funcall main-cb "Error: Agent dispatch has no live parent request."))
+     ((not agent-plist)
+      (with-current-buffer parent-buffer
+        (funcall main-cb
+                 (format "Error: Agent %S is not available for this request."
+                         agent-type))))
+     (t
+      (let* ((where (or (plist-get parent-info :tracking-marker)
+                        (plist-get parent-info :position)))
+             (parent-position
+              (if (markerp where)
+                  (copy-marker where)
+                (with-current-buffer parent-buffer
+                  (set-marker (make-marker) where))))
+             (child-buffer
+              (generate-new-buffer
+               (format " *gptel-agent-run:%s*" agent-type)))
+             (preset (and gptel-agent-preset
+                          (copy-sequence
+                           (if (symbolp gptel-agent-preset)
+                               (gptel-get-preset gptel-agent-preset)
+                             gptel-agent-preset))))
+             (configuration
+              (append (list :include-reasoning nil :use-tools t :context nil)
+                      preset (copy-tree agent-plist)))
+             (run (gptel-agent--make-run
+                   :id (format "agent-%d" (cl-incf gptel-agent--run-counter))
+                   :state 'created :agent agent-type :description description
+                   :prompt prompt :parent-fsm parent-fsm
+                   :parent-buffer parent-buffer :child-buffer child-buffer
+                   :callback main-cb :response "" :response-checkpoint 0
+                   :rounds 0 :retries 0
+                   :started-at (float-time))))
+        (condition-case err
+            (progn
+              (gptel-agent--copy-parent-request-config
+               parent-buffer child-buffer)
+              (with-current-buffer child-buffer
+                (setq default-directory
+                      (buffer-local-value 'default-directory parent-buffer))
+                (setq-local gptel-agent--current-agent agent-type
+                            gptel-agent--agent-snapshot agent-snapshot
+                            gptel--preset nil)
+                (gptel--apply-preset
+                 configuration
+                 (lambda (symbol value)
+                   (set (make-local-variable symbol) value)))
+                (gptel-agent--reset-tool-call-counts)
+                (setf (gptel-agent--run-configuration run)
+                      (list :backend gptel-backend :model gptel-model
+                            :stream gptel-stream :system gptel-system-prompt
+                            :tools (copy-sequence gptel-tools)
+                            :request-params (copy-tree gptel--request-params))))
+              (with-current-buffer parent-buffer
+                (gptel--update-status " Calling Agent..."
+                                      'font-lock-escape-face)
+                (setf (gptel-agent--run-overlay run)
+                      (gptel-agent--task-overlay
+                       where agent-type description)))
+              (puthash (gptel-agent--run-id run) run gptel-agent--runs)
+              (let ((parent-kill-hook
+                     (lambda ()
+                       (gptel-agent--run-finish
+                        run 'cancelled
+                        "Error: Parent buffer was killed during sub-agent task."
+                        'parent-killed t))))
+                (setf (gptel-agent--run-parent-kill-hook run)
+                      parent-kill-hook)
+                (with-current-buffer parent-buffer
+                  (add-hook 'kill-buffer-hook parent-kill-hook nil t)))
+              (with-current-buffer child-buffer
+                (add-hook
+                 'kill-buffer-hook
+                 (lambda ()
+                   (when (gptel-agent--run-active-p run)
+                     (gptel-agent--run-finish
+                      run 'failed
+                      "Error: Sub-agent request buffer was killed."
+                      'child-buffer-killed)))
+                 nil t))
+              (when gptel-agent-task-timeout
+                (setf (gptel-agent--run-timeout-timer run)
+                      (run-at-time
+                       gptel-agent-task-timeout nil
+                       (lambda (owned-run)
+                         (when (gptel-agent--run-active-p owned-run)
+                           (gptel-agent--run-finish
+                            owned-run 'timed-out
+                            (format "Error: Sub-agent task %S timed out after %d seconds."
+                                    (gptel-agent--run-description owned-run)
+                                    gptel-agent-task-timeout)
+                            'timeout)))
+                       run)))
+              (with-current-buffer child-buffer
+                (let* ((transforms
+                        (cl-remove 'gptel--transform-apply-preset
+                                   gptel-prompt-transform-functions))
+                       (transforms
+                        (if (memq #'gptel-agent--localize-agent-tool transforms)
+                            transforms
+                          (append transforms
+                                  (list #'gptel-agent--localize-agent-tool))))
+                       (task-callback
+                        (lambda (resp info)
+                          (condition-case callback-error
+                              (pcase resp
+                                ((pred stringp)
+                                 (setf (gptel-agent--run-response run)
+                                       (concat
+                                        (gptel-agent--run-response run) resp)))
+                                (`(tool-call . ,calls)
+                                 (unless (plist-get info :tracking-marker)
+                                   (plist-put info :tracking-marker where))
+                                 (gptel--display-tool-calls calls info))
+                                ;; ERRS, DONE and ABRT handlers own terminal
+                                ;; completion.  Other callback events are data.
+                                (_ nil))
+                            (error
+                             (gptel-agent--run-finish
+                              run 'failed
+                              (format "Error: Internal callback error in task %S: %S"
+                                      description callback-error)
+                              callback-error)))))
+                       (fsm
+                        (gptel-request prompt
+                          :buffer child-buffer
+                          ;; Keep confirmation UI in the visible parent while
+                          ;; all request configuration and tool execution stay
+                          ;; isolated in CHILD-BUFFER.
+                          :position parent-position
+                          :stream gptel-stream
+                          :system gptel-system-prompt
+                          :context run
+                          :fsm (gptel-make-fsm
+                                :table gptel-send--transitions
+                                :handlers gptel-agent-request--handlers)
+                          :transforms transforms
+                          :callback task-callback)))
+                  (setf (gptel-agent--run-fsm run) fsm))))
+          (error
+           (gptel-agent--run-finish
+            run 'failed
+            (format "Error: Could not start sub-agent task %S: %S"
+                    description err)
+            err))))))))
 
 ;;; Register tool call preview functions
 
@@ -2496,19 +2824,84 @@ Treat agent results as evidence reports: inspect their evidence, assumptions, \
 verification gaps and confidence before relying on them."
   "Base description for the Agent tool, without the available agents list.")
 
+(defun gptel-agent--full-agent-definitions ()
+  "Return full definitions for the currently discovered agent registry."
+  (mapcar
+   (lambda (entry)
+     (cons (car entry)
+           (copy-tree
+            (or (gptel-agent--agent-plist (car entry))
+                (cdr entry)))))
+   gptel-agent--agents))
+
+(defun gptel-agent--snapshot-agent-definitions ()
+  "Return full, request-stable definitions for currently allowed agents."
+  (let* ((inherited gptel-agent--agent-snapshot)
+         (source (or inherited
+                     gptel-agent--registry-snapshot
+                     (gptel-agent--full-agent-definitions)))
+         ;; An inherited snapshot was already filtered by the parent request.
+         (enabled (and (not inherited) gptel-agent--enabled-agents))
+         (current gptel-agent--current-agent))
+    (cl-loop for (name . plist) in source
+             unless (or (member name '("gptel-agent" "gptel-plan" "ask"))
+                        (and current (string-equal name current))
+                        (and enabled (not (member name enabled))))
+             collect (cons name (copy-tree plist)))))
+
+(defun gptel-agent--agent-snapshot-message (snapshot)
+  "Format SNAPSHOT for an invocation-specific Agent tool description."
+  (concat
+   "Available sub-agents for this request.  Use them when appropriate."
+   "\n<available_agents>\n"
+   (mapconcat
+    (lambda (agent)
+      (format "  <agent>\n    <name>%s</name>\n    <description>%s</description>\n  </agent>"
+              (car agent) (or (plist-get (cdr agent) :description) "")))
+    snapshot "\n")
+   "\n</available_agents>"))
+
+(defun gptel-agent--localize-agent-tool (fsm)
+  "Replace Agent in the current prompt buffer with an FSM-owned clone.
+
+The clone captures FSM and a snapshot of the allowed agent registry.  Its
+schema and dispatcher therefore cannot change when another project updates
+the global registry while this request is in flight."
+  (when-let* ((base-tool
+               (cl-find "Agent" gptel-tools
+                        :key #'gptel-tool-name :test #'string=)))
+    (let* ((source-buffer (plist-get (gptel-fsm-info fsm) :buffer))
+           ;; gptel copies only its own buffer-local variables into the prompt
+           ;; transform buffer.  Read our project/agent identity from the
+           ;; explicit request buffer recorded in FSM instead.
+           (snapshot
+            (if (buffer-live-p source-buffer)
+                (with-current-buffer source-buffer
+                  (gptel-agent--snapshot-agent-definitions))
+              (gptel-agent--snapshot-agent-definitions)))
+           (tool (gptel--copy-tool base-tool))
+           (args (copy-tree (gptel-tool-args base-tool))))
+      (setf (gptel-tool-description tool)
+            (concat gptel-agent--agent-tool-base-desc "\n\n"
+                    (gptel-agent--agent-snapshot-message snapshot))
+            (gptel-tool-args tool) args
+            (plist-get (car args) :enum) (vconcat (mapcar #'car snapshot))
+            (gptel-tool-function tool)
+            (lambda (main-cb agent-type description prompt)
+              (gptel-agent--task main-cb agent-type description prompt
+                                 fsm snapshot)))
+      (setq-local
+       gptel-tools
+       (mapcar (lambda (candidate)
+                 (if (eq candidate base-tool) tool candidate))
+               gptel-tools)))))
+
 (defun gptel-agent--update-agent-tool ()
-  "Update the Agent tool's description and enum with currently enabled agents."
-  (let* ((tool (gptel-get-tool "Agent"))
-         (enabled (or gptel-agent--enabled-agents
-                      (cl-remove-if
-                       (lambda (name)
-                         (member name '("gptel-agent" "gptel-plan" "ask")))
-                       (mapcar #'car gptel-agent--agents))))
-         (agents-msg (gptel-agent--agents-tool-message gptel-agent--agents)))
-    (setf (gptel-tool-description tool)
-          (concat gptel-agent--agent-tool-base-desc "\n\n" agents-msg))
-    (setf (plist-get (car (gptel-tool-args tool)) :enum)
-          (vconcat enabled))))
+  "Retain compatibility; Agent schemas are now built per request.
+
+The registered tool is deliberately immutable.  See
+`gptel-agent--localize-agent-tool'."
+  (gptel-get-tool "Agent"))
 
 (gptel-make-tool
  :name "Agent"
@@ -2559,6 +2952,9 @@ none of the predefined options are suitable."
 ;;; Register repetition detection hook
 (add-hook 'gptel-pre-tool-call-functions #'gptel-agent--detect-repetition)
 (add-hook 'gptel-post-response-functions #'gptel-agent--reset-tool-call-counts)
+(add-hook 'gptel-prompt-transform-functions
+          #'gptel-agent--localize-agent-tool t)
+(advice-add 'gptel-abort :around #'gptel-agent--abort-with-owned-runs)
 
 (provide 'gptel-agent-tools)
 ;;; gptel-agent-tools.el ends here
