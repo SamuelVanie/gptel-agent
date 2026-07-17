@@ -254,6 +254,9 @@ from the Agent overlay until the user kills the buffer."
   tool-calls web-tool-calls finalization-reason
   finalization-requested finalization-started)
 
+(defconst gptel-agent--safety-stop-prefix "gptel-agent safety stop: "
+  "Prefix used to distinguish supervised safety stops from request errors.")
+
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
   "Last tool call key tracked for repetition detection.
@@ -2225,21 +2228,27 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
       (gptel-agent--run-log
        run "REQUEST ERROR status=%s error=%S"
        (or (plist-get info :status) "unknown") (plist-get info :error))
-      (if (and (< (gptel-agent--run-retries run)
+      (cond
+       ((gptel-agent--safety-stop-p info)
+        (gptel-agent--run-finish
+         run 'inconclusive
+         (gptel-agent--inconclusive-response run (plist-get info :error))
+         (plist-get info :error)))
+       ((and (< (gptel-agent--run-retries run)
                   gptel-agent-max-request-retries)
                (gptel-agent--transient-request-error-p info))
-          (progn
-            (gptel-agent--run-log
-             run "RETRY %d/%d scheduled"
-             (1+ (gptel-agent--run-retries run))
-             gptel-agent-max-request-retries)
-            (gptel-agent--retry-request run fsm))
+        (gptel-agent--run-log
+         run "RETRY %d/%d scheduled"
+         (1+ (gptel-agent--run-retries run))
+         gptel-agent-max-request-retries)
+        (gptel-agent--retry-request run fsm))
+       (t
         (gptel-agent--run-finish
          run 'failed
          (format "Error: Sub-agent request failed. Status: %s, Error: %S"
                  (or (plist-get info :status) "unknown")
                  (plist-get info :error))
-         (or (plist-get info :error) (plist-get info :status)))))))
+         (or (plist-get info :error) (plist-get info :status))))))))
 
 (defun gptel-agent--handle-task-done (fsm)
   "Complete a sub-agent FSM only when it enters DONE."
