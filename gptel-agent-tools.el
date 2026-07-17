@@ -726,29 +726,48 @@ passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  The tool
 callback is guaranteed to run at most once, including parser exceptions."
   (let* ((timeout gptel-agent-web-request-timeout) timer done proc-buffer
          (inherit-process-coding-system t)
-         (url-request-noninteractive t)
-         (proc-buffer
-          (url-retrieve
-           url (lambda (status)
-                 (setq done t)
-                 (when timer (cancel-timer timer))
-                 (if-let* ((err (plist-get status :error)))
-                     (funcall tool-cb
-                              (format "Error: %s failed with error: %S" failed-msg err))
-                   (apply url-cb tool-cb args))
-                 (kill-buffer (current-buffer)))
-           args 'silent)))
-    (setq timer
-          (run-at-time
-           timeout nil
-           (lambda (buf cb)
-             (unless done
-               (setq done t)
-               (let ((kill-buffer-query-functions)) (kill-buffer buf))
-               (funcall
-                cb (format "Error: %s timed out after %d seconds."
-                           failed-msg timeout))))
-           proc-buffer tool-cb))
+         (finish
+          (lambda (result)
+            (unless done
+              (setq done t)
+              (when timer (cancel-timer timer))
+              (funcall tool-cb result)))))
+    (condition-case err
+        (setq
+         proc-buffer
+         (url-retrieve
+          url
+          (lambda (status)
+            (unwind-protect
+                (if-let* ((request-error (plist-get status :error)))
+                    (funcall finish
+                             (format "Error: %s failed with error: %S"
+                                     failed-msg request-error))
+                  (condition-case parse-error
+                      (apply url-cb finish args)
+                    (error
+                     (funcall
+                      finish
+                      (format "Error: %s could not be parsed: %S"
+                              failed-msg parse-error)))))
+              (when (buffer-live-p (current-buffer))
+                (kill-buffer (current-buffer)))))
+          nil 'silent))
+      (error
+       (funcall finish
+                (format "Error: %s could not start: %S" failed-msg err))))
+    (when (and proc-buffer (not done))
+      (setq timer
+            (run-at-time
+             timeout nil
+             (lambda (buf)
+               (unless done
+                 (when (buffer-live-p buf)
+                   (let ((kill-buffer-query-functions)) (kill-buffer buf)))
+                 (funcall
+                  finish (format "Error: %s timed out after %d seconds."
+                                 failed-msg timeout))))
+             proc-buffer)))
     proc-buffer))
 
 (defun gptel-agent--web-response-body ()
