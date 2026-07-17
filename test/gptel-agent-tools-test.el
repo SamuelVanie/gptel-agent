@@ -304,6 +304,39 @@
                     '("this-project")))))
       (when (buffer-live-p source) (kill-buffer source)))))
 
+(ert-deftest gptel-agent-subagent-configuration-applies-each-layer ()
+  (let (events)
+    (with-temp-buffer
+      (gptel-agent--apply-subagent-configuration
+       (list :pre (lambda () (push 'preset-pre events))
+             :post (lambda () (push 'preset-post events))
+             :stream nil :temperature 0.2)
+       (list :pre (lambda () (push 'agent-pre events))
+             :post (lambda () (push 'agent-post events))
+             :stream t :temperature 0.7))
+      (should (eq gptel-stream t))
+      (should (= gptel-temperature 0.7)))
+    (should (equal (nreverse events)
+                   '(preset-pre preset-post agent-pre agent-post)))))
+
+(ert-deftest gptel-agent-unknown-subagent-preset-is-an-error ()
+  (should-error
+   (gptel-agent--resolve-subagent-preset
+   'gptel-agent-test-missing-preset)
+   :type 'user-error))
+
+(ert-deftest gptel-agent-named-subagent-preset-applies-parents ()
+  (let ((gptel--known-presets (copy-tree gptel--known-presets)))
+    (gptel-make-preset 'gptel-agent-test-parent :max-tokens 222)
+    (gptel-make-preset 'gptel-agent-test-child
+      :parents 'gptel-agent-test-parent :model 'named-preset-model)
+    (with-temp-buffer
+      (gptel-agent--apply-subagent-configuration
+       (gptel-agent--resolve-subagent-preset 'gptel-agent-test-child)
+       '(:description "Test agent"))
+      (should (eq gptel-model 'named-preset-model))
+      (should (= gptel-max-tokens 222)))))
+
 (ert-deftest gptel-agent-task-pins-stream-and-child-buffer ()
   (let* ((parent (generate-new-buffer " *gptel-agent-config-parent*"))
          (parent-fsm (gptel-make-fsm))
@@ -313,7 +346,11 @@
           (with-current-buffer parent
             (insert "prompt\n")
             (setq-local gptel-stream t
-                        gptel-model 'test-model)
+                        gptel-model 'test-model
+                        gptel-agent-preset
+                        '(:model preset-model :stream nil
+                          :temperature 0.2 :max-tokens 321
+                          :include-reasoning t :system "Preset system"))
             (setf (gptel-fsm-info parent-fsm)
                   (list :buffer parent :position (point-marker))))
           (cl-letf (((symbol-function 'gptel--update-status) #'ignore)
@@ -329,9 +366,11 @@
                          fsm))))
             (gptel-agent--task
              #'ignore "researcher" "pin config" "perform task" parent-fsm
-             '(("researcher" :description "Research" :system "Pinned system"))))
+             '(("researcher" :description "Research" :system "Pinned system"
+                :temperature 0.7))))
           (setq run (plist-get captured :context))
-          (should (eq (plist-get captured :stream) t))
+          (should (plist-member captured :stream))
+          (should-not (plist-get captured :stream))
           (should (buffer-live-p (plist-get captured :buffer)))
           (should-not (eq (plist-get captured :buffer) parent))
           (should (eq (marker-buffer (plist-get captured :position)) parent))
@@ -342,7 +381,11 @@
           (should (eq (gptel-agent--run-parent-fsm run) parent-fsm))
           (with-current-buffer (gptel-agent--run-child-buffer run)
             (should (string-match-p "Sub-agent run: agent-" (buffer-string)))
-            (should (string-match-p "perform task" (buffer-string))))
+            (should (string-match-p "perform task" (buffer-string)))
+            (should (eq gptel-model 'preset-model))
+            (should (= gptel-temperature 0.7))
+            (should (= gptel-max-tokens 321))
+            (should (eq gptel-include-reasoning t)))
           (should (string-match-p
                    "Inspect sub-agent"
                    (overlay-get (gptel-agent--run-overlay run) 'msg))))

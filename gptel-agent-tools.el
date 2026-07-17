@@ -2290,6 +2290,35 @@ button for its live diagnostic buffer."
           (set (make-local-variable symbol)
                (if (consp value) (copy-tree value) value)))))))
 
+(defun gptel-agent--resolve-subagent-preset (preset)
+  "Return an isolated preset spec for sub-agent PRESET.
+
+PRESET may be nil, a preset name, or a plist.  Signal a user error for an
+unknown named preset instead of silently ignoring it."
+  (cond
+   ((null preset) nil)
+   ((or (symbolp preset) (stringp preset))
+    (if-let* ((spec (gptel-get-preset preset)))
+        (copy-tree spec)
+      (user-error "gptel-agent: Cannot find sub-agent preset %S" preset)))
+   ((listp preset) (copy-tree preset))
+   (t (user-error "gptel-agent: Invalid sub-agent preset %S" preset))))
+
+(defun gptel-agent--apply-subagent-configuration (preset agent-plist)
+  "Apply PRESET and AGENT-PLIST to the current sub-agent buffer.
+
+The buffer's inherited request state is already installed.  Apply harness
+defaults first, then PRESET, then the per-agent settings so every layer's
+parents, hooks and composition forms run independently and later layers take
+precedence."
+  (let ((setter (lambda (symbol value)
+                  (set (make-local-variable symbol) value))))
+    (gptel--apply-preset
+     '(:include-reasoning nil :use-tools t :context nil) setter)
+    (when preset
+      (gptel--apply-preset preset setter))
+    (gptel--apply-preset (copy-tree agent-plist) setter)))
+
 (defun gptel-agent--task (main-cb agent-type description prompt
                                   &optional parent-fsm agent-snapshot)
   "Call a gptel agent to do specific compound tasks.
@@ -2324,14 +2353,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
              (child-buffer
               (generate-new-buffer
                (format " *gptel-agent-run:%s*" agent-type)))
-             (preset (and gptel-agent-preset
-                          (copy-sequence
-                           (if (symbolp gptel-agent-preset)
-                               (gptel-get-preset gptel-agent-preset)
-                             gptel-agent-preset))))
-             (configuration
-              (append (list :include-reasoning nil :use-tools t :context nil)
-                      preset (copy-tree agent-plist)))
+             (preset (buffer-local-value 'gptel-agent-preset parent-buffer))
              (task-prompt (gptel-agent--prepare-task-prompt prompt))
              (run (gptel-agent--make-run
                    :id (format "agent-%d" (cl-incf gptel-agent--run-counter))
@@ -2343,6 +2365,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                    :started-at (float-time))))
         (condition-case err
             (progn
+              (setq preset (gptel-agent--resolve-subagent-preset preset))
               (gptel-agent--copy-parent-request-config
                parent-buffer child-buffer)
               (with-current-buffer child-buffer
@@ -2352,10 +2375,8 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                             gptel-agent--agent-snapshot agent-snapshot
                             gptel-agent--supervised-run run
                             gptel--preset nil)
-                (gptel--apply-preset
-                 configuration
-                 (lambda (symbol value)
-                   (set (make-local-variable symbol) value)))
+                (gptel-agent--apply-subagent-configuration
+                 preset agent-plist)
                 (gptel-agent--reset-tool-call-counts)
                 (setf (gptel-agent--run-configuration run)
                       (list :backend gptel-backend :model gptel-model

@@ -162,6 +162,14 @@ options are =gptel-agent-task-timeout=, =gptel-agent-max-request-rounds=,
 =gptel-agent-max-request-retries= and =gptel-agent-retry-delay=.  Authentication
 and malformed-request errors are not retried.
 
+=gptel-agent-preset= may be a named gptel preset or a preset plist and can be
+set globally or buffer-locally on the parent request buffer.  Child request
+configuration is applied in this order: inherited parent settings, harness
+defaults, =gptel-agent-preset=, then per-agent frontmatter.  Thus unspecified
+parent settings are retained, the shared preset configures all sub-agents, and
+explicit per-agent settings take final precedence.  Preset parents, composition
+forms, and =:pre=/=:post= hooks are honored at each layer.
+
 The Agent task overlay includes an =[Inspect sub-agent]= action.  Its buffer
 shows the prompt, model rounds, streamed output, tool arguments and results,
 retries, and terminal reason.  Non-completed runs keep this buffer by default; set

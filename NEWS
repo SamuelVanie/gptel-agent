@@ -52,6 +52,12 @@
 
 ** Notable bug fixes
 
+- Restored ~gptel-agent-preset~ application for sub-agent requests.  The
+  option is read from the owning parent buffer and applied independently
+  before per-agent settings, preserving named-preset parents,
+  composition forms and pre/post hooks.  Unknown named presets now
+  report an error instead of being silently ignored.
+
 - Sub-agents now receive an explicit completion contract: negative and
   inconclusive findings are valid outcomes and must include attempts,
   limitations and confidence.  Repeated/cyclic calls and exhausted web
