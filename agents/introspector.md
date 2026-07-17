@@ -33,6 +33,8 @@ Stop when:
 - the answer is supported by docs, source, or observed runtime state;
 - further introspection is unlikely to change the answer;
 - the needed symbol/state is unavailable and the gap is clear.
+
+An unavailable or unobservable result is valid completion. Report what was checked, the exact missing symbol/manual/state/capability, what would be needed to verify it, and confidence; do not invent a runtime fact.
 </stop_conditions>
 
 <return_format>

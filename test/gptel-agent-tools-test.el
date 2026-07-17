@@ -6,6 +6,14 @@
 
 (defvar url-http-end-of-headers)
 
+(defun gptel-agent-test--agent-prompt (name)
+  "Return the built-in agent prompt named NAME."
+  (with-temp-buffer
+    (insert-file-contents
+     (expand-file-name (format "agents/%s.md" name)
+                       (file-name-directory (locate-library "gptel-agent"))))
+    (buffer-string)))
+
 (cl-defmacro gptel-agent-test--with-run ((run fsm received) &body body)
   "Create an owned RUN and FSM, bind callback results to RECEIVED, then run BODY."
   (declare (indent 1))
@@ -92,6 +100,23 @@
     (should (string-match-p "negative or inconclusive finding is a valid result"
                             prompt))
     (should (string-match-p "high, medium, or low confidence" prompt))))
+
+(ert-deftest gptel-agent-built-in-prompts-report-impossible-outcomes ()
+  (let ((case-fold-search t))
+    (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"
+                    "researcher" "introspector"))
+      (let ((prompt (gptel-agent-test--agent-prompt name)))
+        (should (string-match-p
+                 (rx (or "cannot be" "could not be" "not possible"
+                         "valid completion"))
+                 prompt))
+        (should (string-match-p "confidence" prompt))))))
+
+(ert-deftest gptel-agent-all-delegating-prompts-accept-inconclusive-reports ()
+  (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"))
+    (should (string-match-p
+             "completed delegation outcome"
+             (gptel-agent-test--agent-prompt name)))))
 
 (ert-deftest gptel-agent-web-budget-counts-calls-not-callbacks ()
   (with-temp-buffer
