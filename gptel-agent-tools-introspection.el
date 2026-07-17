@@ -58,7 +58,7 @@
   "Return the Info documentation for SYMBOL, if it exists."
   (when-let* ((symbol (intern-soft symbol)))
     (save-window-excursion
-      (info-lookup-symbol symbol #'emacs-lisp-mode)
+      (info-lookup 'symbol symbol #'emacs-lisp-mode t)
       (buffer-substring-no-properties (point-min) (point-max)))))
 
 (defun gptel-agent--introspect-library-source (library-name)
