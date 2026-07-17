@@ -47,7 +47,7 @@
   (should-not (gptel-agent--transient-request-error-p
                '(:http-status "400" :error "Stream must be set to true"))))
 
-(ert-deftest gptel-agent-similar-tool-loop-escalates-from-block-to-stop ()
+(ert-deftest gptel-agent-similar-tool-loop-blocks-without-stopping ()
   (with-temp-buffer
     (gptel-agent--reset-tool-call-counts)
     (let ((gptel-agent-max-tool-repetitions 20)
@@ -62,10 +62,28 @@
               results))
       (setq results (nreverse results))
       (should (plist-get (nth 3 results) :block))
-      (should (plist-get (nth 4 results) :stop))
-      (should (string-prefix-p
-               gptel-agent--safety-stop-prefix
-               (plist-get (nth 4 results) :stop-reason))))))
+      (should (plist-get (nth 4 results) :block))
+      (should-not (cl-find-if (lambda (result) (plist-get result :stop))
+                              results))
+      (should (string-match-p
+               "return a negative or inconclusive report now"
+               (plist-get (nth 4 results) :block))))))
+
+(ert-deftest gptel-agent-exact-repetition-remains-blocked-not-terminal ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 3)
+          (gptel-agent-max-similar-tool-calls nil)
+          results)
+      (dotimes (_ 5)
+        (push (gptel-agent--detect-repetition
+               '(:name "WebFetch" :args (:url "https://example.com")))
+              results))
+      (setq results (nreverse results))
+      (should (plist-get (nth 2 results) :block))
+      (should (plist-get (nth 4 results) :block))
+      (should-not (cl-find-if (lambda (result) (plist-get result :stop))
+                              results)))))
 
 (ert-deftest gptel-agent-web-search-count-is-bounded-and-configurable ()
   (let ((gptel-agent-web-search-default-count 10)
@@ -135,7 +153,8 @@
       (let ((result
              (gptel-agent--detect-repetition
               '(:name "YouTube" :args (:url "https://youtube.test/1")))))
-        (should (plist-get result :stop)))
+        (should (plist-get result :block))
+        (should-not (plist-get result :stop)))
       (should (= (gptel-agent--run-web-tool-calls run) 3)))))
 
 (ert-deftest gptel-agent-web-parser-exception-completes-callback-once ()
@@ -235,25 +254,6 @@
     (should (= (length received) 1))
     (should (string-match-p "limit of 1 model/tool rounds" (car received)))
     (should (string-match-p "Confidence: low" (car received)))))
-
-(ert-deftest gptel-agent-safety-stop-returns-inconclusive-report ()
-  (gptel-agent-test--with-run (run fsm received)
-    (setf (gptel-agent--run-rounds run) 3
-          (gptel-agent--run-tool-calls run) 5
-          (gptel-agent--run-web-tool-calls run) 5
-          (gptel-agent--run-response run) "The exact target was not in the results.")
-    (setf (gptel-fsm-info fsm)
-          (list :context run :status "Stopped by hook"
-                :error (concat gptel-agent--safety-stop-prefix
-                               "repeated WebSearch calls made no progress.")))
-    (gptel-agent--handle-task-error fsm)
-    (should (eq (gptel-agent--run-state run) 'inconclusive))
-    (should (= (length received) 1))
-    (should (string-match-p "Outcome: inconclusive" (car received)))
-    (should (string-match-p "5 tool calls (5 web calls)" (car received)))
-    (should (string-match-p "Confidence: low" (car received)))
-    (should (string-match-p "do not repeat the same delegation"
-                            (car received)))))
 
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))

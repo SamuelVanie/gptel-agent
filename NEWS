@@ -54,9 +54,10 @@
 
 - Sub-agents now receive an explicit completion contract: negative and
   inconclusive findings are valid outcomes and must include attempts,
-  limitations and confidence.  Repetition, web-call and round safety
-  limits return an inspectable inconclusive report instead of turning a
-  useful failure to verify into a generic request error.
+  limitations and confidence.  Repeated/cyclic calls and exhausted web
+  budgets are blocked with actionable feedback but no longer terminate
+  the run, leaving the model able to return its supported or
+  inconclusive result.  The overall round limit remains a final fallback.
 
 - ~WebSearch~ now defaults to 10 results, supports a configurable bound
   with ~gptel-agent-web-search-default-count~ and

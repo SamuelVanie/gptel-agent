@@ -123,10 +123,11 @@ to disable alternating-cycle detection."
   :group 'gptel-agent)
 
 (defcustom gptel-agent-max-loop-violations 2
-  "Number of detected similar/cyclic tool loops before stopping a sub-agent.
+  "Number of detected similar/cyclic tool loops before escalating feedback.
 
-The first violation is returned to the model as a blocked tool result so it
-can change strategy.  A consecutive violation stops the run."
+Violating calls are always blocked rather than terminating the sub-agent.  At
+this threshold the blocked result explicitly directs the model to stop using
+the stalled approach and return its best supported outcome."
   :type 'natnum
   :group 'gptel-agent)
 
@@ -230,9 +231,6 @@ from the Agent overlay until the user kills the buffer."
   fsm response response-checkpoint rounds retries retry-timer timeout-timer
   parent-kill-hook terminal-reason started-at configuration
   tool-calls web-tool-calls)
-
-(defconst gptel-agent--safety-stop-prefix "gptel-agent safety stop: "
-  "Prefix used to distinguish supervised safety stops from request errors.")
 
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
@@ -410,13 +408,18 @@ Each entry is a plist with at least :name, :args and :signature.")
             nil)))
 
 (defun gptel-agent--loop-violation (message)
-  "Block with MESSAGE once, then stop after repeated loop violations."
+  "Block a stalled tool call with increasingly explicit MESSAGE feedback."
   (cl-incf gptel-agent--tool-loop-violations)
-  (if (>= gptel-agent--tool-loop-violations
-          (max 1 gptel-agent-max-loop-violations))
-      (list :stop t
-            :stop-reason (concat gptel-agent--safety-stop-prefix message))
-    (list :block message)))
+  (list
+   :block
+   (if (>= gptel-agent--tool-loop-violations
+           (max 1 gptel-agent-max-loop-violations))
+       (concat message
+               "\nThis stalled call was blocked and will remain blocked. "
+               "Do not try it again. Use evidence already collected, choose "
+               "a materially different approach, or return a negative or "
+               "inconclusive report now.")
+     message)))
 
 (defun gptel-agent--detect-repetition (tool-call-info)
   "Pre-tool-call hook that detects and blocks repeated identical tool calls.
@@ -452,26 +455,19 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
       ((and run web-tool-p gptel-agent-max-web-tool-calls
             (> (gptel-agent--run-web-tool-calls run)
                gptel-agent-max-web-tool-calls))
-       (list :stop t
-             :stop-reason
-             (concat
-              gptel-agent--safety-stop-prefix
-              (format "web tool budget exceeded (%d calls)."
-                      gptel-agent-max-web-tool-calls))))
+       (list :block
+             (format "Error: The web tool budget of %d calls is exhausted. \
+This call was not run. Do not call another web tool in this task; use the \
+evidence already collected and return the best supported result, including an \
+inconclusive result and confidence when necessary."
+                     gptel-agent-max-web-tool-calls)))
       ((and gptel-agent-max-tool-repetitions
-            (> count gptel-agent-max-tool-repetitions))
-       (list :stop t
-             :stop-reason
-             (concat
-              gptel-agent--safety-stop-prefix
-              (format "tool \"%s\" was called %d times with identical arguments."
-                      name count))))
-      ((and gptel-agent-max-tool-repetitions
-            (eq count gptel-agent-max-tool-repetitions))
+            (>= count gptel-agent-max-tool-repetitions))
        (list :block
              (format "Error: You have called tool \"%s\" %d times with identical \
-arguments. This is not making progress. Change your approach, use different \
-parameters, or stop and report what you have so far."
+arguments. This call was blocked because it is not making progress. Do not try \
+it again. Change approach or return the best supported negative/inconclusive \
+report with attempts, limitations, and confidence."
                      name count)))
       ((gptel-agent--alternating-cycle-p gptel-agent--tool-call-history)
        (gptel-agent--loop-violation
@@ -1980,15 +1976,9 @@ ABRT after its children have stopped."
                               (plist-get info :error)))
               " ")))
 
-(defun gptel-agent--safety-stop-p (info)
-  "Return non-nil when INFO describes a gptel-agent safety stop."
-  (string-prefix-p gptel-agent--safety-stop-prefix
-                   (gptel--to-string (or (plist-get info :error) ""))))
-
 (defun gptel-agent--inconclusive-response (run reason)
   "Build an audit-ready inconclusive report for RUN stopped for REASON."
-  (let* ((reason (string-remove-prefix gptel-agent--safety-stop-prefix
-                                       (gptel--to-string reason)))
+  (let* ((reason (gptel--to-string reason))
          (partial (string-trim (or (gptel-agent--run-response run) ""))))
     (format "%s result for task: %s
 
@@ -2068,27 +2058,21 @@ This is a valid negative/inconclusive task outcome; do not repeat the same deleg
       (gptel-agent--run-log
        run "REQUEST ERROR status=%s error=%S"
        (or (plist-get info :status) "unknown") (plist-get info :error))
-      (cond
-       ((gptel-agent--safety-stop-p info)
-        (gptel-agent--run-finish
-         run 'inconclusive
-         (gptel-agent--inconclusive-response run (plist-get info :error))
-         (plist-get info :error)))
-       ((and (< (gptel-agent--run-retries run)
+      (if (and (< (gptel-agent--run-retries run)
                   gptel-agent-max-request-retries)
                (gptel-agent--transient-request-error-p info))
-        (gptel-agent--run-log
-         run "RETRY %d/%d scheduled"
-         (1+ (gptel-agent--run-retries run))
-         gptel-agent-max-request-retries)
-        (gptel-agent--retry-request run fsm))
-       (t
+          (progn
+            (gptel-agent--run-log
+             run "RETRY %d/%d scheduled"
+             (1+ (gptel-agent--run-retries run))
+             gptel-agent-max-request-retries)
+            (gptel-agent--retry-request run fsm))
         (gptel-agent--run-finish
          run 'failed
          (format "Error: Sub-agent request failed. Status: %s, Error: %S"
                  (or (plist-get info :status) "unknown")
                  (plist-get info :error))
-         (or (plist-get info :error) (plist-get info :status))))))))
+         (or (plist-get info :error) (plist-get info :status)))))))
 
 (defun gptel-agent--handle-task-done (fsm)
   "Complete a sub-agent FSM only when it enters DONE."
