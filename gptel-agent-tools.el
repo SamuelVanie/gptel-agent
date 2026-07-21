@@ -2913,35 +2913,55 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
       (funcall cb "User cancelled interaction."))
     (gptel-agent--ask-teardown ov)))
 
+(defun gptel-agent--ask-presentation-buffer ()
+  "Return the buffer in which an Ask interaction should be displayed.
+
+Sub-agent tools execute in an internal child buffer when tool-call
+confirmation is disabled.  Present their questions in the visible parent
+buffer instead."
+  (or (and-let* ((run gptel-agent--supervised-run)
+                 (parent (gptel-agent--run-parent-buffer run))
+                 ((buffer-live-p parent)))
+        parent)
+      (current-buffer)))
+
 (defun gptel-agent--ask-question (callback question choices)
   "Ask user QUESTION with CHOICES, calling CALLBACK with result.
 
 Always appends a custom option allowing the user to provide their own response."
-  (let* ((choices-list (append choices nil))
-         ;; Always add a custom option at the end
-         (choices-with-custom
-          (append choices-list
-                  (list (list :value "Custom"
-                              :description "Provide your own custom response"
-                              :recommended :json-false))))
-         (ui-text (gptel-agent--ask-draw-ui question choices-with-custom 0))
-         (inhibit-read-only t))
-    (goto-char (point-max))
-    (let ((start-pos (point)))
-      (unless (bolp) (insert "\n"))
-      (insert ui-text)
-      (insert "\n")
-      (let ((ov (make-overlay start-pos (point))))
-        (overlay-put ov 'gptel-ask t)
-        (overlay-put ov 'gptel-ask--question question)
-        (overlay-put ov 'gptel-ask--choices choices-with-custom)
-        (overlay-put ov 'gptel-ask--selection 0)
-        (overlay-put ov 'gptel-ask--callback callback)
-        (overlay-put ov 'keymap (gptel-agent--ask-make-keymap choices-with-custom))
-        (overlay-put ov 'evaporate t)
-        (overlay-put ov 'priority 1000)
-        (goto-char (overlay-start ov))
-        (recenter)))))
+  (let ((presentation-buffer (gptel-agent--ask-presentation-buffer)))
+    (with-current-buffer presentation-buffer
+      (let* ((choices-list (append choices nil))
+             ;; Always add a custom option at the end
+             (choices-with-custom
+              (append choices-list
+                      (list (list :value "Custom"
+                                  :description "Provide your own custom response"
+                                  :recommended :json-false))))
+             (ui-text (gptel-agent--ask-draw-ui question choices-with-custom 0))
+             (inhibit-read-only t))
+        (goto-char (point-max))
+        (let ((start-pos (point)))
+          (unless (bolp) (insert "\n"))
+          (insert ui-text)
+          (insert "\n")
+          (let ((ov (make-overlay start-pos (point))))
+            (overlay-put ov 'gptel-ask t)
+            (overlay-put ov 'gptel-ask--question question)
+            (overlay-put ov 'gptel-ask--choices choices-with-custom)
+            (overlay-put ov 'gptel-ask--selection 0)
+            (overlay-put ov 'gptel-ask--callback callback)
+            (overlay-put ov 'keymap (gptel-agent--ask-make-keymap choices-with-custom))
+            (overlay-put ov 'evaporate t)
+            (overlay-put ov 'priority 1000)
+            (goto-char (overlay-start ov))
+            ;; `recenter' signals when the current buffer is not displayed.
+            ;; That error is interpreted by gptel as an async tool result,
+            ;; which would resume the model before the user has answered.
+            (when-let* ((window (get-buffer-window presentation-buffer 'visible)))
+              (set-window-point window (point))
+              (with-selected-window window
+                (recenter)))))))))
 
 (defun gptel-agent--ask-multiple (callback questions)
   "Ask user multiple QUESTIONS sequentially, calling CALLBACK with results."

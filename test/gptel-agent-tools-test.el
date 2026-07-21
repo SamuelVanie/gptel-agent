@@ -123,6 +123,52 @@
     (should (string-match-p "absence is not proof"
                             (plist-get result :coverage-note)))))
 
+(ert-deftest gptel-agent-ask-without-confirmation-waits-in-parent-buffer ()
+  (let* ((parent (generate-new-buffer " *gptel-agent-ask-parent*"))
+         (child (generate-new-buffer " *gptel-agent-ask-child*"))
+         (run (gptel-agent--make-run
+               :state 'waiting-for-tool
+               :parent-buffer parent
+               :child-buffer child))
+         (tool (gptel-get-tool "AskUserQuestion"))
+         (call (list :name "AskUserQuestion"
+                     :args '(:questions
+                             [(:question "Continue?"
+                               :choices [(:value "Yes") (:value "No")])])))
+         (info (list :backend t :buffer child :tools (list tool)
+                     :tool-use (list call)))
+         (fsm (gptel-make-fsm
+               :state 'TOOL
+               :table '((TOOL . ((t . TRET))))
+               :handlers nil
+               :info info))
+         (gptel-confirm-tool-calls nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer child
+            (setq-local gptel-agent--supervised-run run)
+            (gptel--handle-tool-use fsm))
+          ;; The tool remains unresolved until the user confirms a choice.
+          (should (eq (gptel-fsm-state fsm) 'TOOL))
+          (should-not (plist-get call :result))
+          (should-not
+           (seq-find (lambda (ov) (overlay-get ov 'gptel-ask))
+                     (with-current-buffer child
+                       (overlays-in (point-min) (point-max)))))
+          (let ((ask-ov
+                 (seq-find (lambda (ov) (overlay-get ov 'gptel-ask))
+                           (with-current-buffer parent
+                             (overlays-in (point-min) (point-max))))))
+            (should (overlayp ask-ov))
+            (with-current-buffer parent
+              (goto-char (overlay-start ask-ov))
+              (gptel-agent--ask-confirm-choice)))
+          (should (eq (gptel-fsm-state fsm) 'TRET))
+          (should (equal (plist-get call :result)
+                         "Q1: Continue?\nR1: Yes")))
+      (when (buffer-live-p parent) (kill-buffer parent))
+      (when (buffer-live-p child) (kill-buffer child)))))
+
 (ert-deftest gptel-agent-task-prompt-allows-inconclusive-results ()
   (let ((prompt (gptel-agent--prepare-task-prompt "Find the repository")))
     (should (string-prefix-p "Find the repository" prompt))
