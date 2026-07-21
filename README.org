@@ -156,9 +156,14 @@ Sub-agents can be configured to use specific models or other API parameters
 gptel presets.
 
 Each delegation snapshots its backend, model, streaming mode, system prompt,
-tools and request parameters.  It also has an overall timeout, a model/tool
-round limit and bounded retries for transient transport failures.  The relevant
-options are =gptel-agent-task-timeout=, =gptel-agent-max-request-rounds=,
+tools and request parameters.  Tasks are unlimited by default.  Add
+=task-timeout= and/or =max-request-rounds= to an agent's frontmatter or Org
+properties to bound that agent; =nil= or =false= explicitly means unlimited.
+The built-in researcher uses a 1200 second timeout and 30 model/tool rounds,
+while the executor and introspector are unlimited.  The global fallback options
+are =gptel-agent-task-timeout= and =gptel-agent-max-request-rounds=; an omitted
+per-agent value inherits its global fallback, and both fallbacks default to
+nil.  Transient transport retries remain bounded by
 =gptel-agent-max-request-retries= and =gptel-agent-retry-delay=.  Authentication
 and malformed-request errors are not retried.
 
@@ -209,6 +214,8 @@ in a Markdown file, followed by the system prompt:
 name: arxiv-explorer
 description: Searches ArXiv and parses results
 tools: [mcp-arxiv, WebSearch]
+task-timeout: 1200
+max-request-rounds: 30
 pre: (lambda () (gptel-mcp-connect '(arxiv) 'sync))
 ---
 
@@ -221,7 +228,9 @@ search for and gather information efficiently.
 #+end_src
 
 =name= defaults to the file name, so only the =description= is mandatory.
-=tools= is a list of tool names or categories.
+=tools= is a list of tool names or categories.  The optional =task-timeout= and
+=max-request-rounds= keys set this agent's supervision limits; leave them out
+to inherit the global defaults, which are unlimited.
 
 You can specify any other keys that gptel recognizes as preset keys, including a
 specific model, backend and API parameters.  See =gptel-make-preset= for
@@ -246,6 +255,8 @@ block at the top of an Org file, followed by the system prompt:
 :name: arxiv-explorer
 :description: Searches ArXiv and parses results
 :tools: mcp-arxiv WebSearch
+:task-timeout: 1200
+:max-request-rounds: 30
 :pre: (lambda () (gptel-mcp-connect '(arxiv) 'sync))
 :end:
 

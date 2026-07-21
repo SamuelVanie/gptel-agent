@@ -4,6 +4,12 @@
 
 ** New features and UI changes
 
+- Sub-agent time and model-round budgets are now configurable per agent with
+  the ~task-timeout~ and ~max-request-rounds~ Markdown frontmatter or Org
+  property keys.  Omitted limits inherit the corresponding global fallback
+  options, which now default to nil; the built-in researcher retains a bounded
+  1200-second, 30-round budget.
+
 - gptel-agent now works over TRAMP.  This means it can run processes on
   remote servers, grep and edit files and so on without the need to
   install Emacs or an agent harness.  This involves calling command line

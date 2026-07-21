@@ -26,7 +26,7 @@
                  :id "test-run" :state 'created :agent "researcher"
                  :description "test task" :parent-buffer parent
                  :child-buffer child :response "" :response-checkpoint 0
-                 :rounds 0 :retries 0
+                 :rounds 0 :retries 0 :max-request-rounds nil
                  :callback (lambda (value) (push value ,received))))
           (,fsm (gptel-make-fsm :info (list :context ,run))))
      (setf (gptel-agent--run-fsm ,run) ,fsm)
@@ -367,9 +367,9 @@
 
 (ert-deftest gptel-agent-round-budget-is-terminal ()
   (gptel-agent-test--with-run (run fsm received)
-    (setf (gptel-agent--run-rounds run) 1)
-    (let ((gptel-agent-max-request-rounds 1))
-      (gptel-agent--handle-task-wait fsm))
+    (setf (gptel-agent--run-rounds run) 1
+          (gptel-agent--run-max-request-rounds run) 1)
+    (gptel-agent--handle-task-wait fsm)
     (should (eq (gptel-agent--run-state run) 'inconclusive))
     (should (= (length received) 1))
     (should (string-match-p "limit of 1 model/tool rounds" (car received)))
@@ -416,9 +416,9 @@
 (ert-deftest gptel-agent-finalization-gets-a-turn-at-the-round-limit ()
   (gptel-agent-test--with-run (run fsm received)
     (setf (gptel-agent--run-rounds run) 1
-          (gptel-agent--run-finalization-requested run) t)
-    (let ((gptel-agent-max-request-rounds 1)
-          handled)
+          (gptel-agent--run-finalization-requested run) t
+          (gptel-agent--run-max-request-rounds run) 1)
+    (let (handled)
       (cl-letf (((symbol-function 'gptel--handle-wait)
                  (lambda (_fsm) (setq handled t))))
         (gptel-agent--handle-task-wait fsm))
@@ -432,6 +432,19 @@
     (should (string-match-p "current workspace is the primary source" prompt))
     (should (string-match-p "default_branch" prompt))
     (should (string-match-p "successful result.*stop signal" prompt))))
+
+(ert-deftest gptel-agent-built-in-supervision-policy-is-role-specific ()
+  (let ((researcher (gptel-agent-test--agent-prompt "researcher"))
+        (executor (gptel-agent-test--agent-prompt "executor"))
+        (introspector (gptel-agent-test--agent-prompt "introspector")))
+    (should-not gptel-agent-task-timeout)
+    (should-not gptel-agent-max-request-rounds)
+    (should (string-match-p "task-timeout: 1200" researcher))
+    (should (string-match-p "max-request-rounds: 30" researcher))
+    (should-not (string-match-p "task-timeout:" executor))
+    (should-not (string-match-p "max-request-rounds:" executor))
+    (should-not (string-match-p "task-timeout:" introspector))
+    (should-not (string-match-p "max-request-rounds:" introspector))))
 
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))
@@ -491,11 +504,27 @@
              :stream nil :temperature 0.2)
        (list :pre (lambda () (push 'agent-pre events))
              :post (lambda () (push 'agent-post events))
+             :task-timeout 1200 :max-request-rounds 30
              :stream t :temperature 0.7))
       (should (eq gptel-stream t))
       (should (= gptel-temperature 0.7)))
     (should (equal (nreverse events)
                    '(preset-pre preset-post agent-pre agent-post)))))
+
+(ert-deftest gptel-agent-supervision-values-are-per-agent ()
+  (let ((agent '(:task-timeout 1200 :max-request-rounds 30)))
+    (should (= (gptel-agent--supervision-value
+                agent :task-timeout 700) 1200))
+    (should (= (gptel-agent--supervision-value
+                agent :max-request-rounds 15) 30))
+    (should-not (gptel-agent--supervision-value
+                 '(:task-timeout nil) :task-timeout 700))
+    (should-not (gptel-agent--supervision-value
+                 nil :task-timeout nil))
+    (should-error
+     (gptel-agent--supervision-value
+      '(:task-timeout -1) :task-timeout nil)
+     :type 'user-error)))
 
 (ert-deftest gptel-agent-unknown-subagent-preset-is-an-error ()
   (should-error
@@ -545,7 +574,8 @@
             (gptel-agent--task
              #'ignore "researcher" "pin config" "perform task" parent-fsm
              '(("researcher" :description "Research" :system "Pinned system"
-                :temperature 0.7))))
+                :temperature 0.7 :task-timeout 1200
+                :max-request-rounds 30))))
           (setq run (plist-get captured :context))
           (should (plist-member captured :stream))
           (should-not (plist-get captured :stream))
@@ -557,6 +587,8 @@
                    "negative or inconclusive finding is a valid result"
                    requested-prompt))
           (should (eq (gptel-agent--run-parent-fsm run) parent-fsm))
+          (should (= (gptel-agent--run-task-timeout run) 1200))
+          (should (= (gptel-agent--run-max-request-rounds run) 30))
           (with-current-buffer (gptel-agent--run-child-buffer run)
             (should (string-match-p "Sub-agent run: agent-" (buffer-string)))
             (should (string-match-p "perform task" (buffer-string)))

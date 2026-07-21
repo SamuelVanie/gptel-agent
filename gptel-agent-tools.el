@@ -171,12 +171,13 @@ page cannot consume the sub-agent context."
   :type 'natnum
   :group 'gptel-agent)
 
-(defcustom gptel-agent-task-timeout 700
-  "Timeout in seconds for sub-agent tasks.
+(defcustom gptel-agent-task-timeout nil
+  "Default timeout in seconds for sub-agent tasks.
 
 If a sub-agent task does not complete within this many seconds,
 it is aborted and an error message is returned to the parent.
-Set to nil to disable the timeout."
+Set to nil to disable the timeout by default.  An agent definition can
+override this with the `task-timeout' frontmatter/property key."
   :type '(choice (natnum :tag "Timeout in seconds")
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
@@ -197,12 +198,13 @@ Successive retries use exponential backoff."
   :type 'number
   :group 'gptel-agent)
 
-(defcustom gptel-agent-max-request-rounds 30
-  "Maximum model request rounds in a sub-agent run.
+(defcustom gptel-agent-max-request-rounds nil
+  "Default maximum model request rounds in a sub-agent run.
 
 The initial model request is one round and every request following tool
 results is another.  Transport retries do not consume additional rounds.
-Set to nil to disable this limit."
+Set to nil to disable this limit by default.  An agent definition can
+override this with the `max-request-rounds' frontmatter/property key."
   :type '(choice (natnum :tag "Maximum rounds")
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
@@ -248,6 +250,7 @@ from the Agent overlay until the user kills the buffer."
   parent-fsm parent-buffer child-buffer overlay callback
   fsm response response-checkpoint rounds retries retry-timer timeout-timer
   parent-kill-hook terminal-reason started-at configuration
+  task-timeout max-request-rounds
   tool-calls web-tool-calls finalization-reason
   finalization-requested finalization-started)
 
@@ -2055,6 +2058,9 @@ the known skills as string ready to be included to the context."
                 :description (gptel-agent--run-description run)
                 :terminal-reason (gptel-agent--run-terminal-reason run)
                 :rounds (gptel-agent--run-rounds run)
+                :task-timeout (gptel-agent--run-task-timeout run)
+                :max-request-rounds
+                (gptel-agent--run-max-request-rounds run)
                 :tool-calls (gptel-agent--run-tool-calls run)
                 :web-tool-calls (gptel-agent--run-web-tool-calls run)
                 :retries (gptel-agent--run-retries run)
@@ -2339,6 +2345,8 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
 (defun gptel-agent--handle-task-wait (fsm)
   "Send the next request for FSM while enforcing RUN's round budget."
   (let* ((run (gptel-agent--run-from-fsm fsm))
+         (max-rounds (and run
+                          (gptel-agent--run-max-request-rounds run)))
          (retryp (and run (eq (gptel-agent--run-state run) 'retry-wait)))
          (finalization-turn-p
           (and run
@@ -2347,14 +2355,14 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
     (when (and run (gptel-agent--run-active-p run))
       (if (and (not retryp)
                (not finalization-turn-p)
-               gptel-agent-max-request-rounds
+               max-rounds
                (>= (gptel-agent--run-rounds run)
-                   gptel-agent-max-request-rounds))
+                   max-rounds))
           (gptel-agent--run-finish
            run 'inconclusive
            (gptel-agent--inconclusive-response
             run (format "the run reached its limit of %d model/tool rounds."
-                        gptel-agent-max-request-rounds))
+                        max-rounds))
            'round-limit)
         (unless retryp
           (cl-incf (gptel-agent--run-rounds run))
@@ -2366,7 +2374,7 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
          run "%s round %d/%s"
          (if retryp "RETRYING REQUEST" "REQUEST")
          (gptel-agent--run-rounds run)
-         (or gptel-agent-max-request-rounds "unlimited"))
+         (or max-rounds "unlimited"))
         (unless (eq (gptel-agent--run-state run) 'requesting-after-tool)
           (setf (gptel-agent--run-state run) 'requesting))
         ;; `gptel--handle-wait' consults buffer-local transport settings.
@@ -2559,7 +2567,23 @@ precedence."
      '(:include-reasoning nil :use-tools t :context nil) setter)
     (when preset
       (gptel--apply-preset preset setter))
-    (gptel--apply-preset (copy-tree agent-plist) setter)))
+    (gptel--apply-preset
+     (gptel-agent--plist-without-keys
+      (copy-tree agent-plist) '(:task-timeout :max-request-rounds))
+     setter)))
+
+(defun gptel-agent--supervision-value (agent-plist key fallback)
+  "Resolve supervision KEY from AGENT-PLIST, otherwise use FALLBACK.
+
+The value must be nil (unlimited) or a non-negative integer."
+  (let ((value (if (plist-member agent-plist key)
+                   (plist-get agent-plist key)
+                 fallback)))
+    (unless (or (null value)
+                (and (integerp value) (>= value 0)))
+      (user-error "gptel-agent: %s must be nil or a non-negative integer, got %S"
+                  key value))
+    value))
 
 (defun gptel-agent--task (main-cb agent-type description prompt
                                   &optional parent-fsm agent-snapshot)
@@ -2587,6 +2611,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
      (t
       (let* ((where (or (plist-get parent-info :tracking-marker)
                         (plist-get parent-info :position)))
+             task-timeout max-request-rounds
              (parent-position
               (if (markerp where)
                   (copy-marker where)
@@ -2609,6 +2634,19 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                    :started-at (float-time))))
         (condition-case err
             (progn
+              (setq task-timeout
+                    (gptel-agent--supervision-value
+                     agent-plist :task-timeout
+                     (buffer-local-value
+                      'gptel-agent-task-timeout parent-buffer))
+                    max-request-rounds
+                    (gptel-agent--supervision-value
+                     agent-plist :max-request-rounds
+                     (buffer-local-value
+                      'gptel-agent-max-request-rounds parent-buffer)))
+              (setf (gptel-agent--run-task-timeout run) task-timeout
+                    (gptel-agent--run-max-request-rounds run)
+                    max-request-rounds)
               (setq preset (gptel-agent--resolve-subagent-preset preset))
               (gptel-agent--copy-parent-request-config
                parent-buffer child-buffer)
@@ -2629,9 +2667,12 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                             :request-params (copy-tree gptel--request-params)))
                 (let ((inhibit-read-only t))
                   (erase-buffer)
-                  (insert (format "Sub-agent run: %s\nAgent: %s\nTask: %s\nModel: %s\n\nPrompt:\n%s\n\n"
+                  (insert (format "Sub-agent run: %s\nAgent: %s\nTask: %s\nModel: %s\nTimeout: %s\nRound limit: %s\n\nPrompt:\n%s\n\n"
                                   (gptel-agent--run-id run) agent-type description
-                                  (gptel--model-name gptel-model) task-prompt)))
+                                  (gptel--model-name gptel-model)
+                                  (or task-timeout "unlimited")
+                                  (or max-request-rounds "unlimited")
+                                  task-prompt)))
                 (setq buffer-read-only t))
               (with-current-buffer parent-buffer
                 (gptel--update-status " Calling Agent..."
@@ -2655,17 +2696,17 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                           #'gptel-agent--confirm-child-buffer-kill nil t)
                 (add-hook 'kill-buffer-hook
                           #'gptel-agent--handle-child-buffer-kill nil t))
-              (when gptel-agent-task-timeout
+              (when task-timeout
                 (setf (gptel-agent--run-timeout-timer run)
                       (run-at-time
-                       gptel-agent-task-timeout nil
+                       task-timeout nil
                        (lambda (owned-run)
                          (when (gptel-agent--run-active-p owned-run)
                            (gptel-agent--run-finish
                             owned-run 'timed-out
                             (format "Error: Sub-agent task %S timed out after %d seconds."
                                     (gptel-agent--run-description owned-run)
-                                    gptel-agent-task-timeout)
+                                    (gptel-agent--run-task-timeout owned-run))
                             'timeout)))
                        run)))
               (with-current-buffer child-buffer

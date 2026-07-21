@@ -496,6 +496,13 @@ Substitution happens in-place in the buffer."
                         (if (listp val) val (split-string val))))
             ;; Numeric properties: YAML already handles these correctly
             ;; (numbers become numbers), so no conversion needed.
+            ;; Supervision limits can also be disabled with YAML false.
+            ((or :task-timeout :max-request-rounds)
+             (plist-put parsed-yaml key
+                        (unless (or (eq val :false)
+                                    (and (stringp val)
+                                         (string-equal (downcase val) "nil")))
+                          val)))
             ;; Boolean properties: YAML true -> t, YAML false -> :false.
             ((or :stream :track-media :track-response
                  :org-convert-response)
@@ -570,8 +577,9 @@ opening delimiter '---' found but no closing delimiter" file-path))))))
           ((or :context :tools)
            (setq value (split-string value)))
           ;; Numeric properties
-          ((or :temperature :max-tokens :num-messages-to-send)
-           (setq value (unless (string-equal value "nil")
+          ((or :temperature :max-tokens :num-messages-to-send
+               :task-timeout :max-request-rounds)
+           (setq value (unless (member (downcase value) '("" "nil" "false"))
                          (string-to-number value))))
           ;; Include-reasoning can also be a string (buffer name)
           (:include-reasoning (setq value (pcase value
