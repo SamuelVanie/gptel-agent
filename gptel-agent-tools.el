@@ -288,6 +288,7 @@ passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  Handles
 cleanup."
   (let* ((timeout 30) timer done
          (inherit-process-coding-system t)
+         (url-request-noninteractive t)
          (proc-buffer
           (url-retrieve
            url (lambda (status)
