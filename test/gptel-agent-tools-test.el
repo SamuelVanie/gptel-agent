@@ -187,6 +187,17 @@
                  prompt))
         (should (string-match-p "confidence" prompt))))))
 
+(ert-deftest gptel-agent-plan-prompt-requires-a-self-contained-handoff ()
+  (let ((prompt (gptel-agent-test--agent-prompt "gptel-plan")))
+    (dolist (requirement '("standalone handoff"
+                           "user-provided detail"
+                           "current behavior"
+                           "desired behavior"
+                           "success criteria"
+                           "decision log"
+                           "resulting behavior"))
+      (should (string-match-p requirement prompt)))))
+
 (ert-deftest gptel-agent-all-delegating-prompts-accept-inconclusive-reports ()
   (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"))
     (should (string-match-p
