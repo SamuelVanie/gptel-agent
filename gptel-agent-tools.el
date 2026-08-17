@@ -2808,14 +2808,33 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
     (define-key map (kbd "<tab>") 'gptel-agent--ask-cycle-choice)
     (define-key map (kbd "n") 'gptel-agent--ask-next-choice)
     (define-key map (kbd "p") 'gptel-agent--ask-prev-choice)
+    (define-key map (kbd "M-n") 'gptel-agent--ask-next-question)
+    (define-key map (kbd "M-p") 'gptel-agent--ask-previous-question)
+    (define-key map (kbd "<right>") 'gptel-agent--ask-next-question)
+    (define-key map (kbd "<left>") 'gptel-agent--ask-previous-question)
+    (define-key map (kbd "C-c C-c") 'gptel-agent--ask-submit)
     (define-key map (kbd "C-c C-k") 'gptel-agent--ask-cancel)
     map))
 
-(defun gptel-agent--ask-draw-ui (question choices selection)
-  "Return UI string for QUESTION and CHOICES with SELECTION highlighted."
+(defun gptel-agent--ask-draw-ui
+    (question choices selection &optional question-index answers)
+  "Return the interaction UI for QUESTION and CHOICES.
+
+SELECTION is the highlighted choice.  When QUESTION-INDEX and ANSWERS are
+non-nil, also show navigation and completion state for a multi-question
+interaction."
   (let* ((width (min (window-body-width) 80))
          (wrap-width (max 10 (- width 4)))
-         (header (propertize (format " 🤖 AGENT ASKS: %s"
+         (multi-p (and question-index answers))
+         (total (and multi-p (length answers)))
+         (answered (and multi-p
+                        (cl-count-if #'identity (append answers nil))))
+         (saved-answer (and multi-p (aref answers question-index)))
+         (header (propertize (format " 🤖 AGENT ASKS%s: %s"
+                                     (if multi-p
+                                         (format " (%d/%d)"
+                                                 (1+ question-index) total)
+                                       "")
                                      (string-fill question wrap-width))
                              'font-lock-face 'font-lock-keyword-face))
          (choice-strs
@@ -2837,10 +2856,29 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
                         (concat "\n    "
                                 (propertize (string-fill desc wrap-width)
                                             'font-lock-face 'font-lock-comment-face)))))))
-         (footer (propertize "\n [RET] Confirm [n/p] Down/Up [1-9] Select  [C-c C-k] Cancel"
-                             'font-lock-face '(:inherit shadow :height 0.8)))
+         (status
+          (when multi-p
+            (concat
+             "\n "
+             (propertize
+              (format "Answered %d/%d%s"
+                      answered total
+                      (if saved-answer " • Current answer saved" " • Not saved"))
+              'font-lock-face (if saved-answer 'success 'warning)))))
+         (footer
+          (propertize
+           (if multi-p
+               (concat
+                (format "\n [RET] %s  [M-p/←] Previous question  [M-n/→] Next question"
+                        (if (= question-index (1- total))
+                            "Save answer" "Save/Next"))
+                "\n [n/p] Choice Down/Up  [1-9] Select  [C-c C-c] Submit all  [C-c C-k] Cancel")
+             "\n [RET] Confirm [n/p] Down/Up [1-9] Select  [C-c C-k] Cancel")
+           'font-lock-face '(:inherit shadow :height 0.8)))
          gptel-agent--hrule
-         (content (concat "\n" header "\n\n" (mapconcat #'identity choice-strs "\n") footer "\n")))
+         (content (concat "\n" header "\n\n"
+                          (mapconcat #'identity choice-strs "\n")
+                          status footer "\n")))
     content))
 
 (defun gptel-agent--ask-update-overlay (ov)
@@ -2848,7 +2886,10 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
   (let* ((question (overlay-get ov 'gptel-ask--question))
          (choices (overlay-get ov 'gptel-ask--choices))
          (selection (overlay-get ov 'gptel-ask--selection))
-         (new-text (gptel-agent--ask-draw-ui question choices selection))
+         (question-index (overlay-get ov 'gptel-ask--index))
+         (answers (overlay-get ov 'gptel-ask--answers))
+         (new-text (gptel-agent--ask-draw-ui
+                    question choices selection question-index answers))
          (inhibit-read-only t)
          (beg (overlay-start ov))
          (end (overlay-end ov)))
@@ -2864,6 +2905,12 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
   (when-let ((ov (gptel-agent--ask-overlay-at-point))
              (choices (overlay-get ov 'gptel-ask--choices)))
     (when (< n (length choices))
+      (when-let* ((selections (overlay-get ov 'gptel-ask--selections))
+                  (idx (overlay-get ov 'gptel-ask--index)))
+        (unless (= n (aref selections idx))
+          (aset selections idx n)
+          ;; A changed selection is only an answer after RET saves it.
+          (aset (overlay-get ov 'gptel-ask--answers) idx nil)))
       (overlay-put ov 'gptel-ask--selection n)
       (gptel-agent--ask-update-overlay ov)
       (let ((val (or (plist-get (nth n choices) :value) "Option")))
@@ -2876,11 +2923,52 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
               (len (length (overlay-get ov 'gptel-ask--choices)))
               (curr (overlay-get ov 'gptel-ask--selection)))
     (let ((next (mod (+ curr (if prev -1 1)) len)))
+      (when-let* ((selections (overlay-get ov 'gptel-ask--selections))
+                  (idx (overlay-get ov 'gptel-ask--index)))
+        (unless (= next (aref selections idx))
+          (aset selections idx next)
+          (aset (overlay-get ov 'gptel-ask--answers) idx nil)))
       (overlay-put ov 'gptel-ask--selection next)
       (gptel-agent--ask-update-overlay ov))))
 
 (defun gptel-agent--ask-next-choice () (interactive) (gptel-agent--ask-cycle-choice))
 (defun gptel-agent--ask-prev-choice () (interactive) (gptel-agent--ask-cycle-choice t))
+
+(defun gptel-agent--ask-goto-question (ov idx)
+  "Display question IDX in multi-question ask overlay OV."
+  (when-let* ((questions (overlay-get ov 'gptel-ask--questions))
+              (item (and (<= 0 idx) (< idx (length questions))
+                         (nth idx questions))))
+    (let* ((choices (plist-get item :choices))
+           (selections (overlay-get ov 'gptel-ask--selections))
+           (selection (aref selections idx)))
+      (overlay-put ov 'gptel-ask--index idx)
+      (overlay-put ov 'gptel-ask--question (plist-get item :question))
+      (overlay-put ov 'gptel-ask--choices choices)
+      (overlay-put ov 'gptel-ask--selection selection)
+      (overlay-put ov 'keymap (gptel-agent--ask-make-keymap choices))
+      (gptel-agent--ask-update-overlay ov)
+      (goto-char (overlay-start ov))
+      t)))
+
+(defun gptel-agent--ask-next-question ()
+  "Move to the next question without submitting the interaction."
+  (interactive)
+  (when-let* ((ov (gptel-agent--ask-overlay-at-point))
+              (questions (overlay-get ov 'gptel-ask--questions))
+              (idx (overlay-get ov 'gptel-ask--index)))
+    (if (< idx (1- (length questions)))
+        (gptel-agent--ask-goto-question ov (1+ idx))
+      (message "Already at the last question; use C-c C-c to submit"))))
+
+(defun gptel-agent--ask-previous-question ()
+  "Move to the previous question without submitting the interaction."
+  (interactive)
+  (when-let* ((ov (gptel-agent--ask-overlay-at-point))
+              (idx (overlay-get ov 'gptel-ask--index)))
+    (if (> idx 0)
+        (gptel-agent--ask-goto-question ov (1- idx))
+      (message "Already at the first question"))))
 
 (defun gptel-agent--ask-teardown (ov)
   "Remove ask UI overlay OV completely."
@@ -2893,7 +2981,7 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
     (delete-overlay ov)))
 
 (defun gptel-agent--ask-confirm-choice ()
-  "Confirm selection and call callback."
+  "Save the current selection, or confirm a single-question interaction."
   (interactive)
   (when-let* ((ov (gptel-agent--ask-overlay-at-point))
               (callback (overlay-get ov 'gptel-ask--callback))
@@ -2901,16 +2989,56 @@ PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool."
               (sel-idx (overlay-get ov 'gptel-ask--selection))
               (choice (nth sel-idx choices))
               (val (plist-get choice :value)))
-    ;; Treat the appended custom option (always the last in CHOICES)
-    ;; as the free-text sentinel, instead of relying on VAL being \"Custom\".
-    (if (= sel-idx (1- (length choices)))
-        (let (custom-response)
-          (unwind-protect
-              (setq custom-response (read-string "Enter your custom response: "))
-            (gptel-agent--ask-teardown ov))
-          (funcall callback custom-response))
-      (gptel-agent--ask-teardown ov)
-      (funcall callback val))))
+    (if-let* ((answers (overlay-get ov 'gptel-ask--answers))
+              (idx (overlay-get ov 'gptel-ask--index)))
+        (let* ((custom-p (= sel-idx (1- (length choices))))
+               (custom-responses
+                (overlay-get ov 'gptel-ask--custom-responses))
+               (answer
+                (if custom-p
+                    (read-string "Enter your custom response: "
+                                 (aref custom-responses idx))
+                  val)))
+          (when custom-p
+            (aset custom-responses idx answer))
+          (aset (overlay-get ov 'gptel-ask--selections) idx sel-idx)
+          (aset answers idx answer)
+          (if (< idx (1- (length answers)))
+              (gptel-agent--ask-goto-question ov (1+ idx))
+            (gptel-agent--ask-update-overlay ov)
+            (message "Answer saved; review with M-p/← or submit with C-c C-c")))
+      ;; Treat the appended custom option (always the last in CHOICES)
+      ;; as the free-text sentinel, instead of relying on VAL being \"Custom\".
+      (if (= sel-idx (1- (length choices)))
+          (let (custom-response)
+            (unwind-protect
+                (setq custom-response (read-string "Enter your custom response: "))
+              (gptel-agent--ask-teardown ov))
+            (funcall callback custom-response))
+        (gptel-agent--ask-teardown ov)
+        (funcall callback val)))))
+
+(defun gptel-agent--ask-submit ()
+  "Submit all saved answers in the current ask interaction."
+  (interactive)
+  (when-let* ((ov (gptel-agent--ask-overlay-at-point))
+              (questions (overlay-get ov 'gptel-ask--questions))
+              (answers (overlay-get ov 'gptel-ask--answers))
+              (callback (overlay-get ov 'gptel-ask--callback)))
+    (if-let* ((missing (cl-position nil answers)))
+        (progn
+          (gptel-agent--ask-goto-question ov missing)
+          (message "Answer question %d before submitting" (1+ missing)))
+      (let ((formatted-output
+             (mapconcat
+              (lambda (idx)
+                (format "Q%d: %s\nR%d: %s"
+                        (1+ idx) (plist-get (nth idx questions) :question)
+                        (1+ idx) (aref answers idx)))
+              (number-sequence 0 (1- (length questions)))
+              "\n\n")))
+        (gptel-agent--ask-teardown ov)
+        (funcall callback formatted-output)))))
 
 (defun gptel-agent--ask-cancel ()
   "Cancel ask interaction."
@@ -2968,38 +3096,40 @@ Always appends a custom option allowing the user to provide their own response."
             (when-let* ((window (get-buffer-window presentation-buffer 'visible)))
               (set-window-point window (point))
               (with-selected-window window
-                (recenter)))))))))
+                (recenter)))
+            ov))))))
 
 (defun gptel-agent--ask-multiple (callback questions)
-  "Ask user multiple QUESTIONS sequentially, calling CALLBACK with results."
+  "Ask QUESTIONS in one navigable interaction, then call CALLBACK with results."
   (let* ((qs (append questions nil))
-         (results (make-hash-table :test 'equal))
-         (question-order nil)
          (total (length qs)))
-    (cl-labels ((ask-next (idx)
-                  (if (>= idx total)
-                      ;; Format all Q&A pairs in order
-                      (let ((formatted-output
-                             (mapconcat
-                              (lambda (q-and-idx)
-                                (let* ((q (car q-and-idx))
-                                       (qnum (cdr q-and-idx)))
-                                  (format "Q%d: %s\nR%d: %s"
-                                          qnum q
-                                          qnum (gethash q results))))
-                              (nreverse question-order)
-                              "\n\n")))
-                        (funcall callback formatted-output))
-                    (let* ((item (nth idx qs))
-                           (q (plist-get item :question))
-                           (c (plist-get item :choices)))
-                      (push (cons q (1+ idx)) question-order)
-                      (gptel-agent--ask-question
-                       (lambda (answer)
-                         (puthash q answer results)
-                         (ask-next (1+ idx)))
-                       q (append c nil))))))
-      (ask-next 0))))
+    (if (= total 0)
+        (funcall callback "")
+      (let* ((normalized
+              (mapcar
+               (lambda (item)
+                 (list
+                  :question (plist-get item :question)
+                  :choices
+                  (append
+                   (append (plist-get item :choices) nil)
+                   (list (list :value "Custom"
+                               :description "Provide your own custom response"
+                               :recommended :json-false)))))
+               qs))
+             (first (car qs))
+             (ov (gptel-agent--ask-question
+                  callback
+                  (plist-get first :question)
+                  (append (plist-get first :choices) nil))))
+        (with-current-buffer (overlay-buffer ov)
+          (overlay-put ov 'gptel-ask--questions normalized)
+          (overlay-put ov 'gptel-ask--answers (make-vector total nil))
+          (overlay-put ov 'gptel-ask--selections (make-vector total 0))
+          (overlay-put ov 'gptel-ask--custom-responses (make-vector total nil))
+          (gptel-agent--ask-goto-question ov 0))
+        ;; Async tools must return nil while waiting for their callback.
+        nil))))
 
 ;;; All tool declarations
 
@@ -3547,7 +3677,10 @@ automatically appended."))
 (gptel-make-tool
  :name "AskUserQuestion"
  :function #'gptel-agent--ask-multiple
- :description "Ask the user one or more questions sequentially.
+ :description "Ask the user one or more questions in a navigable interaction.
+
+The user can revisit and change saved answers before submitting the complete
+response list.
 
 Each question in QUESTIONS should have `question' and `choices' keys.
 CHOICES must contain objects with a `value' key. An optional `description'

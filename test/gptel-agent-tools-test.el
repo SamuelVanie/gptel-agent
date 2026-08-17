@@ -149,7 +149,8 @@
             (setq-local gptel-agent--supervised-run run)
             (gptel--handle-tool-use fsm))
           ;; The tool remains unresolved until the user confirms a choice.
-          (should (eq (gptel-fsm-state fsm) 'TOOL))
+          (ert-info ("after opening the interaction")
+            (should (eq (gptel-fsm-state fsm) 'TOOL)))
           (should-not (plist-get call :result))
           (should-not
            (seq-find (lambda (ov) (overlay-get ov 'gptel-ask))
@@ -162,12 +163,60 @@
             (should (overlayp ask-ov))
             (with-current-buffer parent
               (goto-char (overlay-start ask-ov))
-              (gptel-agent--ask-confirm-choice)))
+              (gptel-agent--ask-confirm-choice))
+            ;; Saving the last answer does not submit the response list.
+            (ert-info ("after saving the answer")
+              (should (eq (gptel-fsm-state fsm) 'TOOL)))
+            (should-not (plist-get call :result))
+            (with-current-buffer parent
+              (goto-char (overlay-start ask-ov))
+              (gptel-agent--ask-submit)))
           (should (eq (gptel-fsm-state fsm) 'TRET))
           (should (equal (plist-get call :result)
                          "Q1: Continue?\nR1: Yes")))
       (when (buffer-live-p parent) (kill-buffer parent))
       (when (buffer-live-p child) (kill-buffer child)))))
+
+(ert-deftest gptel-agent-ask-multiple-allows-revising-saved-answers ()
+  (with-temp-buffer
+    (let (result)
+      (gptel-agent--ask-multiple
+       (lambda (answers) (setq result answers))
+       [(:question "Pick a color"
+         :choices [(:value "Red") (:value "Blue")])
+        (:question "Enable notifications?"
+         :choices [(:value "Yes") (:value "No")])])
+      (let ((ask-ov
+             (seq-find (lambda (ov) (overlay-get ov 'gptel-ask))
+                       (overlays-in (point-min) (point-max)))))
+        (should (overlayp ask-ov))
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 0))
+        (should (eq (lookup-key (overlay-get ask-ov 'keymap) (kbd "M-p"))
+                    'gptel-agent--ask-previous-question))
+        ;; Save both initial answers.  The interaction remains open.
+        (goto-char (overlay-start ask-ov))
+        (gptel-agent--ask-confirm-choice)
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 1))
+        (gptel-agent--ask-select-choice 1)
+        (gptel-agent--ask-confirm-choice)
+        (should-not result)
+        (should (equal (append (overlay-get ask-ov 'gptel-ask--answers) nil)
+                       '("Red" "No")))
+        ;; Return to the first question and replace its saved answer.
+        (gptel-agent--ask-previous-question)
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 0))
+        (gptel-agent--ask-select-choice 1)
+        (should-not (aref (overlay-get ask-ov 'gptel-ask--answers) 0))
+        (gptel-agent--ask-confirm-choice)
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 1))
+        (should (equal (append (overlay-get ask-ov 'gptel-ask--answers) nil)
+                       '("Blue" "No")))
+        ;; Only the explicit final action resolves the tool call.
+        (gptel-agent--ask-submit)
+        (should (equal result
+                       (concat "Q1: Pick a color\nR1: Blue\n\n"
+                               "Q2: Enable notifications?\nR2: No")))
+        (should-not (overlay-buffer ask-ov))))))
 
 (ert-deftest gptel-agent-task-prompt-allows-inconclusive-results ()
   (let ((prompt (gptel-agent--prepare-task-prompt "Find the repository")))
