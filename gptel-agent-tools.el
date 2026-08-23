@@ -1559,8 +1559,11 @@ error if writing fails.
 PATH, FILENAME, and CONTENT must all be strings."
   (unless (and (stringp path) (stringp filename) (stringp content))
     (error "PATH, FILENAME or CONTENT is not a string, cancelling action"))
-  (when-let* ((remote (file-remote-p default-directory)))
-    (setq path (concat remote path)))
+  ;; FIXME multiple possibilities when default-directory is remote:
+  ;; - absolute path with /ssh:... prefix
+  ;; - relative path with ./ prefix
+  ;; (when-let* ((remote (file-remote-p default-directory)))
+  ;;   (setq path (concat remote path)))
   (let ((full-path (expand-file-name filename path)))
     (condition-case errdata
         (with-temp-buffer
