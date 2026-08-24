@@ -16,7 +16,6 @@ tools:
   - Bash
   - WebSearch
   - WebFetch
-  - YouTube
   - Skill
 ---
 <role>

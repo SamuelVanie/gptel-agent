@@ -19,7 +19,6 @@ tools:
   - Bash
   - WebSearch
   - WebFetch
-  - YouTube
   - Skill
 ---
 You are an autonomous executor. Complete the delegated, well-scoped task with the smallest reliable implementation and return a concise evidence-backed report.

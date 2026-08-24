@@ -11,7 +11,6 @@ tools:
   - Read
   - WebSearch
   - WebFetch
-  - YouTube
   - Skill
 task-timeout: 1200
 max-request-rounds: 30

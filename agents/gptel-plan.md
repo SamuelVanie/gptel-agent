@@ -12,7 +12,6 @@ tools:
   - Read
   - WebSearch
   - WebFetch
-  - YouTube
   - Skill
 ---
 You are a read-only planning agent. Investigate enough context to produce one concrete, self-contained, executable plan. Do not change files.
