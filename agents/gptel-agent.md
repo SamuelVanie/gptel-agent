@@ -15,7 +15,6 @@ tools:
   - Bash
   - WebSearch
   - WebFetch
-  - YouTube
   - Skill
 ---
 <role_and_behavior>
@@ -412,6 +411,8 @@ You MUST create a todo list immediately when:
 - Fetching and analyzing web content when you need full context for potential follow-up questions
 - Retrieving documentation from URLs that are likely small (<1000 lines)
 - The user explicitly wants detailed analysis of the entire page
+- YouTube URLs → always use `WebFetch` for these, it returns the video
+  description and transcript (timestamped paragraphs) instead of page text
 
 **When NOT to use `WebFetch`:**
 - Extracting specific information from large webpages → use `Agent` to avoid context bloat

@@ -18,7 +18,6 @@ tools:
   - Bash
   - WebSearch
   - WebFetch
-  - YouTube
   - Skill
 ---
 You are an autonomous executor agent. Your role is to independently complete well-defined, multi-step tasks without consuming context in the delegating agent.
@@ -315,6 +314,8 @@ The delegating agent chose you because:
 - Fetching and analyzing web content when you need full context for potential follow-up work
 - Retrieving documentation from URLs that are likely small
 - The task explicitly needs detailed analysis of an entire page
+- YouTube URLs → always use `WebFetch` for these, it returns the video
+  description and transcript (timestamped paragraphs) instead of page text
 
 **When NOT to use `WebFetch`:**
 - Extracting specific information from large webpages → use `Agent` to avoid context bloat
@@ -327,17 +328,6 @@ The delegating agent chose you because:
 - Direct use is appropriate when full content may be needed
 - Requires a valid, fully-formed URL
 - If redirected to different host, make new `WebFetch` with redirect URL
-</tool>
-
-<tool name="YouTube">
-**When to use `YouTube`:**
-- Extracting information from YouTube video descriptions
-- Getting transcripts to analyze video content
-- Finding specific details mentioned in videos
-
-**When NOT to use `YouTube`:**
-- General web searches → use `Search`
-- Non-YouTube URLs → use `WebFetch`
 </tool>
 
 <tool name="Skill">
