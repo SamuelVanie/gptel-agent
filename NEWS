@@ -4,6 +4,11 @@
 
 ** New features and UI changes
 
+- Oversized ~Bash~ output is now saved in full and returned as a bounded
+  preview with an exact extraction query.  A new ~result-explorer~ agent
+  can analyze only that registered result file through harness-scoped
+  read/search tools and returns line-cited evidence for parent verification.
+
 - Sub-agent time and model-round budgets are now configurable per agent with
   the ~task-timeout~ and ~max-request-rounds~ Markdown frontmatter or Org
   property keys.  Omitted limits inherit the corresponding global fallback

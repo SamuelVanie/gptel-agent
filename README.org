@@ -199,6 +199,16 @@ client-rendered resources return an explicit limitation.  Responses default to
 by =gptel-agent-web-request-timeout=.  The tool's optional =max_chars= argument
 can raise the per-call output size for a known large textual resource.
 
+=Bash= calls include a =query= stating what should be extracted from their
+output.  Results larger than =gptel-agent-tool-result-max-chars= are saved in
+full under the temporary directory and replaced by a bounded preview.  The
+notice supplies an exact =result_file=/=query= contract for the built-in
+=result-explorer= sub-agent.  Its pathless read/search tools are locked by the
+harness to that registered file, and its report cites file line evidence that
+the parent agent can verify with =Read=.  Preview size is controlled by
+=gptel-agent-tool-result-preview-chars= and
+=gptel-agent-tool-result-preview-lines=.
+
 #+html: </details>
 #+html: <details><summary>
 **** Agents from Markdown files

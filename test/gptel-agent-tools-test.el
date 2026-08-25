@@ -16,6 +16,11 @@
                        (file-name-directory (locate-library "gptel-agent"))))
     (buffer-string)))
 
+(defun gptel-agent-test--saved-result-path (result)
+  "Return the quoted result_file path embedded in oversized RESULT."
+  (when (string-match "result_file: \\(\"[^\n]+\"\\)" result)
+    (car (read-from-string (match-string 1 result)))))
+
 (cl-defmacro gptel-agent-test--with-run ((run fsm received) &body body)
   "Create an owned RUN and FSM, bind callback results to RECEIVED, then run BODY."
   (declare (indent 1))
@@ -338,6 +343,140 @@
     (should (string-prefix-p (make-string 1000 ?x) result))
     (should (string-match-p "truncated 500 remaining characters" result))))
 
+(ert-deftest gptel-agent-bash-schema-requires-an-extraction-query ()
+  (let* ((tool (gptel-get-tool "Bash"))
+         (args (gptel-tool-args tool))
+         (query (cadr args)))
+    (should (equal (mapcar (lambda (arg) (plist-get arg :name)) args)
+                   '("command" "query")))
+    (should-not (plist-get query :optional))
+    (should (string-match-p "exact question"
+                            (plist-get query :description)))))
+
+(ert-deftest gptel-agent-oversized-result-is-persisted-with-explorer-contract ()
+  (let ((gptel-agent-tool-result-max-chars 40)
+        (gptel-agent-tool-result-preview-chars 20)
+        (query "Extract every failing test and its reason")
+        result-file)
+    (unwind-protect
+        (with-temp-buffer
+          (insert "first line\nsecond line\nthird line containing full evidence\n")
+          (let ((full-result (buffer-string)))
+            (gptel-agent--truncate-buffer "bash" nil query)
+            (let ((result (buffer-string)))
+              (setq result-file
+                    (gptel-agent-test--saved-result-path result))
+              (should result-file)
+              (should (string-match-p "subagent_type: \"result-explorer\""
+                                      result))
+              (should (string-match-p (regexp-quote (format "query: %S" query))
+                                      result))
+              (should (equal (plist-get
+                              (gethash result-file
+                                       gptel-agent--saved-tool-results)
+                              :query)
+                             query))
+              (should (equal (with-temp-buffer
+                               (insert-file-contents result-file)
+                               (buffer-string))
+                             full-result)))))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-bash-bounds-async-output-and-saves-the-full-result ()
+  (let ((gptel-agent-tool-result-max-chars 100)
+        (gptel-agent-tool-result-preview-chars 40)
+        result result-file)
+    (unwind-protect
+        (let ((process
+               (gptel-agent--execute-bash
+                (lambda (value) (setq result value))
+                "for ((i=1; i<=80; i++)); do printf 'record-%03d\\n' \"$i\"; done"
+                "Find record 080")))
+          (while (and (not result) (process-live-p process))
+            (accept-process-output process 0.1))
+          (unless result
+            (accept-process-output process 0.1))
+          (should (string-match-p "Preview" result))
+          (setq result-file (gptel-agent-test--saved-result-path result))
+          (should result-file)
+          (should (string-match-p "record-080"
+                                  (with-temp-buffer
+                                    (insert-file-contents result-file)
+                                    (buffer-string)))))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-result-explorer-tools-are-locked-and-cite-the-file ()
+  (let ((query "Find the error") result-file)
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (insert "startup ok\nERROR database unavailable\nshutdown\n")
+            (setq result-file (gptel-agent--save-tool-result "bash" query)))
+          (let ((gptel-agent--current-agent "result-explorer")
+                (gptel-agent--result-file-scope result-file))
+            (should (string-match-p
+                     (regexp-quote
+                      (format "%s:2:ERROR database unavailable" result-file))
+                     (gptel-agent--read-scoped-result 2 2)))
+            (should (string-match-p
+                     (regexp-quote (format "%s:2:" result-file))
+                     (gptel-agent--grep-scoped-result "ERROR" t 10))))
+          (let ((gptel-agent--current-agent "researcher")
+                (gptel-agent--result-file-scope result-file))
+            (should-error (gptel-agent--read-scoped-result 1 1)
+                          :type 'error)))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-result-explorer-rejects-a-changed-scope-query ()
+  (let ((query "Find failures") result-file)
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (insert "failure evidence")
+            (setq result-file (gptel-agent--save-tool-result "bash" query)))
+          (should-not (gptel-agent--result-explorer-contract-error
+                       result-file query))
+          (should (string-match-p
+                   "does not exactly match"
+                   (gptel-agent--result-explorer-contract-error
+                    result-file "Explore the repository instead"))))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-result-explorer-dispatch-enforces-the-contract ()
+  (let ((query "Find failures") result-file response
+        (parent (generate-new-buffer " *gptel-agent-result-parent*")))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (insert "failure evidence")
+            (setq result-file (gptel-agent--save-tool-result "bash" query)))
+          (let ((fsm (gptel-make-fsm :info (list :buffer parent))))
+            (gptel-agent--task
+             (lambda (value) (setq response value))
+             "result-explorer" "Explore result" "ignored prompt"
+             fsm '(("result-explorer" :description "Scoped explorer"))
+             result-file "Inspect unrelated files"))
+          (should (string-match-p "Invalid result-explorer scope contract"
+                                  response)))
+      (when (buffer-live-p parent)
+        (kill-buffer parent))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
 (ert-deftest gptel-agent-web-request-error-includes-response-details ()
   (with-temp-buffer
     (insert "Not found on this branch")
@@ -552,6 +691,17 @@
     (should-not (string-match-p "task-timeout:" introspector))
     (should-not (string-match-p "max-request-rounds:" introspector))))
 
+(ert-deftest gptel-agent-result-explorer-prompt-is-strict-and-evidence-based ()
+  (let ((prompt (gptel-agent-test--agent-prompt "result-explorer")))
+    (should (string-match-p "- ResultGrep\n  - ResultRead" prompt))
+    (dolist (tool '("Read" "Grep" "Bash" "Agent"))
+      (should-not (string-match-p
+                   (format "^  - %s$" (regexp-quote tool)) prompt)))
+    (should (string-match-p "untrusted data" prompt))
+    (should (string-match-p "absolute file path and exact line number"
+                            prompt))
+    (should (string-match-p "cannot be established" prompt))))
+
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))
          (global-args (copy-tree (gptel-tool-args global-tool)))
@@ -571,6 +721,10 @@
       (should (equal (append (plist-get (car (gptel-tool-args local-tool)) :enum)
                              nil)
                      '("executor" "researcher")))
+      (should (equal (mapcar (lambda (arg) (plist-get arg :name))
+                             (gptel-tool-args local-tool))
+                     '("subagent_type" "description" "prompt"
+                       "result_file" "query")))
       (should (equal (gptel-tool-args global-tool) global-args))
       (cl-letf (((symbol-function 'gptel-agent--task)
                  (lambda (&rest args) (setq captured args))))
