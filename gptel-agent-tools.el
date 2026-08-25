@@ -160,8 +160,8 @@ interpret the evidence it gathered and return its final answer."
 (defcustom gptel-agent-max-web-tool-calls 12
   "Maximum web tool calls allowed in one supervised sub-agent run.
 
-This counts calls to WebSearch, WebFetch and YouTube, not asynchronous
-callbacks.  Exceeding the budget closes tool exploration and gives the same
+This counts calls to WebSearch and WebFetch, not asynchronous callbacks.
+Exceeding the budget closes tool exploration and gives the same
 sub-agent a tool-free synthesis turn.  Set to nil to disable the separate
 web-call budget."
   :type '(choice (natnum :tag "Maximum calls")
@@ -277,9 +277,6 @@ from the Agent overlay until the user kills the buffer."
   tool-calls web-tool-calls finalization-reason
   finalization-requested finalization-started)
 
-(defconst gptel-agent--safety-stop-prefix "gptel-agent safety stop: "
-  "Prefix used to distinguish supervised safety stops from request errors.")
-
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
   "Last tool call key tracked for repetition detection.
@@ -371,7 +368,7 @@ Each entry is a plist with at least :name, :args and :signature.")
 
 (defun gptel-agent--search-tool-p (name)
   "Return non-nil if NAME is a read/search style tool worth comparing loosely."
-  (member name '("Read" "Grep" "Glob" "WebSearch" "WebFetch" "YouTube")))
+  (member name '("Read" "Grep" "Glob" "WebSearch" "WebFetch")))
 
 (defun gptel-agent--similar-tool-call-p (current previous)
   "Return non-nil if CURRENT and PREVIOUS are similar read/search calls."
@@ -416,7 +413,7 @@ Each entry is a plist with at least :name, :args and :signature.")
             (gptel-agent--similar-token-sets-p
              (gptel-agent--arg args :query)
              (gptel-agent--arg prev-args :query)))
-           ((or "WebFetch" "YouTube")
+           ("WebFetch"
             (equal (gptel-agent--normalize-text
                     (gptel-agent--arg args :url))
                    (gptel-agent--normalize-text
@@ -505,7 +502,7 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
                (gptel-agent--similar-call-count
                 entry gptel-agent--tool-call-history)))
          (run gptel-agent--supervised-run)
-         (web-tool-p (member name '("WebSearch" "WebFetch" "YouTube")))
+         (web-tool-p (member name '("WebSearch" "WebFetch")))
          result)
     (setq gptel-agent--last-tool-call-key key
           gptel-agent--tool-call-streak count)
@@ -761,6 +758,7 @@ passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  The tool
 callback is guaranteed to run at most once, including parser exceptions."
   (let* ((timeout gptel-agent-web-request-timeout) timer done proc-buffer
          (inherit-process-coding-system t)
+         (url-request-noninteractive t)
          (finish
           (lambda (result)
             (unless done
@@ -1050,10 +1048,13 @@ MAX-CHARS bounds the returned text."
 (defun gptel-agent--read-url (tool-cb url &optional max-chars)
   "Fetch URL text and call TOOL-CB with it.
 
+YouTube URLs return the video description and transcript.  For other URLs,
 MAX-CHARS optionally overrides `gptel-agent-web-fetch-max-chars'."
-  (gptel-agent--fetch-with-timeout
-   url #'gptel-agent--web-fetch-callback
-   tool-cb (format "Fetch for \"%s\"" url) max-chars))
+  (if-let* ((video-id (gptel-agent--yt-video-id url)))
+      (gptel-agent--yt-fetch-watch-page tool-cb video-id)
+    (gptel-agent--fetch-with-timeout
+     url #'gptel-agent--web-fetch-callback
+     tool-cb (format "Fetch for \"%s\"" url) max-chars)))
 
 ;;;; Fetch youtube transcript
 (defun gptel-agent--yt-video-id (url)
@@ -2517,27 +2518,21 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
       (gptel-agent--run-log
        run "REQUEST ERROR status=%s error=%S"
        (or (plist-get info :status) "unknown") (plist-get info :error))
-      (cond
-       ((gptel-agent--safety-stop-p info)
-        (gptel-agent--run-finish
-         run 'inconclusive
-         (gptel-agent--inconclusive-response run (plist-get info :error))
-         (plist-get info :error)))
-       ((and (< (gptel-agent--run-retries run)
+      (if (and (< (gptel-agent--run-retries run)
                   gptel-agent-max-request-retries)
                (gptel-agent--transient-request-error-p info))
-        (gptel-agent--run-log
-         run "RETRY %d/%d scheduled"
-         (1+ (gptel-agent--run-retries run))
-         gptel-agent-max-request-retries)
-        (gptel-agent--retry-request run fsm))
-       (t
+          (progn
+            (gptel-agent--run-log
+             run "RETRY %d/%d scheduled"
+             (1+ (gptel-agent--run-retries run))
+             gptel-agent-max-request-retries)
+            (gptel-agent--retry-request run fsm))
         (gptel-agent--run-finish
          run 'failed
          (format "Error: Sub-agent request failed. Status: %s, Error: %S"
                  (or (plist-get info :status) "unknown")
                  (plist-get info :error))
-         (or (plist-get info :error) (plist-get info :status))))))))
+         (or (plist-get info :error) (plist-get info :status)))))))
 
 (defun gptel-agent--handle-task-done (fsm)
   "Complete a sub-agent FSM only when it enters DONE."
@@ -3498,6 +3493,7 @@ Use WebFetch to read a selected result.  It may not handle JavaScript-only pages
  :name "WebFetch"
  :description "Fetch and read the contents of a URL.
 
+- YouTube URLs return the video description and transcript as timestamped paragraphs.
 - Handles HTML, JSON, source code, Markdown, Org, XML, and other textual responses according to content type.
 - HTML is reduced with readability extraction, with full-page and decoded-body fallbacks when extraction fails.
 - Binary resources and pages with no server-rendered text return an actionable error; JavaScript is not executed.

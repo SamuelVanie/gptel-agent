@@ -197,7 +197,9 @@ readability extraction with full-page and decoded-body fallbacks; binary or
 client-rendered resources return an explicit limitation.  Responses default to
 =gptel-agent-web-fetch-max-chars= characters and request timeout is controlled
 by =gptel-agent-web-request-timeout=.  The tool's optional =max_chars= argument
-can raise the per-call output size for a known large textual resource.
+can raise the per-call output size for a known large textual resource.  YouTube
+URLs use this same tool and return the video description and transcript; there
+is no separate YouTube tool.
 
 =Bash= calls include a =query= stating what should be extracted from their
 output.  Results larger than =gptel-agent-tool-result-max-chars= are saved in

@@ -241,6 +241,22 @@
                  prompt))
         (should (string-match-p "confidence" prompt))))))
 
+(ert-deftest gptel-agent-built-in-prompts-have-balanced-policy-tags ()
+  (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"
+                  "researcher" "introspector" "result-explorer"))
+    (with-temp-buffer
+      (insert (gptel-agent-test--agent-prompt name))
+      (goto-char (point-min))
+      (let (stack)
+        (while (re-search-forward
+                "<\\(/?\\)\\([[:alnum:]_-]+\\)\\(?: [^>]*\\)?>" nil t)
+          (let ((closing (equal (match-string 1) "/"))
+                (tag (match-string 2)))
+            (if closing
+                (should (equal (pop stack) tag))
+              (push tag stack))))
+        (should-not stack)))))
+
 (ert-deftest gptel-agent-plan-prompt-requires-a-self-contained-handoff ()
   (let ((prompt (gptel-agent-test--agent-prompt "gptel-plan")))
     (dolist (requirement '("standalone handoff"
@@ -274,7 +290,7 @@
         '(:name "WebFetch" :args (:url "https://example.com"))))
       (let ((result
              (gptel-agent--detect-repetition
-              '(:name "YouTube" :args (:url "https://youtube.test/1")))))
+              '(:name "WebSearch" :args (:query "second topic")))))
         (should (plist-get result :result))
         (should (string-match-p "Tool exploration is now closed"
                                 (plist-get result :result)))
@@ -296,6 +312,23 @@
        "Test fetch"))
     (should (= (length results) 1))
     (should (string-match-p "could not be parsed" (car results)))))
+
+(ert-deftest gptel-agent-web-requests-are-noninteractive ()
+  (let (noninteractive result)
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (_url callback &rest _args)
+                 (setq noninteractive url-request-noninteractive)
+                 (let ((buffer (generate-new-buffer " *web-request-test*")))
+                   (with-current-buffer buffer
+                     (funcall callback nil))
+                   buffer))))
+      (gptel-agent--fetch-with-timeout
+       "https://example.test"
+       (lambda (callback) (funcall callback "ok"))
+       (lambda (value) (setq result value))
+       "Test fetch"))
+    (should noninteractive)
+    (should (equal result "ok"))))
 
 (ert-deftest gptel-agent-web-fetch-preserves-json-and-plain-text ()
   (let (result)
@@ -342,6 +375,24 @@
   (let ((result (gptel-agent--web-fetch-limit (make-string 1500 ?x) 1000)))
     (should (string-prefix-p (make-string 1000 ?x) result))
     (should (string-match-p "truncated 500 remaining characters" result))))
+
+(ert-deftest gptel-agent-web-fetch-dispatches-youtube-urls ()
+  (let (generic-fetch video-id result)
+    (cl-letf (((symbol-function 'gptel-agent--yt-fetch-watch-page)
+               (lambda (callback id)
+                 (setq video-id id)
+                 (funcall callback "video transcript")))
+              ((symbol-function 'gptel-agent--fetch-with-timeout)
+               (lambda (&rest _args) (setq generic-fetch t))))
+      (gptel-agent--read-url
+       (lambda (value) (setq result value))
+       "https://www.youtube.com/watch?v=H2qJRnV8ZGA"))
+    (should (equal video-id "H2qJRnV8ZGA"))
+    (should (equal result "video transcript"))
+    (should-not generic-fetch)
+    (should (string-match-p
+             "YouTube URLs return the video description and transcript"
+             (gptel-tool-description (gptel-get-tool "WebFetch"))))))
 
 (ert-deftest gptel-agent-bash-schema-requires-an-extraction-query ()
   (let* ((tool (gptel-get-tool "Bash"))
@@ -733,6 +784,45 @@
       (should (eq (nth 4 captured) fsm))
       (should (equal (mapcar #'car (nth 5 captured))
                      '("executor" "researcher"))))))
+
+(ert-deftest gptel-agent-session-records-its-initial-preset ()
+  (let ((session-buffer (generate-new-buffer " *gptel-agent-session-test*"))
+        (gptel-use-header-line nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gptel)
+                   (lambda (&rest _args) session-buffer))
+                  ((symbol-function 'gptel-agent-update) #'ignore)
+                  ((symbol-function 'gptel--apply-preset) #'ignore))
+          (gptel-agent default-directory 'ask)
+          (with-current-buffer session-buffer
+            (should (equal gptel-agent--current-agent "ask"))))
+      (when (buffer-live-p session-buffer)
+        (kill-buffer session-buffer)))))
+
+(ert-deftest gptel-agent-skill-discovery-uses-cached-exact-metadata ()
+  (let ((gptel-agent-skill-dirs '("/skills"))
+        gptel-agent--skills cached-file cached-full filename-regexp)
+    (cl-letf (((symbol-function 'file-directory-p) (lambda (_dir) t))
+              ((symbol-function 'project-current) (lambda (&rest _) nil))
+              ((symbol-function 'directory-files-recursively)
+               (lambda (_dir regexp &rest _args)
+                 (setq filename-regexp regexp)
+                 '("/skills/example/SKILL.md")))
+              ((symbol-function 'gptel-agent--cached-read-file)
+               (lambda (file full)
+                 (setq cached-file file
+                       cached-full full)
+                 '("example" :description "Example skill")))
+              ((symbol-function 'gptel-agent-read-file)
+               (lambda (&rest _args)
+                 (ert-fail "Skill discovery bypassed the file cache"))))
+      (gptel-agent--update-skills))
+    (should (equal filename-regexp "SKILL\\.md$"))
+    (should (equal cached-file "/skills/example/SKILL.md"))
+    (should-not cached-full)
+    (should (equal (car (alist-get "example" gptel-agent--skills
+                                   nil nil #'string-equal))
+                   "/skills/example/"))))
 
 (ert-deftest gptel-agent-project-registry-snapshot-is-isolated ()
   (let ((gptel-agent--agents

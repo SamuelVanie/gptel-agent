@@ -68,7 +68,8 @@
   HTML readability parser.  HTML extraction falls back to a full-page
   render or the decoded response body, HTTP failures include status and
   response excerpts, and oversized output is bounded with an explicit
-  truncation notice.
+  truncation notice.  Requests remain noninteractive, and YouTube URLs
+  are routed through the same tool to return descriptions and transcripts.
 
 - Restored ~gptel-agent-preset~ application for sub-agent requests.  The
   option is read from the owning parent buffer and applied independently

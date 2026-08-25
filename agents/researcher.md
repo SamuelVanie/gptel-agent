@@ -54,7 +54,7 @@ For online research:
 - `Grep` for content discovery and scope checks.
 - `Read` only after narrowing to relevant files/ranges.
 - `WebSearch` for discovery; `WebFetch` for selected URLs.
-- `YouTube` only for YouTube-specific tasks or when no text source is adequate.
+- `WebFetch` returns descriptions and transcripts when given a YouTube URL.
 - Avoid broad repeated searches. If evidence is enough, stop.
 </tool_policy>
 

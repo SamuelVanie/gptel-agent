@@ -295,9 +295,9 @@ Returns an alist of (agent-name . file-path)."
   (mapc (lambda (dir)
           (when (file-directory-p dir)
             (dolist (skill-file (directory-files-recursively
-                                 dir "SKILL\\.md" nil nil t))
-              (pcase-let ((`(,name . ,skill-plist) ;loading only metadata
-                           (gptel-agent-read-file skill-file nil t)))
+                                 dir "SKILL\\.md$" nil nil t))
+              (pcase-let ((`(,name . ,skill-plist)
+                           (gptel-agent--cached-read-file skill-file nil)))
                 ;; validating skill definition
                 (if (plist-get skill-plist :description)
                     (setf (alist-get name gptel-agent--skills nil nil #'string-equal)
@@ -916,6 +916,8 @@ this session, which defaults to the default `gptel-agent'."
       (gptel--apply-preset              ;Apply the gptel-agent preset
        (or agent-preset 'gptel-agent)
        (lambda (sym val) (set (make-local-variable sym) val)))
+      (setq-local gptel-agent--current-agent
+                  (symbol-name (or agent-preset 'gptel-agent)))
       (when gptel-use-header-line
         (let* ((modes '((gptel-agent "[Agent]" font-lock-keyword-face
                                      "Switch to planning preset")
