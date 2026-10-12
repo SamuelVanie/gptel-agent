@@ -129,19 +129,6 @@ manager.  The location of default packages can tell you about the user's
 Emacs installation.")
 
 (gptel-make-tool
- :function (lambda () (mapconcat #'symbol-name features "\n"))
- :name "features"
- :include t
- :category "introspection"
- :args nil
- :description "Return the list of loaded features.
-This tool can be used to see what packages are already loaded in the
-running Emacs.  Use this to understand the user's typical set of
-packages and typical usage patterns.  Especially if the solution depends
-on the user's choice of packages, you will want to look at the features
-and load paths.")
-
-(gptel-make-tool
  :function (lambda ()
              (json-serialize (vconcat (info--filter-manual-names
                                        (info--manual-names nil)))))
