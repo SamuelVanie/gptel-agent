@@ -181,6 +181,31 @@ properties persist through refontification."
             (setq pos (or next (1- (point-max))))))))))
 
 ;;; System tools
+(defun gptel-agent--sanitize-buffer (&optional tool-name)
+  "Prepare current buffer for tool-result serialization, in place.
+
+If the buffer contains a NUL byte (binary content), keep only the text
+head before it, followed by a banner with size and inspection hints.
+Return non-nil if binary content was found.
+
+TOOL-NAME is used to prefix the inserted notices."
+  (save-excursion
+    (goto-char (point-min))
+    (skip-chars-forward "^\0")          ; C-level scan; also the truncate point
+    (if (eobp)                          ; no NUL
+        (prog1 nil
+          (when (memq 'eight-bit (find-charset-region (point-min) (point-max)))
+            (goto-char (point-min)
+                       )
+            (insert (format "[%s: warning, undecodable bytes present]\n"
+                            (or tool-name "gptel-agent")))))
+      (let ((size (position-bytes (point-max))))
+        (delete-region (min (point) (+ (point-min) 2000)) (point-max))
+        (insert (format "\n[%s: Binary output: %d bytes.  \
+Inspect with file(1), strings(1), xxd(1), base64(1)]"
+                        (or tool-name "gptel-agent") size))
+        t))))
+
 ;; "Execute Bash commands to inspect files and system state.
 
 ;; This tool provides access to a Bash shell with GNU coreutils (or equivalents)
@@ -269,6 +294,7 @@ COMMAND is the bash command string to execute."
                   (when (memq (process-status process) '(exit signal))
                     (let* ((exit-code (process-exit-status process))
                            (output (with-current-buffer (process-buffer process)
+                                     (gptel-agent--sanitize-buffer "Bash")
                                      (buffer-string))))
                       (kill-buffer (process-buffer process))
                       (funcall callback
@@ -1051,7 +1077,10 @@ Raises an error if PATTERN is empty, PATH is not readable, or the
                  gptel-agent-read-file-size-threshold)
         (with-temp-buffer
           (insert-file-contents filename)
-          (buffer-string)))
+          (if (gptel-agent--sanitize-buffer "Read")
+              (error "Error: %s appears to be a binary file; \
+inspect it via Bash with file(1), strings(1) or base64(1)" filename)
+            (buffer-string))))
     ;; Default nil start-line to 1, nil end-line to end of file
     (unless start-line (setq start-line 1))
     (cl-decf start-line)
@@ -1092,7 +1121,10 @@ Raises an error if PATTERN is empty, PATH is not readable, or the
                  filename nil byte-offset (+ byte-offset chunk-size))
                 (setq byte-offset (+ byte-offset chunk-size))))))
 
-        (buffer-string)))))
+        (if (gptel-agent--sanitize-buffer "Read")
+            (error "Error: %s appears to be a binary file; \
+inspect it via Bash with file(1), strings(1) or base64(1)" filename)
+          (buffer-string))))))
 
 (defun gptel-agent--grep (regex path &optional glob context-lines)
   "Search for REGEX in file or directory at PATH using ripgrep.
@@ -1166,6 +1198,7 @@ this tool cannot be used")))))
         (when (/= exit-code 0)
           (goto-char (point-min))
           (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code)))
+        (gptel-agent--sanitize-buffer "Grep")
         (gptel-agent--truncate-buffer "grep")
         (buffer-string)))))
 
