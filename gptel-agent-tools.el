@@ -45,6 +45,7 @@
 (require 'gptel)
 (require 'eww)
 (require 'url-http)
+(require 'mail-utils)
 (eval-when-compile (require 'cl-lib))
 
 (declare-function org-escape-code-in-region "org-src")
@@ -195,8 +196,7 @@ TOOL-NAME is used to prefix the inserted notices."
     (if (eobp)                          ; no NUL
         (prog1 nil
           (when (memq 'eight-bit (find-charset-region (point-min) (point-max)))
-            (goto-char (point-min)
-                       )
+            (goto-char (point-min))
             (insert (format "[%s: warning, undecodable bytes present]\n"
                             (or tool-name "gptel-agent")))))
       (let ((size (position-bytes (point-max))))
@@ -377,41 +377,41 @@ COUNT is the number of results to return (default 5)."
            tool-cb (format "Web search for \"%s\"" query))
           gptel-agent--web-search-active)))
 
-(defun gptel-agent--web-fix-unreadable ()
-  "Replace invalid characters from point to end in current buffer."
-  (while (and (skip-chars-forward "\0-\x3fff7f")
-              (not (eobp)))
-    (display-warning
-     '(gptel gptel-agent-tools)
-     (format "Invalid character in buffer \"%s\"" (buffer-name)))
-    (delete-char 1) (insert "?")))
-
 (defun gptel-agent--web-search-eww-callback (cb)
   "Extract website text and run callback CB with it."
-  (let* ((count 5) (results))
-    (goto-char (point-min))
-    (goto-char url-http-end-of-headers)
-    ;; (gptel-agent--web-fix-unreadable)
-    (let* ((dom (libxml-parse-html-region (point) (point-max)))
-           (result-count 0))
-      (eww-score-readability dom)
-      ;; (erase-buffer) (buffer-disable-undo)
-      (with-temp-buffer
-        (shr-insert-document (eww-highest-readability dom))
-        (goto-char (point-min))
-        (while (and (not (eobp)) (< result-count count))
-          (let ((pos (point))
-                (url (get-char-property (point) 'shr-url))
-                (next-pos (gptel-agent--shr-next-link)))
-            (when-let* (((stringp url))
-                        (idx (string-search "http" url))
-                        (url-fmt (url-unhex-string (substring url idx))))
-              (cl-incf result-count)
-              (push (concat url-fmt "\n\n"
-                            (string-trim
-                             (buffer-substring-no-properties pos next-pos))
-                            "\n\n----\n")
-                    results))))))
+  (let ((count 5) (results)
+        (body-start (if url-http-end-of-headers
+                        (save-excursion
+                          (goto-char url-http-end-of-headers)
+                          (point))
+                      (goto-char (point-min)) (forward-paragraph)
+                      (point))))
+    ;; Bare NUL scan: the body is parsed as HTML below when not binary.
+    (if (save-excursion (goto-char body-start)
+                        (skip-chars-forward "^\0")
+                        (not (eobp)))
+        (setq results
+              (list "[WebSearch: binary content in search results page.]"))
+      ;; NOTE: libxml2 replaces unencodable chars with placeholders
+      (let ((dom (libxml-parse-html-region body-start (point-max)))
+            (result-count 0))
+        (eww-score-readability dom)
+        (with-temp-buffer
+          (shr-insert-document (eww-highest-readability dom))
+          (goto-char (point-min))
+          (while (and (not (eobp)) (< result-count count))
+            (let ((pos (point))
+                  (url (get-char-property (point) 'shr-url))
+                  (next-pos (gptel-agent--shr-next-link)))
+              (when-let* (((stringp url))
+                          (idx (string-search "http" url))
+                          (url-fmt (url-unhex-string (substring url idx))))
+                (cl-incf result-count)
+                (push (concat url-fmt "\n\n"
+                              (string-trim
+                               (buffer-substring-no-properties pos next-pos))
+                              "\n\n----\n")
+                      results)))))))
     (funcall cb (apply #'concat (nreverse results)))))
 
 ;;;; Read URLs
@@ -425,16 +425,36 @@ instead."
     (gptel-agent--fetch-with-timeout
      url
      (lambda (cb)
-       (goto-char (point-min)) (forward-paragraph)
        (condition-case errdata
-           (let ((dom (libxml-parse-html-region (point) (point-max))))
-             (with-temp-buffer
-               (eww-score-readability dom)
-               (shr-insert-document (eww-highest-readability dom))
-               (decode-coding-region (point-min) (point-max) 'utf-8)
-               (funcall
-                cb (buffer-substring-no-properties
-                    (point-min) (point-max)))))
+           (let ((body-start (if url-http-end-of-headers
+                                 (save-excursion
+                                   (goto-char url-http-end-of-headers)
+                                   (point))
+                               (goto-char (point-min)) (forward-paragraph)
+                               (point)))
+                 (ctype (and url-http-end-of-headers
+                             (save-excursion
+                               (goto-char (point-min))
+                               (mail-fetch-field "content-type")))))
+             ;; Bare NUL scan: the body is parsed as HTML below when not binary.
+             (if (save-excursion (goto-char body-start)
+                                 (skip-chars-forward "^\0")
+                                 (not (eobp)))
+                 (funcall
+                  cb (concat "[WebFetch: binary content"
+                             (and ctype ;Header values are untrusted bytes and bypass libxml2
+                                  (format " (%s)" (replace-regexp-in-string
+                                                   "[^[:ascii:]]" "?" ctype)))
+                             " at URL.  Use the Bash tool with curl(1) or \
+wget(1) to download it, then inspect it with file(1), strings(1), \
+pdftotext(1) or base64(1)]"))
+               ;; NOTE: libxml2 replaces unencodable chars with placeholders
+               (let ((dom (libxml-parse-html-region body-start (point-max))))
+                 (with-temp-buffer
+                   (eww-score-readability dom)
+                   (shr-insert-document (eww-highest-readability dom))
+                   (funcall cb (buffer-substring-no-properties
+                                (point-min) (point-max)))))))
          (error (funcall cb (format "Error: Request failed with error data:\n%S"
                                     errdata)))))
      tool-cb (format "Fetch for \"%s\"" url))))
@@ -1631,6 +1651,8 @@ If required, consider using the url as the input to the `Read` tool to get the c
 - For YouTube video URLs, returns the video description and transcript
   (timestamped paragraphs) instead.  Use this tool proactively for
   YouTube URLs.
+- If the URL serves binary content, returns an error with instructions
+  to inspect it via the Bash tool instead.
 - Request times out after 30 seconds."
  :args '(( :name "url"
            :type "string"
