@@ -1123,9 +1123,8 @@ inspect it via Bash with file(1), strings(1) or base64(1)" filename)
 
         (delete-region (point-min) (point))
 
-        (unless end-line (setq end-line (line-number-at-pos (point-max))))
+        (unless end-line (setq end-line most-positive-fixnum))
         (setq line-offset (- end-line line-offset))
-
         ;; Go to end-line, forward by line-offset
         (cl-block nil
           (while (> line-offset 0)
