@@ -1106,7 +1106,7 @@ inspect it via Bash with file(1), strings(1) or base64(1)" filename)
     (cl-decf start-line)
     (let* ((file-size (nth 7 (file-attributes filename)))
            (chunk-size (min file-size (* gptel-agent-read-file-size-threshold 1024)))
-           (byte-offset 0) line-offset)
+           (byte-offset 0) (line-offset start-line))
       (with-temp-buffer
         ;; Go to start-line
         (while (and (> start-line 0)
@@ -1124,7 +1124,7 @@ inspect it via Bash with file(1), strings(1) or base64(1)" filename)
         (delete-region (point-min) (point))
 
         (unless end-line (setq end-line (line-number-at-pos (point-max))))
-        (setq line-offset (- end-line start-line))
+        (setq line-offset (- end-line line-offset))
 
         ;; Go to end-line, forward by line-offset
         (cl-block nil
