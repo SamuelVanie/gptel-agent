@@ -829,6 +829,8 @@ callback is guaranteed to run at most once, including parser exceptions."
                (string-match
                 "charset=[\"']?\\([^;\"'[:space:]]+\\)" content-type)
                (coding-system-from-name (match-string 1 content-type)))))
+    (when (string-search "\0" raw)
+      (error "Response body contains NUL bytes; use a specialized tool for this binary resource"))
     (if (multibyte-string-p raw)
         raw
       (decode-coding-string
@@ -836,7 +838,10 @@ callback is guaranteed to run at most once, including parser exceptions."
 
 (defun gptel-agent--web-request-error (failed-msg request-error)
   "Format a useful FAILED-MSG diagnostic for REQUEST-ERROR."
-  (let* ((type (and (boundp 'url-http-content-type) url-http-content-type))
+  (let* ((type (and (boundp 'url-http-content-type)
+                    url-http-content-type
+                    (replace-regexp-in-string
+                     "[[:cntrl:]]" "?" url-http-content-type)))
          (body (ignore-errors (string-trim (gptel-agent--web-response-body))))
          (excerpt (and body (not (string-empty-p body))
                        (truncate-string-to-width body 500 nil nil t))))
@@ -906,15 +911,6 @@ COUNT is the requested number of results.  It defaults to
                   tool-cb (format "Web search for \"%s\"" query) query count)))
       (push buffer gptel-agent--web-search-active))))
 
-(defun gptel-agent--web-fix-unreadable ()
-  "Replace invalid characters from point to end in current buffer."
-  (while (and (skip-chars-forward "\0-\x3fff7f")
-              (not (eobp)))
-    (display-warning
-     '(gptel gptel-agent-tools)
-     (format "Invalid character in buffer \"%s\"" (buffer-name)))
-    (delete-char 1) (insert "?")))
-
 (defun gptel-agent--web-search-eww-callback (cb query count)
   "Extract search results for QUERY and run callback CB with them.
 
@@ -922,7 +918,8 @@ COUNT is the already normalized requested result count."
   (let (results)
     (goto-char (point-min))
     (goto-char url-http-end-of-headers)
-    ;; (gptel-agent--web-fix-unreadable)
+    (when (save-excursion (search-forward "\0" nil t))
+      (error "WebSearch received a response body containing NUL bytes; cannot parse binary content"))
     (let* ((dom (libxml-parse-html-region (point) (point-max)))
            (result-count 0))
       (eww-score-readability dom)
@@ -1030,12 +1027,14 @@ MAX-CHARS bounds the returned text."
           (downcase (or (and (boundp 'url-http-content-type)
                              url-http-content-type)
                         "")))
+         (safe-content-type
+          (replace-regexp-in-string "[[:cntrl:]]" "?" content-type))
          (body (gptel-agent--web-response-body))
          (text
           (cond
            ((gptel-agent--web-binary-content-p content-type)
             (format "Error: WebFetch received unsupported binary content-type %s. Use a specialized tool for this resource."
-                    content-type))
+                    safe-content-type))
            ((gptel-agent--web-html-content-p content-type body)
             (gptel-agent--web-render-html body))
            (t (string-trim body)))))
@@ -1043,7 +1042,7 @@ MAX-CHARS bounds the returned text."
      cb
      (if (string-empty-p text)
          (format "Error: WebFetch received no readable text (content-type %s). The page may require JavaScript, authentication, or a specialized client."
-                 (if (string-empty-p content-type) "unknown" content-type))
+                 (if (string-empty-p content-type) "unknown" safe-content-type))
        (gptel-agent--web-fetch-limit text max-chars)))))
 
 (defun gptel-agent--read-url (tool-cb url &optional max-chars)
