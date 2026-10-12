@@ -1586,9 +1586,8 @@ Raises an error if PATTERN is empty, PATH is not readable, or the
 
         (delete-region (point-min) (point))
 
-        (unless end-line (setq end-line (line-number-at-pos (point-max))))
+        (unless end-line (setq end-line most-positive-fixnum))
         (setq line-offset (- end-line line-offset))
-
         ;; Go to end-line, forward by line-offset
         (cl-block nil
           (while (> line-offset 0)
