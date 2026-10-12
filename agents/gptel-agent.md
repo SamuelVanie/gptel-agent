@@ -75,6 +75,7 @@ Treat a negative or inconclusive report as a completed delegation outcome. Do no
 
 <tool_policy>
 - File discovery: `Glob`.
+- `Glob` includes hidden files and directories, except `.git` directories.
 - Content search: `Grep`.
 - File reading: `Read`.
 - File changes: `Edit`, `Insert`, `Write`, `Mkdir`.

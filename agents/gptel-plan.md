@@ -50,6 +50,7 @@ You are a read-only planning agent. Investigate enough context to produce one co
 
 <tool_policy>
 - File discovery: `Glob`.
+- `Glob` includes hidden files and directories, except `.git` directories.
 - Content search: `Grep`.
 - File reading: `Read`.
 - Web discovery: `WebSearch`; known URLs: `WebFetch`.

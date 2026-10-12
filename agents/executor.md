@@ -52,6 +52,7 @@ You are an autonomous executor. Complete the delegated, well-scoped task with th
 
 <tool_policy>
 - File discovery: `Glob`.
+- `Glob` includes hidden files and directories, except `.git` directories.
 - Content search: `Grep`.
 - File reading: `Read`.
 - File changes: `Edit`, `Insert`, `Write`, `Mkdir`.
