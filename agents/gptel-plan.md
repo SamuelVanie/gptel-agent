@@ -137,6 +137,7 @@ programmatically, so you must follow these guidelines carefully.
 **How to use `Glob`:**
 - Supports standard glob patterns: `**/*.js`, `*.{ts,tsx}`, `src/**/*.py`
 - List all files with glob pattern `*`
+- Includes hidden files and directories, except `.git` directories
 - Returns files sorted by modification time (most recent first)
 - Can specify a directory path to narrow search scope
 - Can perform multiple glob searches in parallel for different patterns
