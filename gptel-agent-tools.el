@@ -3352,46 +3352,30 @@ too."
 (gptel-make-tool
  :name "Edit"
  :description
- "Replace text in one or more files.
+ "Edit text in one or more files. Read the affected files first.
 
-To edit a single file, provide the file `path`.
+- diff=false: replace one exact occurrence of nonempty `old_str` in file `path` \
+with literal `new_str`. Match case and whitespace exactly; empty `new_str` deletes the match.
+- diff=true: supply a unified diff in `new_str`; omit `old_str`. \
+Use ---/+++ file headers and @@ hunks with actual source context.
 
-For the replacement, there are two methods:
-- Short replacements: Provide both `old_str` and `new_str`, in which case `old_str` \
-needs to exactly match one unique section of the original file, including case and whitespace.  \
-Make sure to include enough context that the match is not ambiguous.  \
-The entire original string will be replaced with `new str`.
-- Long or involved replacements: set the `diff` parameter to true and provide a unified diff \
-in `new_str`. Omit `old_str`; `diff: true` always selects diff mode.
-
-To edit multiple files,
-- provide the directory path,
-- set the `diff` parameter to true
-- and provide ONE unified diff in `new_str` containing every file and hunk to review together.
-Use multiple @@ hunks for separate changes in the same file.
-
-Diff instructions:
-
-- Use unified format with --- / +++ file headers and @@ hunk headers.
-- Markdown diff or patch code fences are optional.
-- File paths must be relative to the directory `path`; a/ and b/ prefixes are accepted.
-- /dev/null supports file creation or deletion; renames and binary diffs are unsupported.
-- All hunks must apply before any file is written. No-op or ambiguous edits are errors.
-
-To simply insert text at some line, use the \"Insert\" instead."
+For multiple files, set `path` to their common directory. Header paths must be \
+relative to it; a/ and b/ prefixes are accepted. A file `path` targets only that file.
+Group all related files and hunks into ONE diff call for a combined review.
+Text changes only; renames and permission changes are unsupported."
  :function #'gptel-agent--edit-files
  :args '(( :name "path"
-           :description "File path or directory to edit"
+           :description "Existing file, or common root directory for a multi-file diff. Prefer an absolute path."
            :type string)
          ( :name "old_str"
-           :description "Exact, case-sensitive original string to replace. Omit when diff is true"
+           :description "Required for diff=false: nonempty text matching exactly once. Omit for diff=true."
            :type string
            :optional t)
          ( :name "new_str"
-           :description "Replacement string OR unified diff text"
+           :description "Literal replacement (diff=false) or unified diff containing all changes (diff=true)."
            :type string)
          ( :name "diff"
-           :description "Whether the replacement is a string or a diff.  `true` for a diff, `false` otherwise."
+           :description "false for literal replacement; true for unified diff."
            :type boolean))
  :category "gptel-agent"
  :confirm t
