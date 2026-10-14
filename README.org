@@ -108,6 +108,46 @@ buffers and the minibuffer.
 Please note: gptel-agent uses significantly more tokens than the average
 gptel LLM interaction.
 
+*** Reviewing file edits with Ediff
+
+Load =gptel-ediff-prehook.el= after gptel-agent to review =Edit=, =Insert= and
+=Write= calls when =gptel-confirm-tool-calls= is non-nil:
+
+#+begin_src emacs-lisp
+(require 'gptel-ediff-prehook)
+#+end_src
+
+In the Ediff control buffer:
+
+| Key | Action |
+|-----+--------|
+| =n= / =p= | Next / previous change in this file |
+| =N= / =P= | Next / previous file, keeping the current change position |
+| =f= | Choose a file by path |
+| =q= | Accept the whole change set; first visits any unseen files |
+| =R= | Reject the whole change set and send feedback to the agent |
+| =H= | Add feedback for the region or current line in original/proposed buffer |
+| =C-]= | Cancel the review without applying it |
+
+Comments retain their filename and line range when switching files.  Pending
+comments must be sent using =R=.  The preview buffers are for review; ask the
+agent to revise the proposal rather than editing these temporary buffers.
+
+For a combined review, the agent should make *one Edit call* with =path= set
+to the common directory, =diff= set to true, and =new_str= containing one
+unified diff with all files and hunks.  Paths in the diff are relative to that
+directory; Git =a/= and =b/= prefixes and optional Markdown fences work.
+Separate tool calls are reviewed separately.  Text file creation/deletion
+using =/dev/null= is supported; renames, binary files and mode changes are not.
+
+Preview and execution share =gptel-agent-edit.el=.  Failed patches, ambiguous
+replacements and edits that change nothing are reported to the agent instead
+of opening an empty comparison.  Every file is prepared before any target is
+written.  After approval the hook applies the exact reviewed snapshots and
+returns =:result= to gptel, so the tool does not run again.  Files changed on
+disk during review or with unsaved visiting buffers require a fresh review.
+Unmodified visiting buffers refresh after an edit.
+
 *** What is an "agent"?
 
 "Agent" is the (now common) parlance used to refer to a bundle of configuration,
