@@ -1339,7 +1339,8 @@ directory to create."
   "Replace text in PATH, or apply a unified diff when DIFFP is true.
 Prepare every affected file before writing any of them.  Diff paths are
 relative to a directory PATH; standard a/ and b/ prefixes are accepted.
-In string mode OLD-STR must match exactly once, with case significant.
+In string mode OLD-STR must match uniquely, with case significant.  If exact
+matching fails, tolerate indentation and trailing whitespace on complete lines.
 OPERATIONS instead supplies an ordered mixed batch under directory PATH."
   (gptel-agent-edit-apply
    (gptel-agent-edit-prepare
@@ -3374,8 +3375,8 @@ too."
 - Batch: set `path` to an existing root directory and supply `operations` to mix \
 replacements, patches, insertions, file creation/overwrites and deletions. Paths are relative \
 to the root; operations see earlier results. Omit top-level old_str/new_str/diff.
-- Replacement: diff=false, file `path`, nonempty `old_str` matching exactly once \
-(case and whitespace), literal `new_str` (empty deletes).
+- Replacement: file `path`, unique `old_str` copied from the file, literal `new_str` \
+(empty deletes). Indentation/trailing whitespace differences are tolerated if unique.
 - Unified diff: diff=true, `new_str` with ---/+++ headers and @@ hunks; omit `old_str`. \
 Multi-file diffs require a directory `path` and relative headers; a/ and b/ prefixes work.
 
@@ -3385,7 +3386,7 @@ Text changes only; no renames or permission changes."
            :description "Existing file, or root directory for operations/multi-file diffs. Prefer an absolute path."
            :type string)
          ( :name "old_str"
-           :description "Nonempty text matching exactly once for literal replacement. Omit for diffs/batches."
+           :description "Copy a unique block from the current file, with enough context. Omit for diffs/batches."
            :type string
            :optional t)
          ( :name "new_str"
@@ -3408,7 +3409,7 @@ Text changes only; no renames or permission changes."
              :properties
              ( :operation (:type string :enum ["replace" "patch" "insert" "write" "delete"])
                :path (:type string :description "Path relative to the root, no ../; patch may use . for all files.")
-               :old_str (:type string :description "replace: required nonempty text matching exactly once.")
+               :old_str (:type string :description "replace: required unique block copied from the current file.")
                :new_str (:type string :description "replace/insert: text; patch: unified diff with ---/+++ and @@ headers.")
                :line_number (:type integer :minimum -1 :description "insert: after this line; 0 = start, -1 = end. Uses earlier operation results.")
                :content (:type string :description "write: complete content, possibly empty; creates or overwrites the file.")))))

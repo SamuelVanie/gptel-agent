@@ -157,7 +157,14 @@ without opening Ediff.
 
 Preview and execution share =gptel-agent-edit.el=.  Failed patches, ambiguous
 replacements and edits that change nothing are reported to the agent instead
-of opening an empty comparison.  Every file is prepared before any target is
+of opening an empty comparison; review failures also appear in the echo area
+and =*Messages*=.  Replacements try exact matching first, then a unique match
+of complete lines ignoring indentation and trailing whitespace.  The fallback
+aligns the replacement's indentation with the source block.  Case, words,
+punctuation and internal whitespace still must match.  Patches try exact
+context first, then normal patch fuzz (up to two surrounding context lines)
+and flexible whitespace, as in the original patch workflow.  Failed attempts
+are discarded before retrying.  Every file is prepared before any target is
 written.  After approval the hook applies the exact reviewed snapshots and
 returns =:result= to gptel, so the tool does not run again.  Files changed on
 disk during review or with unsaved visiting buffers require a fresh review.

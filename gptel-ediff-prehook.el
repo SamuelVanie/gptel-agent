@@ -304,7 +304,11 @@ Apply the exact reviewed snapshots and return their result through gptel's
                                    rejection))
             (list :confirm nil :result (gptel-agent-edit-apply changes))))
       (quit (list :block "The user cancelled Ediff review. No changes were applied."))
-      (error (list :block (concat "Ediff review could not complete: " (error-message-string err)))))))
+      (error
+       (let ((reason (concat "Ediff review could not complete: " (error-message-string err))))
+         ;; Also explain the missing preview to the user, not only to the model.
+         (message "%s" reason)
+         (list :block reason))))))
 
 (add-hook 'gptel-pre-tool-call-functions #'smv/gptel-ediff-tool-call)
 

@@ -15,6 +15,91 @@
   "Dynamically bound table of file changes while preparing a batch.
 Keys are canonical paths; values retain the original :before and latest :after.")
 
+(defun gptel-agent-edit--unique-match (regexp path)
+  "Return the unique bounds of REGEXP in the current buffer for PATH.
+Return nil if absent; reject ambiguous matches, including overlapping ones."
+  (goto-char (point-min))
+  (let ((case-fold-search nil))
+    (when (re-search-forward regexp nil t)
+      (let ((bounds (cons (match-beginning 0) (match-end 0))))
+        (goto-char (1+ (car bounds)))
+        (when (re-search-forward regexp nil t)
+          (error "old_str is not unique in %s; read the file and include more surrounding lines" path))
+        bounds))))
+
+(defun gptel-agent-edit--line-pattern (text)
+  "Match complete lines of TEXT, tolerating leading and trailing whitespace.
+Keep line breaks, internal whitespace and case significant."
+  (let* ((newline (string-suffix-p "\n" text))
+         (lines (split-string (if newline (substring text 0 -1) text) "\n")))
+    (concat
+     "^[ \t]*"
+     (mapconcat (lambda (line)
+                  (regexp-quote (string-trim line "[ \t]+" "[ \t]+")))
+                lines "[ \t]*\n[ \t]*")
+     "[ \t]*" (if newline "\\(?:\n\\|\\'\\)" "$"))))
+
+(defun gptel-agent-edit--indent-width (prefix)
+  "Return the indentation width of PREFIX, with tab stops every eight columns."
+  (let ((width 0))
+    (mapc (lambda (char)
+            (setq width (+ width (if (= char ?\t) (- 8 (% width 8)) 1))))
+          prefix)
+    width))
+
+(defun gptel-agent-edit--base-indent (text)
+  "Return the least indentation prefix of the nonblank lines in TEXT."
+  (let (prefix width)
+    (dolist (line (split-string text "\n"))
+      (when (string-match "\\`\\([ \t]*\\)[^ \t]" line)
+        (let* ((indent (match-string 1 line))
+               (columns (gptel-agent-edit--indent-width indent)))
+          (when (or (null width) (< columns width))
+            (setq prefix indent width columns)))))
+    (or prefix "")))
+
+(defun gptel-agent-edit--reindent (new old actual)
+  "Align NEW's indentation with ACTUAL when OLD matched only after trimming.
+Preserve relative indentation in NEW and the source block's base prefix."
+  (let* ((old-prefix (gptel-agent-edit--base-indent old))
+         (prefix (gptel-agent-edit--base-indent actual))
+         (old-width (gptel-agent-edit--indent-width old-prefix))
+         (width (gptel-agent-edit--indent-width prefix)))
+    (if (equal prefix old-prefix) new
+      (mapconcat
+       (lambda (line)
+         (if (not (string-match "\\`\\([ \t]*\\)[^ \t]" line)) line
+           (let* ((end (match-end 1))
+                  (relative (- (gptel-agent-edit--indent-width (match-string 1 line)) old-width)))
+             (concat (if (>= relative 0)
+                         (concat prefix (make-string relative ?\s))
+                       (make-string (max 0 (+ width relative)) ?\s))
+                     (substring line end)))))
+       (split-string new "\n") "\n"))))
+
+(defun gptel-agent-edit--replace (change old new)
+  "Replace OLD with NEW in CHANGE, using a unique whitespace fallback.
+Exact matches take precedence.  Never guess changed words or punctuation."
+  (with-temp-buffer
+    (insert (plist-get change :before))
+    (let* ((path (plist-get change :path))
+           (bounds (gptel-agent-edit--unique-match (regexp-quote old) path)))
+      (unless bounds
+        (setq old (string-replace "\r\n" "\n" old))
+        (when (string-match-p "[^ \t\n]" old)
+          (setq bounds (gptel-agent-edit--unique-match
+                        (gptel-agent-edit--line-pattern old) path)))
+        (unless bounds
+          (error "Could not find old_str in %s, even ignoring indentation and trailing whitespace. Read the current file and retry with a unique block copied from it" path))
+        (setq new (gptel-agent-edit--reindent
+                   (string-replace "\r\n" "\n" new) old
+                   (buffer-substring-no-properties (car bounds) (cdr bounds)))))
+      (goto-char (car bounds))
+      (delete-region (car bounds) (cdr bounds))
+      (insert new))
+    (setf (plist-get change :after) (buffer-string)))
+  (list change))
+
 (defun gptel-agent-edit--snapshot (path &optional must-exist)
   "Read PATH into a change plist.  Require an existing file if MUST-EXIST."
   (setq path (expand-file-name path))
@@ -173,15 +258,24 @@ starting with additional plus or minus signs.  Never count file headers."
          (coding-system-for-read 'utf-8-unix))
     (unwind-protect
         (progn
-          (with-temp-file target (insert (or (plist-get change :before) "")))
           (with-temp-file patch-file
             (insert "--- target\n+++ target\n" hunks))
           (with-temp-buffer
-            (let ((status (process-file "patch" patch-file t nil
-                                        "--batch" "--forward" "--fuzz=0"
-                                        "--no-backup-if-mismatch" "target")))
+            (let (status)
+              ;; Try exact context first.  The original tool allowed patch's
+              ;; normal fuzz; try that before also relaxing whitespace.
+              ;; Reset the copy because an unsuccessful attempt can apply some
+              ;; hunks before rejecting others.
+              (catch 'applied
+                (dolist (options '(("--fuzz=0") ("--fuzz=2") ("--fuzz=2" "-l")))
+                  (with-temp-file target (insert (or (plist-get change :before) "")))
+                  (erase-buffer)
+                  (setq status (apply #'process-file "patch" patch-file t nil
+                                      "--batch" "--forward" "--no-backup-if-mismatch"
+                                      (append options '("target"))))
+                  (when (eq status 0) (throw 'applied t))))
               (unless (eq status 0)
-                (error "Cannot apply diff to %s (status %s):\n%s"
+                (error "Cannot apply diff to %s (status %s). Read the current file and regenerate the diff:\n%s"
                        (plist-get change :path) status (string-trim (buffer-string)))))
             (erase-buffer)
             (insert-file-contents target)
@@ -291,7 +385,7 @@ an empty string means an existing empty file.  Signal invalid or no-op edits."
           (if (and (equal name "Edit") (plist-member args :operations))
               (progn
                 (when (or (plist-get args :old_str) (plist-get args :new_str)
-                          (plist-get args :diff))
+                          (eq (plist-get args :diff) t))
                   (error "Use operations alone; omit top-level old_str, new_str and diff"))
                 (gptel-agent-edit--prepare-batch path (plist-get args :operations)))
             (pcase name
@@ -299,26 +393,17 @@ an empty string means an existing empty file.  Signal invalid or no-op edits."
                (let ((old (plist-get args :old_str)) (new (plist-get args :new_str))
                      (diff (plist-get args :diff)))
                  (unless (stringp new) (error "Required argument `new_str' must be a string"))
-                 (if (and diff (not (eq diff :json-false)))
+                 (if (or (eq diff t)
+                         ;; Older callers omitted DIFF when supplying only a
+                         ;; patch.  Recognize its headers when no old text was
+                         ;; supplied, without misreading a literal replacement.
+                         (and (or (null old) (eq old :json-false) (equal old ""))
+                              (string-match-p "^--- [^\n]+\n\\+\\+\\+ [^\n]+\n@@ " new)))
                      (gptel-agent-edit--prepare-diff path new)
                    (unless (and (stringp old) (not (string-empty-p old)))
                      (error "String replacement requires a nonempty `old_str'"))
-                   (let ((change (gptel-agent-edit--snapshot path t)))
-                     (with-temp-buffer
-                       (insert (plist-get change :before))
-                       (goto-char (point-min))
-                       (let ((case-fold-search nil))
-                         (unless (search-forward old nil t)
-                           (error "Could not find old_str in %s" path))
-                         (let ((start (match-beginning 0)))
-                           (when (save-excursion
-                                   (goto-char (1+ start)) (search-forward old nil t))
-                             (error "old_str is not unique in %s; add context or use a diff" path)))
-                         ;; Searching for duplicates changes the match data.
-                         (goto-char (point-min)) (search-forward old)
-                         (replace-match new t t))
-                       (setf (plist-get change :after) (buffer-string)))
-                     (list change)))))
+                   (gptel-agent-edit--replace
+                    (gptel-agent-edit--snapshot path t) old new))))
               ("Insert"
                (let ((line (plist-get args :line_number)) (new (plist-get args :new_str))
                      (change (gptel-agent-edit--snapshot path t)))
