@@ -1,8 +1,9 @@
 ;;; gptel-ediff-prehook.el --- Review gptel file edits with Ediff -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Load after gptel-agent.  N/P switch files, f selects a file, n/p switch
-;; hunks, H adds feedback, R rejects, and q accepts once every file was seen.
+;; Loaded automatically by gptel-agent-tools.  N/P switch files, f selects a
+;; file, n/p switch hunks, H adds feedback, R rejects, and q accepts once every
+;; file was seen.
 ;; Preparation and execution use exactly the same file changes.
 
 ;;; Code:

@@ -110,12 +110,12 @@ gptel LLM interaction.
 
 *** Reviewing file edits with Ediff
 
-Load =gptel-ediff-prehook.el= after gptel-agent to review =Edit=, =Insert= and
-=Write= calls when =gptel-confirm-tool-calls= is non-nil:
-
-#+begin_src emacs-lisp
-(require 'gptel-ediff-prehook)
-#+end_src
+Loading =gptel-agent= (or =gptel-agent-tools=) automatically enables Ediff
+review for =Edit=, =Insert= and =Write= when =gptel-confirm-tool-calls= is
+non-nil.  No separate prehook configuration is needed.  After updating an
+existing installation, rebuild the package and restart Emacs so the new
+libraries and hook are loaded.  Remove any explicit load of an older custom
+prehook to avoid overriding the bundled implementation.
 
 In the Ediff control buffer:
 

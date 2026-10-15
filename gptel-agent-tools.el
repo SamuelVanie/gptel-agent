@@ -3808,7 +3808,11 @@ none of the predefined options are suitable."
  :async t
  :include t)
 
-;;; Register repetition detection hook
+;;; Register tool hooks
+;; File review is part of the tools, including when only this library is loaded.
+;; The hook itself honors `gptel-confirm-tool-calls'.
+(require 'gptel-ediff-prehook)
+
 (add-hook 'gptel-pre-tool-call-functions #'gptel-agent--detect-repetition)
 (add-hook 'gptel-post-response-functions #'gptel-agent--reset-tool-call-counts)
 (add-hook 'gptel-prompt-transform-functions
