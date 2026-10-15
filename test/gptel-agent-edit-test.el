@@ -14,20 +14,21 @@
 (defmacro gptel-edit-test--with-files (files &rest body)
   "Create FILES in a temporary directory and run BODY there."
   (declare (indent 1))
-  `(let* ((directory (make-temp-file "gptel-edit-test-" t))
-          (default-directory (file-name-as-directory directory)))
-     (unwind-protect
-         (progn
-           (dolist (file ,files)
-             (make-directory (file-name-directory (expand-file-name (car file))) t)
-             (with-temp-file (car file) (insert (cdr file))))
-           ,@body)
-       (dolist (buffer (buffer-list))
-         (when-let* ((path (buffer-file-name buffer)))
-           (when (string-prefix-p default-directory path)
-             (with-current-buffer buffer (set-buffer-modified-p nil))
-             (kill-buffer buffer))))
-       (delete-directory directory t))))
+  `(with-temp-buffer
+     (let* ((directory (make-temp-file "gptel-edit-test-" t))
+            (default-directory (file-name-as-directory directory)))
+       (unwind-protect
+           (progn
+             (dolist (file ,files)
+               (make-directory (file-name-directory (expand-file-name (car file))) t)
+               (with-temp-file (car file) (insert (cdr file))))
+             ,@body)
+         (dolist (buffer (buffer-list))
+           (when-let* ((path (buffer-file-name buffer)))
+             (when (string-prefix-p default-directory path)
+               (with-current-buffer buffer (set-buffer-modified-p nil))
+               (kill-buffer buffer))))
+         (delete-directory directory t)))))
 
 (defun gptel-edit-test--read (path)
   (with-temp-buffer (insert-file-contents path) (buffer-string)))
@@ -193,27 +194,6 @@ diff --git a/sub/two b/sub/two
                   '(:name "Edit" :args (:path "one" :diff t :new_str "invalid patch")))
                  :block))))))
 
-(ert-deftest gptel-ediff-accept-applies-the-reviewed-snapshot-once ()
-  (gptel-edit-test--with-files '(("one" . "old\n"))
-    (let ((gptel-confirm-tool-calls t))
-      (cl-letf (((symbol-function 'smv/gptel-ediff--review) (lambda (_) nil)))
-        (let ((result (smv/gptel-ediff-tool-call
-                       '(:name "Edit" :args (:path "one" :old_str "old" :new_str "new" :diff :json-false)))))
-          (should (plist-get result :result))
-          (should-not (plist-get result :confirm))
-          (should (equal (gptel-edit-test--read "one") "new\n")))))))
-
-(ert-deftest gptel-ediff-rejection-and-abort-leave-files-untouched ()
-  (gptel-edit-test--with-files '(("one" . "old\n"))
-    (let ((gptel-confirm-tool-calls t))
-      (dolist (review (list (lambda (_) "Keep the original") (lambda (_) (signal 'quit nil))))
-        (cl-letf (((symbol-function 'smv/gptel-ediff--review) review))
-          (should (plist-get
-                   (smv/gptel-ediff-tool-call
-                    '(:name "Edit" :args (:path "one" :old_str "old" :new_str "new" :diff :json-false)))
-                   :block))
-          (should (equal (gptel-edit-test--read "one") "old\n")))))))
-
 (defun gptel-edit-test--control ()
   (or (cl-find-if (lambda (b) (with-current-buffer b (eq major-mode 'ediff-mode)))
                   (buffer-list))
@@ -265,8 +245,7 @@ diff --git a/sub/two b/sub/two
                      (with-current-buffer proposed
                        (goto-char (point-min))
                        (call-interactively (key-binding (kbd "H")))))
-                   (should-error (gptel-edit-test--key "q") :type 'user-error)
-                   (gptel-edit-test--key "R"))))
+                   (gptel-edit-test--key "q"))))
         (let ((reason (smv/gptel-ediff--review changes)))
           (should (string-match-p "one (proposed changes), line 1" reason))
           (should (string-match-p "Explain this change" reason)))))))
@@ -296,19 +275,6 @@ diff --git a/sub/two b/sub/two
       (set-buffer-multibyte nil)
       (insert-file-contents-literally "one")
       (should (equal (buffer-string) (encode-coding-string "été\n" 'utf-8-dos))))))
-
-(ert-deftest gptel-ediff-abort-cleans-up-real-session ()
-  (gptel-edit-test--with-files '(("one" . "old\n"))
-    (let ((gptel-confirm-tool-calls t)
-          (ediff-window-setup-function #'ediff-setup-windows-plain)
-          (registry (copy-sequence ediff-session-registry)))
-      (cl-letf (((symbol-function 'recursive-edit) (lambda () (signal 'quit nil))))
-        (should (plist-get
-                 (smv/gptel-ediff-tool-call '(:name "Edit" :args (:path "one" :old_str "old" :new_str "new")))
-                 :block)))
-      (should (equal ediff-session-registry registry))
-      (should-not (cl-find-if (lambda (b) (string-prefix-p "*gptel-" (buffer-name b))) (buffer-list)))
-      (should (equal (gptel-edit-test--read "one") "old\n")))))
 
 (ert-deftest gptel-ediff-picker-preserves-hunk-position ()
   (gptel-edit-test--with-files '(("one" . "first\na\nb\nc\nlast\n") ("sub/two" . "second\n"))
@@ -341,20 +307,6 @@ diff --git a/sub/two b/sub/two
                    (gptel-edit-test--key "q"))))
         (should-not (smv/gptel-ediff--review changes)))
       (should (equal ediff-diff-options "-w")))))
-
-(ert-deftest gptel-ediff-modified-preview-is-not-applied ()
-  (gptel-edit-test--with-files '(("one" . "old\n"))
-    (let ((gptel-confirm-tool-calls t)
-          (ediff-window-setup-function #'ediff-setup-windows-plain))
-      (cl-letf (((symbol-function 'recursive-edit)
-                 (lambda ()
-                   (with-current-buffer (buffer-local-value 'ediff-buffer-B (gptel-edit-test--control))
-                     (let ((inhibit-read-only t)) (goto-char (point-max)) (insert "manual change\n")))
-                   (gptel-edit-test--key "q"))))
-        (should (plist-get (smv/gptel-ediff-tool-call
-                            '(:name "Edit" :args (:path "one" :old_str "old" :new_str "new")))
-                           :block)))
-      (should (equal (gptel-edit-test--read "one") "old\n")))))
 
 (defconst gptel-edit-test--mixed-operations
   '[(:operation "replace" :path "one" :old_str "old" :new_str "new")
@@ -464,61 +416,6 @@ diff --git a/sub/two b/sub/two
                                  (should (equal (gptel-edit-test--read "one") "original"))
                                  (should-not (file-exists-p "new")))))
 
-(ert-deftest gptel-ediff-insert-and-write-open-review ()
-  (gptel-edit-test--with-files '(("one" . "original\n"))
-                               (let ((gptel-confirm-tool-calls t) reviewed)
-                                 (cl-letf (((symbol-function 'smv/gptel-ediff--review)
-                                            (lambda (changes) (push changes reviewed) nil)))
-                                   (should (plist-get (smv/gptel-ediff-tool-call
-                                                       '(:name "Insert" :args (:path "one" :line_number 0 :new_str "first"))) :result))
-                                   (should (plist-get (smv/gptel-ediff-tool-call
-                                                       '(:name "Write" :args (:path "." :filename "new" :content "created"))) :result)))
-                                 (should (= 2 (length reviewed)))
-                                 (should (equal (gptel-edit-test--read "one") "first\noriginal\n"))
-                                 (should (equal (gptel-edit-test--read "new") "created")))))
-
-(ert-deftest gptel-ediff-mixed-batch-has-one-review-and-one-decision ()
-  (dolist (accept '(nil t))
-    (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
-                                 (let ((gptel-confirm-tool-calls t) (calls 0))
-                                   (cl-letf (((symbol-function 'smv/gptel-ediff--review)
-                                              (lambda (changes)
-                                                (cl-incf calls)
-                                                (should (= 5 (length changes)))
-                                                (should (equal (gptel-edit-test--read "one") "old\ntail\n"))
-                                                (should-not (file-exists-p "nested"))
-                                                (unless accept "Keep everything as it is"))))
-                                     (let ((result (smv/gptel-ediff-tool-call
-                                                    (list :name "Edit" :args (list :path directory :operations gptel-edit-test--mixed-operations)))))
-                                       (should (plist-get result (if accept :result :block)))))
-                                   (should (= calls 1))
-                                   (if accept
-                                       (progn (should (equal (gptel-edit-test--read "nested/created") "final\n"))
-                                              (should-not (file-exists-p "obsolete")))
-                                     (should-not (file-exists-p "nested"))
-                                     (should (file-exists-p "obsolete"))
-                                     (should (equal (gptel-edit-test--read "one") "old\ntail\n")))))))
-
-(ert-deftest gptel-ediff-mixed-batch-navigates-creations-modifications-and-deletions ()
-  (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
-                               (let ((gptel-confirm-tool-calls t)
-                                     (ediff-window-setup-function #'ediff-setup-windows-plain)
-                                     (visits 0) headers)
-                                 (cl-letf (((symbol-function 'recursive-edit)
-                                            (lambda ()
-                                              (cl-incf visits)
-                                              (should (<= visits 5))
-                                              (with-current-buffer (gptel-edit-test--control)
-                                                (push header-line-format headers))
-                                              (gptel-edit-test--key "q"))))
-                                   (should (plist-get
-                                            (smv/gptel-ediff-tool-call
-                                             (list :name "Edit" :args (list :path directory :operations gptel-edit-test--mixed-operations))) :result)))
-                                 (should (= visits 5))
-                                 (should (= 2 (cl-count-if (lambda (h) (string-match-p (regexp-quote "[new file]") h)) headers)))
-                                 (should (= 1 (cl-count-if (lambda (h) (string-match-p (regexp-quote "[delete file]") h)) headers)))
-                                 (should (equal (gptel-edit-test--read "one") "new\ninserted\ntail\n")))))
-
 (ert-deftest gptel-ediff-confirmation-off-skips-all-file-reviews ()
   (gptel-edit-test--with-files '(("one" . "old\n"))
                                (let ((gptel-confirm-tool-calls nil)
@@ -587,9 +484,9 @@ diff --git a/sub/two b/sub/two
 
 (defun gptel-edit-test--dispatch (name args confirm)
   "Dispatch NAME with ARGS through gptel's hooks and tool runner.
-Use the buffer-local CONFIRM setting and stop before any network request."
-  (with-temp-buffer
-    (setq-local gptel-confirm-tool-calls confirm)
+Use CONFIRM in the current conversation and stop before any network request.
+Queued review integration is tested in `gptel-agent-review-test'."
+  (let ((gptel-confirm-tool-calls confirm))
     (let* ((call (list :name name :args args))
            (info (list :backend t :buffer (current-buffer)
                        :tools (list (gptel-get-tool name))
@@ -605,64 +502,6 @@ Use the buffer-local CONFIRM setting and stop before any network request."
       (should (= 1 (length (plist-get info :tool-result))))
       (should (stringp (plist-get call :result)))
       call)))
-
-(ert-deftest gptel-ediff-dispatch-reviews-write-insert-and-edit ()
-  (dolist (confirm '(t auto))
-    (pcase-dolist
-        (`(,name ,args ,path ,expected)
-         '(("Write" (:path "." :filename "created" :content "new\n") "created" "new\n")
-           ("Write" (:path "." :filename "created" :content "") "created" "")
-           ("Write" (:path "." :filename "one" :content "new\n") "one" "new\n")
-           ("Insert" (:path "one" :line_number 0 :new_str "first") "one" "first\nold\n")
-           ("Edit" (:path "one" :old_str "old" :new_str "new") "one" "new\n")))
-      (gptel-edit-test--with-files '(("one" . "old\n"))
-        (let ((ediff-window-setup-function #'ediff-setup-windows-plain)
-              (visits 0))
-          (cl-letf (((symbol-function 'recursive-edit)
-                     (lambda ()
-                       (cl-incf visits)
-                       (should (= visits 1))
-                       (should (equal (gptel-edit-test--read "one") "old\n"))
-                       (should-not (file-exists-p "created"))
-                       (with-current-buffer
-                           (buffer-local-value 'ediff-buffer-B (gptel-edit-test--control))
-                         (should (equal (buffer-string) expected)))
-                       (gptel-edit-test--key "q"))))
-            (should-not (plist-get (gptel-edit-test--dispatch name args confirm) :error)))
-          (should (= visits 1))
-          (should (equal (gptel-edit-test--read path) expected)))))))
-
-(ert-deftest gptel-ediff-dispatch-mixed-batch-reviews-every-file-before-writing ()
-  (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
-    (let ((ediff-window-setup-function #'ediff-setup-windows-plain)
-          (visits 0))
-      (cl-letf (((symbol-function 'recursive-edit)
-                 (lambda ()
-                   (cl-incf visits)
-                   (should (<= visits 5))
-                   (should (equal (gptel-edit-test--read "one") "old\ntail\n"))
-                   (should (file-exists-p "obsolete"))
-                   (should-not (file-exists-p "nested"))
-                   (gptel-edit-test--key "q"))))
-        (should-not
-         (plist-get (gptel-edit-test--dispatch
-                     "Edit" (list :path "." :operations gptel-edit-test--mixed-operations) t)
-                    :error)))
-      (should (= visits 5))
-      (should (equal (gptel-edit-test--read "one") "new\ninserted\ntail\n"))
-      (should (equal (gptel-edit-test--read "nested/created") "final\n"))
-      (should-not (file-exists-p "obsolete")))))
-
-(ert-deftest gptel-ediff-dispatch-rejected-write-never-runs-tool ()
-  (gptel-edit-test--with-files nil
-    (let ((ediff-window-setup-function #'ediff-setup-windows-plain))
-      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "Keep this file absent"))
-                ((symbol-function 'recursive-edit) (lambda () (gptel-edit-test--key "R"))))
-        (let ((call (gptel-edit-test--dispatch
-                     "Write" '(:path "." :filename "created" :content "new") t)))
-          (should (plist-get call :error))
-          (should (string-match-p "Keep this file absent" (plist-get call :result)))))
-      (should-not (file-exists-p "created")))))
 
 (ert-deftest gptel-ediff-dispatch-confirmation-off-applies-without-review ()
   (gptel-edit-test--with-files '(("one" . "old\n"))
@@ -687,7 +526,7 @@ Use the buffer-local CONFIRM setting and stop before any network request."
       (let ((call (gptel-edit-test--dispatch
                    "Edit" '(:path "one" :old_str "missing" :new_str "new") t)))
         (should (plist-get call :error))
-        (should (string-match-p "Ediff review could not complete" (plist-get call :result)))))
+        (should (string-match-p "File review could not prepare proposal" (plist-get call :result)))))
     (should (equal (gptel-edit-test--read "one") "old\n"))))
 
 (ert-deftest gptel-edit-replacement-recovers-indentation-and-trailing-whitespace ()
@@ -741,61 +580,6 @@ Use the buffer-local CONFIRM setting and stop before any network request."
      (gptel-agent--edit-files
       "one" nil "--- one\n+++ one\n@@ -1,3 +1,3 @@\n above\n-old\n+new\n below\n" t))
     (should (equal (gptel-edit-test--read "one") "above\nchanged\nbelow\n"))))
-
-(ert-deftest gptel-edit-patch-with-omitted-diff-flag-still-opens-review ()
-  (gptel-edit-test--with-files '(("one" . "old\n"))
-    (let ((ediff-window-setup-function #'ediff-setup-windows-plain)
-          (visits 0))
-      (cl-letf (((symbol-function 'recursive-edit)
-                 (lambda ()
-                   (cl-incf visits)
-                   (should (= visits 1))
-                   (should (equal (gptel-edit-test--read "one") "old\n"))
-                   (gptel-edit-test--key "q"))))
-        (should-not
-         (plist-get
-          (gptel-edit-test--dispatch
-           "Edit" '(:path "one" :old_str :json-false
-                    :new_str "```diff\n--- one\n+++ one\n@@ -1 +1 @@\n-old\n+new\n```\n") t)
-          :error)))
-      (should (= visits 1))
-      (should (equal (gptel-edit-test--read "one") "new\n")))))
-
-(ert-deftest gptel-ediff-dispatch-fallback-preview-equals-accepted-batch ()
-  (dolist (confirm '(t nil))
-    (gptel-edit-test--with-files '(("one" . "  first\n  last  \n")
-                                 ("two" . "changed above\n  second\nchanged below\n"))
-      (let ((ediff-window-setup-function #'ediff-setup-windows-plain)
-            (visits 0) proposals)
-        (cl-letf (((symbol-function 'recursive-edit)
-                   (lambda ()
-                     (cl-incf visits)
-                     (should (<= visits 3))
-                     (should (equal (gptel-edit-test--read "one") "  first\n  last  \n"))
-                     (should (equal (gptel-edit-test--read "two") "changed above\n  second\nchanged below\n"))
-                     (should-not (file-exists-p "created"))
-                     (with-current-buffer
-                         (buffer-local-value 'ediff-buffer-B (gptel-edit-test--control))
-                       (push (buffer-string) proposals))
-                     (gptel-edit-test--key "q"))))
-          (should-not
-           (plist-get
-            (gptel-edit-test--dispatch
-             "Edit" '(:path "." :diff :json-false
-                      :operations [(:operation "replace" :path "one"
-                                    :old_str "first\nlast\n" :new_str "new\nlast\n")
-                                   (:operation "patch" :path "two"
-                                    :new_str "--- two\n+++ two\n@@ -1,3 +1,3 @@\n above\n-    second\n+  SECOND\n below\n")
-                                   (:operation "write" :path "created" :content "created\n")]) confirm)
-            :error)))
-        (should (= visits (if confirm 3 0)))
-        (should (equal (gptel-edit-test--read "one") "  new\n  last\n"))
-        (should (equal (gptel-edit-test--read "two") "changed above\n  SECOND\nchanged below\n"))
-        (should (equal (gptel-edit-test--read "created") "created\n"))
-        (when confirm
-          (should (equal (nreverse proposals)
-                         (list (gptel-edit-test--read "one") (gptel-edit-test--read "two")
-                               (gptel-edit-test--read "created")))))))))
 
 (ert-deftest gptel-ediff-preparation-error-is-visible-and-actionable ()
   (gptel-edit-test--with-files '(("one" . "old\n"))

@@ -12,8 +12,18 @@
 (require 'subr-x)
 
 (defvar gptel-agent-edit--staged-changes nil
-  "Dynamically bound table of file changes while preparing a batch.
+  "Dynamically bound table of file changes while preparing proposals.
 Keys are canonical paths; values retain the original :before and latest :after.")
+
+(defun gptel-agent-edit-stage (changes table)
+  "Merge CHANGES into TABLE without modifying the supplied change plists."
+  (dolist (change changes)
+    (let* ((path (file-truename (plist-get change :path)))
+           (merged (copy-sequence (or (gethash path table) change))))
+      (setf (plist-get merged :path) path
+            (plist-get merged :after) (plist-get change :after))
+      (puthash path merged table)))
+  table)
 
 (defun gptel-agent-edit--unique-match (regexp path)
   "Return the unique bounds of REGEXP in the current buffer for PATH.
@@ -359,20 +369,23 @@ Each operation sees earlier results.  Return one original/final pair per file."
   (unless (and (or (listp operations) (vectorp operations)) (> (length operations) 0))
     (error "operations must be a nonempty array"))
   (let ((root (file-name-as-directory (file-truename root)))
-        (gptel-agent-edit--staged-changes (make-hash-table :test #'equal))
+        (gptel-agent-edit--staged-changes
+         (if gptel-agent-edit--staged-changes
+             (copy-hash-table gptel-agent-edit--staged-changes)
+           (make-hash-table :test #'equal)))
+        (batch-changes (make-hash-table :test #'equal))
         (index 0) paths)
     (dolist (operation (append operations nil))
       (cl-incf index)
       (condition-case err
           (dolist (change (gptel-agent-edit--prepare-operation operation root))
             (let* ((path (file-truename (plist-get change :path)))
-                   (previous (gethash path gptel-agent-edit--staged-changes)))
-              (if previous
-                  (setf (plist-get previous :after) (plist-get change :after))
-                (push path paths)
-                (puthash path change gptel-agent-edit--staged-changes))))
+                   (previous (gethash path batch-changes)))
+              (unless previous (push path paths))
+              (gptel-agent-edit-stage (list change) batch-changes)
+              (gptel-agent-edit-stage (list change) gptel-agent-edit--staged-changes)))
         (error (error "Operation %d: %s" index (error-message-string err)))))
-    (mapcar (lambda (path) (gethash path gptel-agent-edit--staged-changes))
+    (mapcar (lambda (path) (gethash path batch-changes))
             (nreverse paths))))
 
 (defun gptel-agent-edit-prepare (name args)

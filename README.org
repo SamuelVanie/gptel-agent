@@ -117,6 +117,25 @@ existing installation, rebuild the package and restart Emacs so the new
 libraries and hook are loaded.  Remove any explicit load of an older custom
 prehook to avoid overriding the bundled implementation.
 
+File proposals now collect in a separate =*File review: …*= buffer. The tool
+returns immediately, so the agent can continue proposing modifications while
+you review. Open the queue again with =M-x gptel-agent-review= from the
+conversation buffer. Each tool call is one proposal; =Edit= with =operations=
+is one proposal containing multiple files. Sub-agent proposals join their
+parent conversation's queue. Different conversations have separate queues.
+
+In the review queue:
+
+| Key | Action |
+|-----+--------|
+| =RET= | Inspect the selected proposal in Ediff |
+| =r= | Cancel the selected proposal, with optional feedback |
+| =a= | Mark all remaining proposals accepted |
+| =D= | Mark review done: apply accepted proposals and deliver feedback |
+| =C= | Cancel all proposals and finish without applying any |
+| =g= | Refresh the list |
+| =q= | Hide the queue; proposals remain pending |
+
 In the Ediff control buffer:
 
 | Key | Action |
@@ -124,51 +143,60 @@ In the Ediff control buffer:
 | =n= / =p= | Next / previous change in this file |
 | =N= / =P= | Next / previous file, keeping the current change position |
 | =f= | Choose a file by path |
-| =q= | Accept the whole change set; first visits any unseen files |
-| =R= | Reject the whole change set and send feedback to the agent |
+| =q= | Accept this proposal after visiting its files; with comments, request revision |
+| =R= | Cancel this proposal and record feedback |
+| =C= | Cancel the entire queue and finish review |
 | =H= | Add feedback for the region or current line in original/proposed buffer |
-| =C-]= | Cancel the review without applying it |
+| =C-]= | Cancel this proposal's review |
 
-Comments retain their filename and line range when switching files.  Pending
-comments must be sent using =R=.  The preview buffers are for review; ask the
-agent to revise the proposal rather than editing these temporary buffers.
+Nothing is written, and no review feedback is sent, until =D= (or =C=).
+=D= requires a decision on every proposal currently in the queue; use =RET=
+to inspect pending proposals, or explicitly accept them all with =a=.
+New proposals arriving during Ediff remain pending for a later decision.
+Comments retain filenames and line ranges. Preview buffers are snapshots;
+editing them invalidates the proposal.
 
-For a combined review, make *one Edit call* with =path= set to an existing
-root directory and an =operations= array.  Operations can mix =replace=,
-=patch=, =insert=, =write= (create or overwrite), and =delete=.  Each operation
+Cancelling a proposal also cancels later proposals that modify any of its
+files, including transitive dependencies. This conservative rule prevents
+later edits from restoring rejected content. Other proposals can still be
+accepted. On completion, the agent receives the accepted/cancelled proposal
+IDs and feedback. Feedback reaches an active request at its next tool boundary;
+if the response has already finished, revision feedback starts a follow-up.
+Plain acceptance records the outcome without starting another response.
+
+Later =Edit=, =Insert=, =Write= and =Read= calls see the cumulative staged
+contents, including files created or deleted by earlier proposals. Shell
+commands, tests, =Grep= and =Glob= still see disk contents. A queued tool result
+explicitly says the changes have not been applied. Turning confirmation off
+while a queue exists does not bypass its pending decisions. With confirmation
+nil and no pending queue, file tools apply directly as before.
+
+=Edit= accepts string replacements, unified diffs, or an =operations= array
+with =path= set to an existing root directory. Operations can mix =replace=,
+=patch=, =insert=, =write= (create or overwrite), and =delete=. Each operation
 has an =operation= name and a =path= relative to the root, plus the fields it
 needs: =old_str=/=new_str= for replacement, =new_str= for a patch,
-=line_number=/=new_str= for insertion, or =content= for writing.
+=line_number=/=new_str= for insertion, or =content= for writing. Operations
+run in order, with one original/final comparison per affected file in the
+proposal. Unified diffs can also create/delete files using =/dev/null=.
+Renames, binary files and mode changes remain unsupported. Shell/Elisp side
+effects are not intercepted; use the structured tools for reviewable changes.
 
-Operations run in order on temporary content, so a later operation can edit
-a newly created file.  Ediff shows each affected file once, comparing its
-original contents with the final result.  Nothing is applied until the whole
-batch is accepted.  A rejected or invalid batch leaves all target files alone.
-Empty file creation and deletion are identified in the review header.
+Preparation and execution share =gptel-agent-edit.el=. Failed patches,
+ambiguous replacements and no-op edits report an error without altering the
+queue or target files. Replacements try exact matching first, then a unique
+match of complete lines ignoring indentation and trailing whitespace, aligning
+the new block's indentation with the source. Case, words, punctuation and
+internal whitespace still must match. Patches try exact context, normal fuzz
+(up to two surrounding context lines), then flexible whitespace. Failed
+attempts are discarded before retrying.
 
-The original string replacement and unified diff forms of =Edit= still work.
-A unified diff can also mix modifications, additions and deletions using
-=/dev/null=.  Separate =Edit=, =Insert= and =Write= calls are still reviewed
-separately; use =operations= to group them.  Renames, binary files and mode
-changes are unsupported.  Shell/Elisp side effects are not intercepted by this
-hook; use the structured file tools for reviewable content changes.
-With =gptel-confirm-tool-calls= set to nil, edits and batches apply directly
-without opening Ediff.
-
-Preview and execution share =gptel-agent-edit.el=.  Failed patches, ambiguous
-replacements and edits that change nothing are reported to the agent instead
-of opening an empty comparison; review failures also appear in the echo area
-and =*Messages*=.  Replacements try exact matching first, then a unique match
-of complete lines ignoring indentation and trailing whitespace.  The fallback
-aligns the replacement's indentation with the source block.  Case, words,
-punctuation and internal whitespace still must match.  Patches try exact
-context first, then normal patch fuzz (up to two surrounding context lines)
-and flexible whitespace, as in the original patch workflow.  Failed attempts
-are discarded before retrying.  Every file is prepared before any target is
-written.  After approval the hook applies the exact reviewed snapshots and
-returns =:result= to gptel, so the tool does not run again.  Files changed on
-disk during review or with unsaved visiting buffers require a fresh review.
-Unmodified visiting buffers refresh after an edit.
+Review completion validates every original before writing anything, then
+applies the accepted snapshots together and rolls back on write failure.
+Files changed on disk or with unsaved visiting buffers block completion and
+leave the queue available for cancellation or retry. Unmodified visiting
+buffers refresh after acceptance. Killing the conversation discards its queue;
+hiding or killing only the review list does not discard proposals.
 
 *** What is an "agent"?
 

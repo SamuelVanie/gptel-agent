@@ -1,10 +1,10 @@
 ;;; gptel-ediff-prehook.el --- Review gptel file edits with Ediff -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Loaded automatically by gptel-agent-tools.  N/P switch files, f selects a
-;; file, n/p switch hunks, H adds feedback, R rejects, and q accepts once every
-;; file was seen.
-;; Preparation and execution use exactly the same file changes.
+;; Loaded automatically by gptel-agent-tools.  File tools stage proposals in
+;; a nonblocking review queue.  Ediff runs only when the user opens a proposal.
+;; The original side stays fixed while the proposed side updates in place.
+;; H submits comments immediately; R refuses this file, C cancels all files.
 
 ;;; Code:
 
@@ -12,6 +12,7 @@
 (require 'subr-x)
 (require 'ediff)
 (require 'seq)
+(require 'gptel-agent-review)
 
 (declare-function lsp-mode "lsp-mode")
 (declare-function gptel-agent-edit-prepare "gptel-agent-edit")
@@ -83,23 +84,6 @@ If none exists, split one off the frame root."
         (format "line %d" start)
       (format "lines %d-%d" start finish))))
 
-(defun smv/gptel-ediff--format-region-comments (comments)
-  "Format region-specific rejection COMMENTS for the final refusal message."
-  (concat
-   "The user added comments to the proposed changes, should be taken into account before proceeding:\n\n"
-   (mapconcat
-    (lambda (entry)
-      (let ((index (plist-get entry :index))
-            (source (format "%s (%s)" (plist-get entry :path)
-                            (plist-get entry :source)))
-            (range (plist-get entry :range))
-            (text (plist-get entry :text))
-            (comment (plist-get entry :comment)))
-        (format "%d. from %s, %s:\n%s\n\nComment:\n%s"
-                index source range text comment)))
-    comments
-    "\n\n")))
-
 (defun smv/gptel-ediff--buffer-local-set-key (key command)
   "Bind KEY to COMMAND in the current buffer without changing shared mode maps."
   (setq-local smv/gptel-ediff-review-mode t)
@@ -114,199 +98,210 @@ If none exists, split one off the frame root."
                    new-map))))
     (define-key map (kbd key) command)))
 
-(defun smv/gptel-ediff--comment (path source comments)
-  "Record feedback for PATH and SOURCE in the mutable COMMENTS list."
-  (let* ((has-region (use-region-p))
+
+(cl-defstruct (smv/gptel-ediff--view (:constructor smv/gptel-ediff--make-view))
+  queue file original proposed control revision before after config closing)
+
+(defun smv/gptel-ediff--fill (buffer text)
+  "Replace preview BUFFER with TEXT, retaining its approximate line position."
+  (with-current-buffer buffer
+    (let ((line (line-number-at-pos)) (column (current-column)) (inhibit-read-only t))
+      (save-restriction
+        (widen)
+        (erase-buffer)
+        (insert (or text ""))
+        (goto-char (point-min))
+        (forward-line (1- line))
+        (move-to-column column))
+      (set-buffer-modified-p nil))))
+
+(defun smv/gptel-ediff--validate-view (view)
+  "Verify VIEW still contains the displayed snapshots, not manual edits."
+  (dolist (pair (list (cons (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-before view))
+                      (cons (smv/gptel-ediff--view-proposed view) (smv/gptel-ediff--view-after view))))
+    (unless (and (buffer-live-p (car pair))
+                 (equal (with-current-buffer (car pair)
+                          (save-restriction (widen) (buffer-substring-no-properties (point-min) (point-max))))
+                        (or (cdr pair) "")))
+      (user-error "Preview buffers were edited; close with Q and reopen the file"))))
+
+(defun smv/gptel-ediff-validate (queue)
+  "Ensure QUEUE's open view shows the current revision without manual edits."
+  (when-let* ((view (gptel-agent-review--queue-view queue)))
+    (smv/gptel-ediff--validate-view view)
+    (unless (= (smv/gptel-ediff--view-revision view)
+               (plist-get (smv/gptel-ediff--view-file view) :revision))
+      (user-error "The file has newer changes; refresh or reopen its review"))))
+
+(defun smv/gptel-ediff--headers (view)
+  "Display the file revision and decision throughout VIEW."
+  (let* ((file (smv/gptel-ediff--view-file view))
+         (header (format "%s — revision %d — %s%s"
+                         (plist-get file :path) (plist-get file :revision) (plist-get file :status)
+                         (cond ((null (plist-get file :before)) " [new file]")
+                               ((null (plist-get file :after)) " [delete file]") (t "")))))
+    (dolist (buffer (list (smv/gptel-ediff--view-control view)
+                          (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-proposed view)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (setq-local header-line-format header))))))
+
+(defun smv/gptel-ediff-refresh (queue)
+  "Refresh QUEUE's active Ediff when the file's cumulative revision changes."
+  (when-let* ((view (gptel-agent-review--queue-view queue))
+              (control (smv/gptel-ediff--view-control view))
+              ((buffer-live-p control)))
+    (let ((file (smv/gptel-ediff--view-file view)))
+      (unless (= (smv/gptel-ediff--view-revision view) (plist-get file :revision))
+        (smv/gptel-ediff--validate-view view)
+        (save-selected-window
+          (smv/gptel-ediff--fill (smv/gptel-ediff--view-original view) (plist-get file :before))
+          (smv/gptel-ediff--fill (smv/gptel-ediff--view-proposed view) (plist-get file :after))
+          (with-current-buffer control
+            (let ((ediff-diff-options "")) (ediff-update-diffs))))
+        (setf (smv/gptel-ediff--view-revision view) (plist-get file :revision)
+              (smv/gptel-ediff--view-before view) (plist-get file :before)
+              (smv/gptel-ediff--view-after view) (plist-get file :after)))
+      (smv/gptel-ediff--headers view))))
+
+(defun smv/gptel-ediff--destroy (view)
+  "Release VIEW's temporary buffers and restore its window configuration."
+  (let ((queue (smv/gptel-ediff--view-queue view)))
+    (when (eq view (gptel-agent-review--queue-view queue))
+      (setf (gptel-agent-review--queue-view queue) nil)
+      (dolist (buffer (list (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-proposed view)))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer (set-buffer-modified-p nil))
+          (kill-buffer buffer)))
+      (set-window-configuration (smv/gptel-ediff--view-config view)))))
+
+(defun smv/gptel-ediff-close (queue)
+  "Close QUEUE's active Ediff without deciding or applying its changes."
+  (when-let* ((view (gptel-agent-review--queue-view queue))
+              ((not (smv/gptel-ediff--view-closing view))))
+    (setf (smv/gptel-ediff--view-closing view) t)
+    (let ((control (smv/gptel-ediff--view-control view)))
+      (when (buffer-live-p control)
+        (with-current-buffer control
+          (setf (plist-get (smv/gptel-ediff--view-file view) :hunk) ediff-current-difference)
+          (condition-case err (ediff-really-quit nil)
+            (error (message "Closing file review: %s" (error-message-string err)))))
+        (when (buffer-live-p control) (kill-buffer control))))
+    (smv/gptel-ediff--destroy view)))
+
+(defun smv/gptel-ediff--navigate (view offset)
+  "Switch from VIEW by OFFSET files in the live review list."
+  (let* ((queue (smv/gptel-ediff--view-queue view))
+         (files (gptel-agent-review--queue-files queue))
+         (index (cl-position (smv/gptel-ediff--view-file view) files)))
+    (smv/gptel-ediff-open queue (nth (mod (+ index offset) (length files)) files))))
+
+(defun smv/gptel-ediff--comment (view source)
+  "Submit immediate feedback on the selected region of VIEW's SOURCE buffer."
+  (let* ((file (smv/gptel-ediff--view-file view))
+         (revision (smv/gptel-ediff--view-revision view))
+         (has-region (use-region-p))
          (beg (if has-region (region-beginning) (line-beginning-position)))
          (end (if has-region (region-end) (line-end-position)))
          (range (smv/gptel-ediff--line-range beg (if has-region (max beg (1- end)) end)))
-         (text (buffer-substring-no-properties beg end))
-         (comment (read-string (format "Comment for %s, %s: " path range))))
-    (unless (string-empty-p (string-trim comment))
-      (setcar comments
-              (append (car comments)
-                      (list (list :index (1+ (length (car comments)))
-                                  :path path :source source :range range
-                                  :text text :comment comment))))
-      (message "Added feedback %d; use R to send it to the agent."
-               (length (car comments))))))
+         ;; Capture context before read-string: network callbacks can refresh
+         ;; the preview while the user is still composing the comment.
+         (context (format " (%s), %s:\n%s" source range (buffer-substring-no-properties beg end)))
+         (comment (read-string (format "Comment for %s, %s: " (plist-get file :path) range))))
+    (gptel-agent-review--comment (smv/gptel-ediff--view-queue view) file comment context revision)))
 
-(defun smv/gptel-ediff--review (changes)
-  "Review prepared CHANGES as one navigable Ediff session.
-Return nil on acceptance or a rejection reason.  No target files are written.
-Quitting requires viewing every file, and feedback must be sent using R."
-  (let* ((count (length changes))
-         (pairs (make-vector count nil))
-         (seen (make-vector count nil))
-         (hunks (make-vector count -1))
-         (comments (list nil))
-         (saved-config (current-window-configuration))
-         ;; Whitespace-only edits must remain visible, regardless of a user's
-         ;; usual diff filters.  These bindings apply only to this review.
-         (ediff-diff-options "")
-         (index 0) decision reason control resume)
+(defun smv/gptel-ediff-open (queue file)
+  "Open FILE's cumulative diff from QUEUE and return immediately.
+Updates reuse the same buffers and control window; no recursive edit is used."
+  (smv/gptel-ediff-close queue)
+  (let* ((path (plist-get file :path))
+         (view (smv/gptel-ediff--make-view
+                :queue queue :file file :config (current-window-configuration)
+                :original (generate-new-buffer (format "*gptel-original: %s*" path))
+                :proposed (generate-new-buffer (format "*gptel-proposed: %s*" path))
+                :revision (plist-get file :revision)
+                :before (plist-get file :before) :after (plist-get file :after)))
+         (ediff-diff-options "") ready)
+    (setf (gptel-agent-review--queue-view queue) view)
     (unwind-protect
         (progn
-          (cl-loop for change in changes for i from 0 do
-                   (let* ((path (plist-get change :path))
-                          (original (generate-new-buffer
-                                     (format "*gptel-original: %s*" path)))
-                          (proposed (generate-new-buffer
-                                     (format "*gptel-proposed: %s*" path))))
-                     (aset pairs i (cons original proposed))
-                     (dolist (entry (list (cons original :before) (cons proposed :after)))
-                       (with-current-buffer (car entry)
-                         (insert (or (plist-get change (cdr entry)) ""))
-                         (smv/gptel-ediff--set-mode-for (current-buffer) path)
-                         (setq buffer-read-only t)
-                         (set-buffer-modified-p nil)))))
-          (while (not decision)
-            (let* ((change (nth index changes))
-                   (path (plist-get change :path))
-                   (pair (aref pairs index))
-                   (next index)
-                   (navigating nil)
-                   (active nil)
-                   (depth (recursion-depth))
-                   (finish
-                    (lambda ()
-                      (when (buffer-live-p control)
-                        (with-current-buffer control
-                          (aset hunks index ediff-current-difference)
-                          (ediff-really-quit nil)))))
-                   (navigate
-                    (lambda (target)
-                      (setq next (mod target count) navigating t)
-                      (funcall finish)))
-                   (reject
-                    (lambda ()
-                      (interactive)
-                      (setq reason
-                            (if (car comments)
-                                (smv/gptel-ediff--format-region-comments (car comments))
-                              (read-string "Reject all proposed changes — reason: "))
-                            decision 'rejected)
-                      (funcall finish)))
-                   (accept
-                    (lambda ()
-                      (interactive)
-                      (cond
-                       ((car comments)
-                        (user-error "Feedback is pending; use R to send it to the agent"))
-                       ((seq-position seen nil)
-                        (message "Review this file before accepting the entire change set")
-                        (funcall navigate (seq-position seen nil)))
-                       (t (setq decision 'accepted) (funcall finish)))))
-                   (select-file
-                    (lambda ()
-                      (interactive)
-                      (let* ((choices
-                              (cl-loop for c in changes for i from 0
-                                       collect (cons (format "%d. %s%s" (1+ i)
-                                                             (plist-get c :path)
-                                                             (if (aref seen i) "" " [unseen]"))
-                                                     i)))
-                             (choice (completing-read "Review file: " choices nil t)))
-                        (funcall navigate (cdr (assoc choice choices)))))))
-              (setq resume (lambda ()
-                             (when (and active (= (recursion-depth) (1+ depth)))
-                               (exit-recursive-edit))))
-              (smv/gptel-ediff--select-main-window)
-              (setq control
-                    (ediff-buffers
-                     (car pair) (cdr pair)
-                     (list (lambda ()
-                             (setq-local ediff-brief-help-message-function
-                                         (lambda ()
-                                           (format " n/p: change   N/P: file   f: choose file\n q: accept all (visits unseen files first)\n %s: reject all   %s: comment in A/B   ?: Ediff help"
-                                                   smv/gptel-ediff-reject-key
-                                                   smv/gptel-ediff-comment-key)))))))
-              (aset seen index t)
-              (with-current-buffer control
-                ;; This hook belongs only to this Ediff control buffer.  Quitting
-                ;; an unrelated Ediff must never release our recursive edit.
-                (add-hook 'ediff-after-quit-hook-internal resume nil t)
-                (setq-local ediff-ignore-similar-regions nil)
-                (setq-local header-line-format
-                            (format "%d/%d %s%s"
-                                    (1+ index) count path
-                                    (cond ((null (plist-get change :before)) " [new file]")
-                                          ((null (plist-get change :after)) " [delete file]")
-                                          (t ""))))
-                (smv/gptel-ediff--buffer-local-set-key "q" accept)
-                (smv/gptel-ediff--buffer-local-set-key smv/gptel-ediff-reject-key reject)
-                (smv/gptel-ediff--buffer-local-set-key "N"
-                                                       (lambda () (interactive) (funcall navigate (1+ index))))
-                (smv/gptel-ediff--buffer-local-set-key "P"
-                                                       (lambda () (interactive) (funcall navigate (1- index))))
-                (smv/gptel-ediff--buffer-local-set-key "f" select-file)
+          (dolist (pair (list (cons (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-before view))
+                              (cons (smv/gptel-ediff--view-proposed view) (smv/gptel-ediff--view-after view))))
+            (smv/gptel-ediff--fill (car pair) (cdr pair))
+            (smv/gptel-ediff--set-mode-for (car pair) path)
+            (with-current-buffer (car pair) (setq buffer-read-only t)))
+          (smv/gptel-ediff--select-main-window)
+          (setf (smv/gptel-ediff--view-control view)
+                (ediff-buffers (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-proposed view)))
+          (with-current-buffer (smv/gptel-ediff--view-control view)
+            (setq-local ediff-keep-variants t)
+            (setq-local ediff-ignore-similar-regions nil)
+            (setq-local ediff-brief-help-message-function
+                        (lambda () " n/p: change   N/P: file   f: choose file\n q: accept file   Q: hide   R: refuse file   C: cancel all\n H: submit comment immediately (also in A/B)   ?: help"))
+            (add-hook 'ediff-after-quit-hook-internal (lambda () (smv/gptel-ediff--destroy view)) nil t)
+            (smv/gptel-ediff--buffer-local-set-key
+             "q" (lambda ()
+                   (interactive)
+                   (smv/gptel-ediff-validate queue)
+                   (when (eq (plist-get file :status) 'feedback)
+                     (user-error "Feedback submitted; wait for a revision, or use Q to leave review"))
+                   (when (eq (plist-get file :status) 'pending)
+                     (setf (plist-get file :status) 'accepted))
+                   (smv/gptel-ediff-close queue)
+                   (gptel-agent-review--refresh queue)))
+            (smv/gptel-ediff--buffer-local-set-key "Q" (lambda () (interactive) (smv/gptel-ediff-close queue)))
+            (smv/gptel-ediff--buffer-local-set-key
+             smv/gptel-ediff-reject-key
+             (lambda () (interactive)
+               (gptel-agent-review--cancel queue file (read-string "Refusal feedback (optional): "))))
+            (smv/gptel-ediff--buffer-local-set-key
+             "C" (lambda () (interactive)
+                   (with-current-buffer (gptel-agent-review--queue-owner queue) (gptel-agent-review-cancel-all))))
+            (smv/gptel-ediff--buffer-local-set-key
+             "C-]" (lambda () (interactive)
+                     (gptel-agent-review--cancel queue file "Review cancelled by user.")
+                     (smv/gptel-ediff-close queue)))
+            (smv/gptel-ediff--buffer-local-set-key "N" (lambda () (interactive) (smv/gptel-ediff--navigate view 1)))
+            (smv/gptel-ediff--buffer-local-set-key "P" (lambda () (interactive) (smv/gptel-ediff--navigate view -1)))
+            (smv/gptel-ediff--buffer-local-set-key
+             "f" (lambda () (interactive)
+                   (let* ((files (gptel-agent-review--queue-files queue))
+                          (paths (mapcar (lambda (f) (cons (plist-get f :path) f)) files)))
+                     (smv/gptel-ediff-open queue (cdr (assoc (completing-read "Review file: " paths nil t) paths))))))
+            (smv/gptel-ediff--buffer-local-set-key
+             smv/gptel-ediff-comment-key
+             (lambda () (interactive)
+               (gptel-agent-review--comment queue file (read-string "Review comment: "))))
+            (when (> ediff-number-of-differences 0)
+              (ediff-jump-to-difference (1+ (max 0 (min (plist-get file :hunk) (1- ediff-number-of-differences)))))))
+          (dolist (pair (list (cons (smv/gptel-ediff--view-original view) "original file")
+                              (cons (smv/gptel-ediff--view-proposed view) "proposed changes")))
+            (let ((source (cdr pair)))
+              (with-current-buffer (car pair)
                 (smv/gptel-ediff--buffer-local-set-key
-                 smv/gptel-ediff-comment-key
-                 (lambda () (interactive) (message "Select a region in A or B, then press H")))
-                (when (> ediff-number-of-differences 0)
-                  (ediff-jump-to-difference
-                   (1+ (max 0 (min (aref hunks index) (1- ediff-number-of-differences)))))))
-              (dolist (entry (list (cons (car pair) "original file")
-                                   (cons (cdr pair) "proposed changes")))
-                (let ((source (cdr entry)))
-                  (with-current-buffer (car entry)
-                    (setq-local header-line-format
-                                (format "%d/%d %s — %s%s" (1+ index) count path source
-                                        (cond ((null (plist-get change :before)) " [new file]")
-                                              ((null (plist-get change :after)) " [delete file]")
-                                              (t ""))))
-                    (smv/gptel-ediff--buffer-local-set-key
-                     smv/gptel-ediff-comment-key
-                     (lambda () (interactive) (smv/gptel-ediff--comment path source comments))))))
-              (setq active t)
-              (unwind-protect (recursive-edit) (setq active nil))
-              ;; An unexpected recursive exit must not count as acceptance.
-              (when (or (buffer-live-p control) (and (not decision) (not navigating)))
-                (setq decision 'rejected reason "Ediff review was interrupted."))
-              (setq index next)))
-          (when (eq decision 'accepted)
-            ;; The preview is a snapshot, not an editor.  Ediff commands can
-            ;; override read-only buffers, so verify both sides before applying.
-            (cl-loop for change in changes for pair across pairs do
-                     (dolist (entry (list (cons (car pair) :before) (cons (cdr pair) :after)))
-                       (unless (and (buffer-live-p (car entry))
-                                    (equal (with-current-buffer (car entry)
-                                             (save-restriction
-                                               (widen)
-                                               (buffer-substring-no-properties (point-min) (point-max))))
-                                           (or (plist-get change (cdr entry)) "")))
-                         (error "Preview buffers were edited; ask the agent to regenerate the proposal"))))))
-      (when (buffer-live-p control)
-        (with-current-buffer control
-          (remove-hook 'ediff-after-quit-hook-internal resume t)
-          (ignore-errors (ediff-really-quit nil)))
-        (when (buffer-live-p control) (kill-buffer control)))
-      (cl-loop for pair across pairs do
-               (dolist (buffer (list (car pair) (cdr pair)))
-                 (when (buffer-live-p buffer)
-                   (with-current-buffer buffer (set-buffer-modified-p nil))
-                   (kill-buffer buffer))))
-      (set-window-configuration saved-config))
-    (unless (eq decision 'accepted) (or reason "Review cancelled."))))
+                 smv/gptel-ediff-comment-key (lambda () (interactive) (smv/gptel-ediff--comment view source))))))
+          (smv/gptel-ediff--headers view)
+          (smv/gptel-ediff-refresh queue)
+          (setq ready t))
+      (unless ready (smv/gptel-ediff-close queue)))
+    (smv/gptel-ediff--view-control view)))
 
 (defun smv/gptel-ediff-tool-call (plist)
-  "Review Edit batches and individual Edit/Write/Insert calls in PLIST.
-Apply the exact reviewed snapshots and return their result through gptel's
-:result hook API.  Failed previews and aborted reviews always block the call."
-  (when (and gptel-confirm-tool-calls
-             (member (plist-get plist :name) smv/gptel-ediff-tool-names))
+  "Stage file tool PLIST without waiting for review, or read staged content.
+Return an immediate :result so gptel can continue with more proposals."
+  (let* ((name (plist-get plist :name))
+         (owner (gptel-agent-review--owner (plist-get plist :buffer)))
+         (queue (buffer-local-value 'gptel-agent-review--queue owner)))
     (condition-case err
-        (let* ((_ (require 'gptel-agent-edit))
-               (changes (gptel-agent-edit-prepare (plist-get plist :name) (plist-get plist :args)))
-               (rejection (smv/gptel-ediff--review changes)))
-          (if rejection
-              (list :block (concat "The user rejected the proposed changes. Adjust accordingly.\n"
-                                   rejection))
-            (list :confirm nil :result (gptel-agent-edit-apply changes))))
-      (quit (list :block "The user cancelled Ediff review. No changes were applied."))
+        (cond
+         ((equal name "Read")
+          (gptel-agent-review-read (plist-get plist :args) owner))
+         ((and (or gptel-confirm-tool-calls queue)
+               (member name smv/gptel-ediff-tool-names))
+          (list :confirm nil :result
+                (gptel-agent-review-enqueue name (plist-get plist :args) (plist-get plist :buffer)))))
+      (quit (list :block "Proposal preparation cancelled. No changes were applied."))
       (error
-       (let ((reason (concat "Ediff review could not complete: " (error-message-string err))))
-         ;; Also explain the missing preview to the user, not only to the model.
+       (let ((reason (concat "File review could not prepare proposal: " (error-message-string err))))
          (message "%s" reason)
          (list :block reason))))))
 

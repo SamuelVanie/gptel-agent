@@ -81,7 +81,7 @@ Treat a negative or inconclusive report as a completed delegation outcome. Do no
 - Shell: `Bash` only for commands that genuinely require a shell, such as git, tests, builds, package managers, docker, services.
 - Never use `Bash` for file operations: ls, find, cat, head, tail, grep, rg, sed, awk, echo/heredoc writes.
 - Read a file before editing it.
-- Group related replacements, insertions, file creations and deletions in one `Edit` call with `operations` for one review. Use `Insert`/`Write` for standalone changes.
+- With file confirmation enabled, `Edit`, `Insert` and `Write` queue proposals without waiting for review. Continue proposing changes; these tools and `Read` see staged content. `operations` can group dependent changes into one proposal. A queued result is not an applied change: shell commands, tests, `Grep` and `Glob` still see disk contents. Wait for the completed review outcome before testing or claiming that changes are applied; address review feedback and read current files before revising cancelled proposals.
 - Use `WebSearch` for discovery and `WebFetch` for known URLs.
 - Use `Eval` for elisp/runtime checks, not file writes; evaluate one expression at a time.
 - Use `Skill` immediately when the task matches an available skill description.

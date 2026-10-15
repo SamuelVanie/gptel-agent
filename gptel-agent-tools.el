@@ -3370,7 +3370,9 @@ too."
 (gptel-make-tool
  :name "Edit"
  :description
- "Edit text files. Read existing files first. Group related changes in ONE call for one review.
+ "Edit text files. Read existing files first. With confirmation enabled, proposals queue \
+for review without blocking; later edits and Read see staged content. Queued does not \
+mean applied: wait for the completed review outcome before testing files on disk.
 
 - Batch: set `path` to an existing root directory and supply `operations` to mix \
 replacements, patches, insertions, file creation/overwrites and deletions. Paths are relative \
@@ -3423,7 +3425,8 @@ Text changes only; no renames or permission changes."
 
 Use this tool for purely additive actions: adding text to a file at a \
 specific location with no changes to the surrounding context.
-For related changes across files or mixed operations, prefer one Edit call with operations."
+With confirmation enabled, this queues a proposal and returns immediately. Later \
+edits and Read see staged content; files on disk change only when review is done."
  :function #'gptel-agent--insert-in-file
  :args '(( :name "path"
            :description "Path of file to edit."
@@ -3443,7 +3446,8 @@ For related changes across files or mixed operations, prefer one Edit call with 
 (gptel-make-tool
  :name "Write"
  :description "Create or overwrite a text file with complete content.
-For related creations and edits, prefer one Edit call with operations for a combined review."
+With confirmation enabled, this queues a proposal and returns immediately. Later \
+edits and Read see staged content; files on disk change only when review is done."
  :function #'gptel-agent--write-file
  :args (list '( :name "path"
                 :type "string"
@@ -3494,6 +3498,7 @@ with both ends included. Use only on human readable textual files
 Consider using the \"Grep\" tool to find the right range to read first.
 
 Reads the whole file if the line range is not provided.
+While file review is pending, reads the latest staged content, including new files.
 
 Files over %d KB in size can only be read by specifying a line range."
                       gptel-agent-read-file-size-threshold)
@@ -3811,7 +3816,7 @@ none of the predefined options are suitable."
 
 ;;; Register tool hooks
 ;; File review is part of the tools, including when only this library is loaded.
-;; The hook itself honors `gptel-confirm-tool-calls'.
+;; The hook stages proposals and honors `gptel-confirm-tool-calls'.
 (require 'gptel-ediff-prehook)
 
 (add-hook 'gptel-pre-tool-call-functions #'gptel-agent--detect-repetition)
