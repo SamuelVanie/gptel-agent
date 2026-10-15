@@ -133,12 +133,27 @@ Comments retain their filename and line range when switching files.  Pending
 comments must be sent using =R=.  The preview buffers are for review; ask the
 agent to revise the proposal rather than editing these temporary buffers.
 
-For a combined review, the agent should make *one Edit call* with =path= set
-to the common directory, =diff= set to true, and =new_str= containing one
-unified diff with all files and hunks.  Paths in the diff are relative to that
-directory; Git =a/= and =b/= prefixes and optional Markdown fences work.
-Separate tool calls are reviewed separately.  Text file creation/deletion
-using =/dev/null= is supported; renames, binary files and mode changes are not.
+For a combined review, make *one Edit call* with =path= set to an existing
+root directory and an =operations= array.  Operations can mix =replace=,
+=patch=, =insert=, =write= (create or overwrite), and =delete=.  Each operation
+has an =operation= name and a =path= relative to the root, plus the fields it
+needs: =old_str=/=new_str= for replacement, =new_str= for a patch,
+=line_number=/=new_str= for insertion, or =content= for writing.
+
+Operations run in order on temporary content, so a later operation can edit
+a newly created file.  Ediff shows each affected file once, comparing its
+original contents with the final result.  Nothing is applied until the whole
+batch is accepted.  A rejected or invalid batch leaves all target files alone.
+Empty file creation and deletion are identified in the review header.
+
+The original string replacement and unified diff forms of =Edit= still work.
+A unified diff can also mix modifications, additions and deletions using
+=/dev/null=.  Separate =Edit=, =Insert= and =Write= calls are still reviewed
+separately; use =operations= to group them.  Renames, binary files and mode
+changes are unsupported.  Shell/Elisp side effects are not intercepted by this
+hook; use the structured file tools for reviewable content changes.
+With =gptel-confirm-tool-calls= set to nil, edits and batches apply directly
+without opening Ediff.
 
 Preview and execution share =gptel-agent-edit.el=.  Failed patches, ambiguous
 replacements and edits that change nothing are reported to the agent instead

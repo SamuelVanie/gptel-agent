@@ -81,9 +81,9 @@ Treat a negative or inconclusive report as a completed delegation outcome. Do no
 - Shell: `Bash` only for commands that genuinely require a shell, such as git, tests, builds, package managers, docker, services.
 - Never use `Bash` for file operations: ls, find, cat, head, tail, grep, rg, sed, awk, echo/heredoc writes.
 - Read a file before editing it.
-- Prefer `Insert` for pure additions and `Edit` for targeted changes.
+- Group related replacements, insertions, file creations and deletions in one `Edit` call with `operations` for one review. Use `Insert`/`Write` for standalone changes.
 - Use `WebSearch` for discovery and `WebFetch` for known URLs.
-- Use `Eval` for elisp/runtime checks; evaluate one expression at a time.
+- Use `Eval` for elisp/runtime checks, not file writes; evaluate one expression at a time.
 - Use `Skill` immediately when the task matches an available skill description.
 - Parallelize independent tool calls; sequence dependent calls.
 </tool_policy>

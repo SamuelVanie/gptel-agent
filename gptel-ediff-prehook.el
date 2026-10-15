@@ -18,7 +18,7 @@
 (defvar gptel-confirm-tool-calls)
 
 (defvar smv/gptel-ediff-tool-names '("Edit" "Write" "Insert")
-  "Tool names whose calls should be previewed via ediff.")
+  "File tools previewed via Ediff; Edit also supports mixed operation batches.")
 
 (defvar smv/gptel-ediff-reject-key "R"
   "Key bound in the ediff control buffer to reject the proposed change.")
@@ -289,7 +289,7 @@ Quitting requires viewing every file, and feedback must be sent using R."
     (unless (eq decision 'accepted) (or reason "Review cancelled."))))
 
 (defun smv/gptel-ediff-tool-call (plist)
-  "Review Edit/Write/Insert calls in PLIST using the shared file edit engine.
+  "Review Edit batches and individual Edit/Write/Insert calls in PLIST.
 Apply the exact reviewed snapshots and return their result through gptel's
 :result hook API.  Failed previews and aborted reviews always block the call."
   (when (and gptel-confirm-tool-calls

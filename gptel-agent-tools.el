@@ -1263,33 +1263,48 @@ diagnostics."
 ;;;; Writing to files
 (defun gptel-agent--edit-files-preview-setup (arg-values _info)
   "Insert tool call preview for ARG-VALUES for \"Edit\" tool."
-  (pcase-let ((from (point)) (files-affected) (description)
-              (`(,path ,old-str ,new-str-or-diff ,diffp) arg-values))
+  (pcase-let* ((from (point)) (files-affected) (description)
+               (`(,path ,old-str ,new-str-or-diff ,diffp . ,tail) arg-values)
+               (operations (car tail)))
 
-    (if (and diffp (not (eq diffp :json-false)))
-        (progn                          ;Patch
-          (insert new-str-or-diff)
-          (save-excursion
-            (while (re-search-backward "^\\+\\+\\+ \\(.*\\)$" from t)
-              (push (match-string 1) files-affected))
-            (goto-char from)
-            (when (looking-at "^ *```\\(diff\\|patch\\)\\s-*\n")
-              (delete-region (match-beginning 0) (match-end 0))))
-          (skip-chars-backward " \t\r\n")
-          (when (looking-back "^ *```\\s-*\\'" (line-beginning-position))
-            (delete-region (line-beginning-position) (line-end-position)))
-          (setq description "Patch")
-          (require 'diff-mode)
-          (gptel-agent--fontify-block 'diff-mode from (point)))
-      (when old-str                     ;Text replacement
-        (push path files-affected)
-        (setq description "ReplaceIn")
-        (insert
-         (propertize old-str 'font-lock-face 'diff-removed
-                     'line-prefix (propertize "-" 'face 'diff-removed))
-         "\n" (propertize new-str-or-diff 'font-lock-face 'diff-added
-                          'line-prefix (propertize "+" 'face 'diff-added))
-         "\n")))
+    (cond
+     (operations
+      (setq description "BatchEdit")
+      (dolist (change (gptel-agent-edit-prepare "Edit" (list :path path :operations operations)))
+        (let ((file (plist-get change :path))
+              (before (plist-get change :before)) (after (plist-get change :after)))
+          (push file files-affected)
+          (insert (format "%s%s\n" file (cond ((null before) " [new file]")
+                                              ((null after) " [delete file]") (t ""))))
+          (when before
+            (insert (propertize before 'font-lock-face 'diff-removed
+                                'line-prefix (propertize "-" 'face 'diff-removed)) "\n"))
+          (when after
+            (insert (propertize after 'font-lock-face 'diff-added
+                                'line-prefix (propertize "+" 'face 'diff-added)) "\n")))))
+     ((and diffp (not (eq diffp :json-false)))
+      (insert new-str-or-diff)
+      (save-excursion
+        (while (re-search-backward "^\\+\\+\\+ \\(.*\\)$" from t)
+          (push (match-string 1) files-affected))
+        (goto-char from)
+        (when (looking-at "^ *```\\(diff\\|patch\\)\\s-*\n")
+          (delete-region (match-beginning 0) (match-end 0))))
+      (skip-chars-backward " \t\r\n")
+      (when (looking-back "^ *```\\s-*\\'" (line-beginning-position))
+        (delete-region (line-beginning-position) (line-end-position)))
+      (setq description "Patch")
+      (require 'diff-mode)
+      (gptel-agent--fontify-block 'diff-mode from (point)))
+     (old-str                          ;Text replacement
+      (push path files-affected)
+      (setq description "ReplaceIn")
+      (insert
+       (propertize old-str 'font-lock-face 'diff-removed
+                   'line-prefix (propertize "-" 'face 'diff-removed))
+       "\n" (propertize new-str-or-diff 'font-lock-face 'diff-added
+                        'line-prefix (propertize "+" 'face 'diff-added))
+       "\n")))
     (insert "\n")
     (font-lock-append-text-property
      from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
@@ -1300,7 +1315,7 @@ diagnostics."
       (insert
        "(" (propertize description 'font-lock-face 'font-lock-keyword-face)
        " " (mapconcat (lambda (f) (propertize (concat "\"" f "\"")
-                                         'font-lock-face 'font-lock-constant-face))
+                                              'font-lock-face 'font-lock-constant-face))
                       files-affected " ")
        ")\n"))
     (gptel-agent--confirm-overlay from (point) t)))
@@ -1320,14 +1335,16 @@ directory to create."
         (format "Directory %s created/verified in %s" name parent))
     (error "Error creating directory %s in %s:\n%S" name parent errdata)))
 
-(defun gptel-agent--edit-files (path &optional old-str new-str-or-diff diffp)
+(defun gptel-agent--edit-files (path &optional old-str new-str-or-diff diffp operations)
   "Replace text in PATH, or apply a unified diff when DIFFP is true.
 Prepare every affected file before writing any of them.  Diff paths are
 relative to a directory PATH; standard a/ and b/ prefixes are accepted.
-In string mode OLD-STR must match exactly once, with case significant."
+In string mode OLD-STR must match exactly once, with case significant.
+OPERATIONS instead supplies an ordered mixed batch under directory PATH."
   (gptel-agent-edit-apply
    (gptel-agent-edit-prepare
-    "Edit" (list :path path :old_str old-str :new_str new-str-or-diff :diff diffp))))
+    "Edit" (append (list :path path :old_str old-str :new_str new-str-or-diff :diff diffp)
+                   (and operations (list :operations operations))))))
 
 (defun gptel-agent--insert-in-file-preview-setup (arg-values _info)
   "Preview setup for Insert.
@@ -3352,31 +3369,49 @@ too."
 (gptel-make-tool
  :name "Edit"
  :description
- "Edit text in one or more files. Read the affected files first.
+ "Edit text files. Read existing files first. Group related changes in ONE call for one review.
 
-- diff=false: replace one exact occurrence of nonempty `old_str` in file `path` \
-with literal `new_str`. Match case and whitespace exactly; empty `new_str` deletes the match.
-- diff=true: supply a unified diff in `new_str`; omit `old_str`. \
-Use ---/+++ file headers and @@ hunks with actual source context.
+- Batch: set `path` to an existing root directory and supply `operations` to mix \
+replacements, patches, insertions, file creation/overwrites and deletions. Paths are relative \
+to the root; operations see earlier results. Omit top-level old_str/new_str/diff.
+- Replacement: diff=false, file `path`, nonempty `old_str` matching exactly once \
+(case and whitespace), literal `new_str` (empty deletes).
+- Unified diff: diff=true, `new_str` with ---/+++ headers and @@ hunks; omit `old_str`. \
+Multi-file diffs require a directory `path` and relative headers; a/ and b/ prefixes work.
 
-For multiple files, set `path` to their common directory. Header paths must be \
-relative to it; a/ and b/ prefixes are accepted. A file `path` targets only that file.
-Group all related files and hunks into ONE diff call for a combined review.
-Text changes only; renames and permission changes are unsupported."
+Text changes only; no renames or permission changes."
  :function #'gptel-agent--edit-files
  :args '(( :name "path"
-           :description "Existing file, or common root directory for a multi-file diff. Prefer an absolute path."
+           :description "Existing file, or root directory for operations/multi-file diffs. Prefer an absolute path."
            :type string)
          ( :name "old_str"
-           :description "Required for diff=false: nonempty text matching exactly once. Omit for diff=true."
+           :description "Nonempty text matching exactly once for literal replacement. Omit for diffs/batches."
            :type string
            :optional t)
          ( :name "new_str"
-           :description "Literal replacement (diff=false) or unified diff containing all changes (diff=true)."
-           :type string)
+           :description "Required without operations: literal replacement (diff=false) or unified diff (diff=true)."
+           :type string
+           :optional t)
          ( :name "diff"
-           :description "false for literal replacement; true for unified diff."
-           :type boolean))
+           :description "false for literal replacement; true for unified diff. Omit with operations."
+           :type boolean
+           :optional t)
+         ( :name "operations"
+           :description "Ordered mixed batch; use instead of top-level old_str/new_str/diff. One final preview per file."
+           :type array
+           :optional t
+           :minItems 1
+           :items
+           ( :type object
+             :required ["operation" "path"]
+             :additionalProperties :json-false
+             :properties
+             ( :operation (:type string :enum ["replace" "patch" "insert" "write" "delete"])
+               :path (:type string :description "Path relative to the root, no ../; patch may use . for all files.")
+               :old_str (:type string :description "replace: required nonempty text matching exactly once.")
+               :new_str (:type string :description "replace/insert: text; patch: unified diff with ---/+++ and @@ headers.")
+               :line_number (:type integer :minimum -1 :description "insert: after this line; 0 = start, -1 = end. Uses earlier operation results.")
+               :content (:type string :description "write: complete content, possibly empty; creates or overwrites the file.")))))
  :category "gptel-agent"
  :confirm t
  :include t)
@@ -3386,7 +3421,8 @@ Text changes only; renames and permission changes are unsupported."
  :description "Insert `new_str` after `line_number` in file at `path`.
 
 Use this tool for purely additive actions: adding text to a file at a \
-specific location with no changes to the surrounding context."
+specific location with no changes to the surrounding context.
+For related changes across files or mixed operations, prefer one Edit call with operations."
  :function #'gptel-agent--insert-in-file
  :args '(( :name "path"
            :description "Path of file to edit."
@@ -3405,9 +3441,8 @@ specific location with no changes to the surrounding context."
 
 (gptel-make-tool
  :name "Write"
- :description "Create a new file with the specified content.
-Overwrites an existing file, so use with care!
-Consider using the more granular tools \"Insert\" or \"Edit\" first."
+ :description "Create or overwrite a text file with complete content.
+For related creations and edits, prefer one Edit call with operations for a combined review."
  :function #'gptel-agent--write-file
  :args (list '( :name "path"
                 :type "string"

@@ -55,9 +55,10 @@ You are an autonomous executor. Complete the delegated, well-scoped task with th
 - Content search: `Grep`.
 - File reading: `Read`.
 - File changes: `Edit`, `Insert`, `Write`, `Mkdir`.
+- Group related replacements, insertions, file creations and deletions in one `Edit` call with `operations` for one review.
 - Shell: `Bash` only for git, tests, builds, package managers, docker, services, or commands that genuinely require a shell.
 - Never use `Bash` for file operations: ls, find, cat, head, tail, grep, rg, sed, awk, echo/heredoc writes.
-- Use `Eval` for elisp/runtime checks; one expression at a time.
+- Use `Eval` for elisp/runtime checks, not file writes; one expression at a time.
 - Use web tools only when external/current information is required.
 - Parallelize independent reads/searches; sequence dependent edits and checks.
 </tool_policy>

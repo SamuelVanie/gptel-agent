@@ -350,5 +350,234 @@ diff --git a/sub/two b/sub/two
                            :block)))
       (should (equal (gptel-edit-test--read "one") "old\n")))))
 
+(defconst gptel-edit-test--mixed-operations
+  '[(:operation "replace" :path "one" :old_str "old" :new_str "new")
+    (:operation "insert" :path "./one" :line_number 1 :new_str "inserted")
+    (:operation "write" :path "nested/created" :content "draft\n")
+    (:operation "patch" :path "nested/created" :new_str "--- created\n+++ created\n@@ -1 +1 @@\n-draft\n+final\n")
+    (:operation "write" :path "empty" :content "")
+    (:operation "write" :path "overwrite" :content "replacement\n")
+    (:operation "delete" :path "obsolete")])
+
+(ert-deftest gptel-edit-mixed-batch-stages-in-order-and-applies-final-results ()
+  (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
+                               (let ((changes (gptel-agent-edit-prepare
+                                               "Edit" (list :path directory :operations gptel-edit-test--mixed-operations))))
+                                 (should (= 5 (length changes)))
+                                 (should (equal (plist-get (car changes) :before) "old\ntail\n"))
+                                 (should (equal (plist-get (car changes) :after) "new\ninserted\ntail\n"))
+                                 (should (equal (plist-get (cadr changes) :after) "final\n"))
+                                 (should (equal (gptel-edit-test--read "one") "old\ntail\n"))
+                                 (should-not (file-exists-p "nested"))
+                                 ;; Exercise the same registered function called with confirmation off.
+                                 (gptel-agent--edit-files directory nil nil nil gptel-edit-test--mixed-operations)
+                                 (dolist (change changes)
+                                   (let ((path (plist-get change :path)) (after (plist-get change :after)))
+                                     (if after (should (equal (gptel-edit-test--read path) after))
+                                       (should-not (file-exists-p path)))))
+                                 (should (file-exists-p "empty")))))
+
+(ert-deftest gptel-edit-batch-directory-patch-sees-created-and-inserted-content ()
+  (gptel-edit-test--with-files '(("existing" . "first\n"))
+                               (gptel-agent--edit-files
+                                directory nil nil nil
+                                '[(:operation "write" :path "new" :content "hello\n")
+                                  (:operation "insert" :path "existing" :line_number -1 :new_str "second\n")
+                                  (:operation "patch" :path "." :new_str "--- a/new\n+++ b/new\n@@ -1 +1 @@\n-hello\n+HELLO\n--- a/existing\n+++ b/existing\n@@ -2 +2 @@\n-second\n+SECOND\n")])
+                               (should (equal (gptel-edit-test--read "new") "HELLO\n"))
+                               (should (equal (gptel-edit-test--read "existing") "first\nSECOND\n"))))
+
+(ert-deftest gptel-edit-batch-invalid-later-operation-writes-nothing ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+                               (let ((failure
+                                      (should-error
+                                       (gptel-agent--edit-files
+                                        directory nil nil nil
+                                        '[(:operation "write" :path "nested/new" :content "new\n")
+                                          (:operation "delete" :path "one")
+                                          (:operation "insert" :path "one" :line_number 0 :new_str "oops")]))))
+                                 (should (string-match-p "Operation 3: File was deleted" (error-message-string failure)))
+                                 (should (equal (gptel-edit-test--read "one") "old\n"))
+                                 (should-not (file-exists-p "nested")))))
+
+(ert-deftest gptel-edit-batch-retains-first-snapshot-across-recreation ()
+  (gptel-edit-test--with-files '(("one" . "original"))
+                               (let ((changes (gptel-agent-edit-prepare
+                                               "Edit" (list :path directory :operations
+                                                            '[(:operation "delete" :path "one")
+                                                              (:operation "write" :path "./one" :content "replacement")]))))
+                                 (should (= 1 (length changes)))
+                                 (should (equal (plist-get (car changes) :before) "original"))
+                                 (should (equal (plist-get (car changes) :after) "replacement"))
+                                 (with-temp-file "one" (insert "user change"))
+                                 (should-error (gptel-agent-edit-apply changes))
+                                 (should (equal (gptel-edit-test--read "one") "user change")))))
+
+(ert-deftest gptel-edit-batch-discards-transient-files-and-rejects-net-noop ()
+  (gptel-edit-test--with-files nil
+                               (should-error
+                                (gptel-agent--edit-files directory nil nil nil
+                                                         '[(:operation "write" :path "transient" :content "")
+                                                           (:operation "delete" :path "transient")]))
+                               (gptel-agent--edit-files directory nil nil nil
+                                                        '[(:operation "write" :path "transient" :content "")
+                                                          (:operation "delete" :path "transient")
+                                                          (:operation "write" :path "kept" :content "")])
+                               (should-not (file-exists-p "transient"))
+                               (should (file-exists-p "kept"))))
+
+(ert-deftest gptel-edit-batch-rejects-invalid-arguments-and-paths ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+                               (dolist (operations
+                                        (list [] "invalid" '[(:operation "unknown" :path "one")]
+                                              '[(:operation "write" :path "../outside" :content "x")]
+                                              '[(:operation "write" :path "/tmp/outside" :content "x")]
+                                              '[(:operation "replace" :path "one" :new_str "x")]
+                                              '[(:operation "insert" :path "one" :new_str "x")]
+                                              '[(:operation "write" :path "new")]))
+                                 (should-error (gptel-agent-edit-prepare "Edit" (list :path directory :operations operations))))
+                               (should-error
+                                (gptel-agent-edit-prepare
+                                 "Edit" (list :path directory :new_str "extra" :operations '[(:operation "delete" :path "one")])))))
+
+(ert-deftest gptel-edit-batch-blocks-unsaved-files-and-rolls-back-write-failures ()
+  (gptel-edit-test--with-files '(("one" . "original"))
+                               (let ((buffer (find-file-noselect "one"))
+                                     (operations '[(:operation "write" :path "new" :content "created")
+                                                   (:operation "write" :path "one" :content "replaced")]))
+                                 (with-current-buffer buffer (insert "unsaved"))
+                                 (should-error (gptel-agent--edit-files directory nil nil nil operations))
+                                 (should-not (file-exists-p "new"))
+                                 (with-current-buffer buffer (revert-buffer t t))
+                                 (let ((write (symbol-function 'gptel-agent-edit--write)))
+                                   (cl-letf (((symbol-function 'gptel-agent-edit--write)
+                                              (lambda (change content)
+                                                (if (equal content "replaced") (error "Simulated failure")
+                                                  (funcall write change content)))))
+                                     (should-error (gptel-agent--edit-files directory nil nil nil operations))))
+                                 (should (equal (gptel-edit-test--read "one") "original"))
+                                 (should-not (file-exists-p "new")))))
+
+(ert-deftest gptel-ediff-insert-and-write-open-review ()
+  (gptel-edit-test--with-files '(("one" . "original\n"))
+                               (let ((gptel-confirm-tool-calls t) reviewed)
+                                 (cl-letf (((symbol-function 'smv/gptel-ediff--review)
+                                            (lambda (changes) (push changes reviewed) nil)))
+                                   (should (plist-get (smv/gptel-ediff-tool-call
+                                                       '(:name "Insert" :args (:path "one" :line_number 0 :new_str "first"))) :result))
+                                   (should (plist-get (smv/gptel-ediff-tool-call
+                                                       '(:name "Write" :args (:path "." :filename "new" :content "created"))) :result)))
+                                 (should (= 2 (length reviewed)))
+                                 (should (equal (gptel-edit-test--read "one") "first\noriginal\n"))
+                                 (should (equal (gptel-edit-test--read "new") "created")))))
+
+(ert-deftest gptel-ediff-mixed-batch-has-one-review-and-one-decision ()
+  (dolist (accept '(nil t))
+    (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
+                                 (let ((gptel-confirm-tool-calls t) (calls 0))
+                                   (cl-letf (((symbol-function 'smv/gptel-ediff--review)
+                                              (lambda (changes)
+                                                (cl-incf calls)
+                                                (should (= 5 (length changes)))
+                                                (should (equal (gptel-edit-test--read "one") "old\ntail\n"))
+                                                (should-not (file-exists-p "nested"))
+                                                (unless accept "Keep everything as it is"))))
+                                     (let ((result (smv/gptel-ediff-tool-call
+                                                    (list :name "Edit" :args (list :path directory :operations gptel-edit-test--mixed-operations)))))
+                                       (should (plist-get result (if accept :result :block)))))
+                                   (should (= calls 1))
+                                   (if accept
+                                       (progn (should (equal (gptel-edit-test--read "nested/created") "final\n"))
+                                              (should-not (file-exists-p "obsolete")))
+                                     (should-not (file-exists-p "nested"))
+                                     (should (file-exists-p "obsolete"))
+                                     (should (equal (gptel-edit-test--read "one") "old\ntail\n")))))))
+
+(ert-deftest gptel-ediff-mixed-batch-navigates-creations-modifications-and-deletions ()
+  (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
+                               (let ((gptel-confirm-tool-calls t)
+                                     (ediff-window-setup-function #'ediff-setup-windows-plain)
+                                     (visits 0) headers)
+                                 (cl-letf (((symbol-function 'recursive-edit)
+                                            (lambda ()
+                                              (cl-incf visits)
+                                              (should (<= visits 5))
+                                              (with-current-buffer (gptel-edit-test--control)
+                                                (push header-line-format headers))
+                                              (gptel-edit-test--key "q"))))
+                                   (should (plist-get
+                                            (smv/gptel-ediff-tool-call
+                                             (list :name "Edit" :args (list :path directory :operations gptel-edit-test--mixed-operations))) :result)))
+                                 (should (= visits 5))
+                                 (should (= 2 (cl-count-if (lambda (h) (string-match-p (regexp-quote "[new file]") h)) headers)))
+                                 (should (= 1 (cl-count-if (lambda (h) (string-match-p (regexp-quote "[delete file]") h)) headers)))
+                                 (should (equal (gptel-edit-test--read "one") "new\ninserted\ntail\n")))))
+
+(ert-deftest gptel-ediff-confirmation-off-skips-all-file-reviews ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+                               (let ((gptel-confirm-tool-calls nil)
+                                     (calls '((:name "Insert" :args (:path "one" :line_number 0 :new_str "inserted"))
+                                              (:name "Write" :args (:path "." :filename "written" :content "created"))
+                                              (:name "Edit" :args (:path "one" :old_str "old" :new_str "new" :diff :json-false))
+                                              (:name "Edit" :args (:path "." :operations [(:operation "delete" :path "written")
+                                                                                          (:operation "write" :path "empty" :content "")])))))
+                                 (cl-letf (((symbol-function 'smv/gptel-ediff--review)
+                                            (lambda (_) (ert-fail "Confirmation off opened Ediff"))))
+                                   (dolist (call calls)
+                                     (should-not (smv/gptel-ediff-tool-call call))
+                                     (let ((tool (gptel-get-tool (plist-get call :name))))
+                                       (apply (gptel-tool-function tool)
+                                              (mapcar (lambda (arg)
+                                                        (plist-get (plist-get call :args) (intern (concat ":" (plist-get arg :name)))))
+                                                      (gptel-tool-args tool))))))
+                                 (should (equal (gptel-edit-test--read "one") "inserted\nnew\n"))
+                                 (should-not (file-exists-p "written"))
+                                 (should (file-exists-p "empty")))))
+
+(ert-deftest gptel-edit-batch-schema-and-json-dispatch ()
+  (gptel-edit-test--with-files '(("old" . "old"))
+                               (let* ((tool (gptel-get-tool "Edit"))
+                                      ;; Round-trip the outgoing schema: gptel uses uninterned property keys.
+                                      (schema (json-parse-string
+                                               (gptel--json-encode
+                                                (plist-get (plist-get (aref (gptel--parse-tools nil (list tool)) 0) :function) :parameters))
+                                               :object-type 'plist :false-object :json-false))
+                                      (args (json-parse-string
+                                             "{\"path\":\".\",\"operations\":[{\"operation\":\"replace\",\"path\":\"old\",\"old_str\":\"old\",\"new_str\":\"new\"},{\"operation\":\"write\",\"path\":\"created\",\"content\":\"\"}]}"
+                                             :object-type 'plist :false-object :json-false)))
+                                 (should (equal (plist-get schema :required) ["path"]))
+                                 (should (equal (plist-get (plist-get (plist-get (plist-get schema :properties) :operations) :items) :required)
+                                                ["operation" "path"]))
+                                 (apply (gptel-tool-function tool)
+                                        (mapcar (lambda (arg) (plist-get args (intern (concat ":" (plist-get arg :name))))) (gptel-tool-args tool))))
+                               (should (equal (gptel-edit-test--read "old") "new"))
+                               (should (file-exists-p "created"))))
+
+(ert-deftest gptel-edit-batch-fallback-preview-includes-all-changes ()
+  (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
+                               (with-temp-buffer
+                                 (let ((overlays 0))
+                                   (cl-letf (((symbol-function 'gptel-agent--confirm-overlay)
+                                              (lambda (&rest _) (cl-incf overlays))))
+                                     (gptel-agent--edit-files-preview-setup (list directory nil nil nil gptel-edit-test--mixed-operations) nil))
+                                   (should (= overlays 1)))
+                                 (should (string-match-p "BatchEdit" (buffer-string)))
+                                 (should (string-match-p "final" (buffer-string)))
+                                 (should (string-match-p (regexp-quote "[delete file]") (buffer-string))))))
+
+(ert-deftest gptel-edit-batch-coalesces-symlink-aliases-within-a-patch ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+    (make-symbolic-link "one" "alias")
+    (let ((changes (gptel-agent-edit-prepare
+                    "Edit" (list :path directory :operations
+                                 '[(:operation "replace" :path "alias" :old_str "old" :new_str "staged")
+                                   (:operation "patch" :path "." :new_str "--- a/one\n+++ b/one\n@@ -1 +1 @@\n-staged\n+next\n--- a/alias\n+++ b/alias\n@@ -1 +1 @@\n-next\n+final\n")]))))
+      (should (= 1 (length changes)))
+      (should (equal (plist-get (car changes) :before) "old\n"))
+      (should (equal (plist-get (car changes) :after) "final\n"))
+      (gptel-agent-edit-apply changes)
+      (should (file-symlink-p "alias"))
+      (should (equal (gptel-edit-test--read "one") "final\n")))))
+
 (provide 'gptel-agent-edit-test)
 ;;; gptel-agent-edit-test.el ends here

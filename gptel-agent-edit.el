@@ -11,22 +11,35 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+(defvar gptel-agent-edit--staged-changes nil
+  "Dynamically bound table of file changes while preparing a batch.
+Keys are canonical paths; values retain the original :before and latest :after.")
+
 (defun gptel-agent-edit--snapshot (path &optional must-exist)
   "Read PATH into a change plist.  Require an existing file if MUST-EXIST."
   (setq path (expand-file-name path))
-  (when (file-directory-p path)
-    (error "Cannot edit a directory as a file: %s" path))
-  (when-let* ((buffer (find-buffer-visiting path)))
-    (when (buffer-modified-p buffer)
-      (error "Save or revert the unsaved buffer before editing %s" path)))
-  (when (and must-exist (not (file-exists-p path)))
-    (error "File does not exist: %s" path))
-  (with-temp-buffer
-    (let ((exists (file-exists-p path)))
-      (when exists (insert-file-contents path))
-      (list :path path :before (and exists (buffer-string))
-            :coding buffer-file-coding-system
-            :modes (and exists (file-modes path))))))
+  (when gptel-agent-edit--staged-changes
+    (setq path (file-truename path)))
+  (if-let* ((staged (and gptel-agent-edit--staged-changes
+                         (gethash path gptel-agent-edit--staged-changes))))
+      (let ((snapshot (copy-sequence staged)))
+        (when (and must-exist (null (plist-get staged :after)))
+          (error "File was deleted earlier in this batch: %s" path))
+        (setf (plist-get snapshot :before) (plist-get staged :after))
+        snapshot)
+    (when (file-directory-p path)
+      (error "Cannot edit a directory as a file: %s" path))
+    (when-let* ((buffer (find-buffer-visiting path)))
+      (when (buffer-modified-p buffer)
+        (error "Save or revert the unsaved buffer before editing %s" path)))
+    (when (and must-exist (not (file-exists-p path)))
+      (error "File does not exist: %s" path))
+    (with-temp-buffer
+      (let ((exists (file-exists-p path)))
+        (when exists (insert-file-contents path))
+        (list :path path :before (and exists (buffer-string))
+              :coding buffer-file-coding-system
+              :modes (and exists (file-modes path)))))))
 
 (defun gptel-agent-edit--normalize-patch (text)
   "Remove optional Markdown fences from unified diff TEXT."
@@ -181,12 +194,16 @@ starting with additional plus or minus signs.  Never count file headers."
          (directory (file-directory-p path))
          (sections (gptel-agent-edit--sections text))
          changes)
-    (unless (file-readable-p path) (error "Path is not readable: %s" path))
+    (unless (or (file-readable-p path)
+                (and gptel-agent-edit--staged-changes
+                     (plist-get (gethash (file-truename path) gptel-agent-edit--staged-changes) :after)))
+      (error "Path is not readable: %s" path))
     (when (and (not directory) (> (length sections) 1))
       (error "Use a directory path for a diff affecting multiple files"))
     (dolist (section sections)
       (pcase-let* ((`(,old ,new ,hunks) section)
                    (target (if directory (gptel-agent-edit--target old new path) path))
+                   (target (if gptel-agent-edit--staged-changes (file-truename target) target))
                    (existing (cl-find target changes :key (lambda (c) (plist-get c :path))
                                       :test #'equal))
                    (change (or existing (gptel-agent-edit--snapshot target
@@ -204,6 +221,66 @@ starting with additional plus or minus signs.  Never count file headers."
         (unless existing (push change changes))))
     (nreverse changes)))
 
+(defun gptel-agent-edit--batch-path (path root)
+  "Resolve an operation PATH inside ROOT, including paths not yet created."
+  (unless (and (stringp path) (not (string-empty-p path))
+               (not (file-name-absolute-p path))
+               (not (member ".." (split-string path "/"))))
+    (error "Operation path must be relative to the batch directory: %S" path))
+  (let ((target (file-truename (expand-file-name path root))))
+    (unless (or (equal (directory-file-name target) (directory-file-name root))
+                (file-in-directory-p target root))
+      (error "Operation path escapes the batch directory: %s" path))
+    target))
+
+(defun gptel-agent-edit--prepare-operation (operation root)
+  "Prepare OPERATION against the current staged contents under ROOT."
+  (let* ((kind (plist-get operation :operation))
+         (path (gptel-agent-edit--batch-path (plist-get operation :path) root)))
+    (pcase kind
+      ((or "replace" "patch")
+       (gptel-agent-edit-prepare
+        "Edit" (list :path path :old_str (plist-get operation :old_str)
+                     :new_str (plist-get operation :new_str)
+                     :diff (if (equal kind "patch") t :json-false))))
+      ("insert"
+       (gptel-agent-edit-prepare
+        "Insert" (list :path path :line_number (plist-get operation :line_number)
+                       :new_str (plist-get operation :new_str))))
+      ("write"
+       (gptel-agent-edit-prepare
+        "Write" (list :path (file-name-directory path)
+                      :filename (file-name-nondirectory path)
+                      :content (plist-get operation :content))))
+      ("delete"
+       (let ((change (gptel-agent-edit--snapshot path t)))
+         (setf (plist-get change :after) nil)
+         (list change)))
+      (_ (error "Unknown file operation: %S" kind)))))
+
+(defun gptel-agent-edit--prepare-batch (root operations)
+  "Prepare ordered OPERATIONS under ROOT without writing to target files.
+Each operation sees earlier results.  Return one original/final pair per file."
+  (unless (file-directory-p root) (error "Batch path must be an existing directory"))
+  (unless (and (or (listp operations) (vectorp operations)) (> (length operations) 0))
+    (error "operations must be a nonempty array"))
+  (let ((root (file-name-as-directory (file-truename root)))
+        (gptel-agent-edit--staged-changes (make-hash-table :test #'equal))
+        (index 0) paths)
+    (dolist (operation (append operations nil))
+      (cl-incf index)
+      (condition-case err
+          (dolist (change (gptel-agent-edit--prepare-operation operation root))
+            (let* ((path (file-truename (plist-get change :path)))
+                   (previous (gethash path gptel-agent-edit--staged-changes)))
+              (if previous
+                  (setf (plist-get previous :after) (plist-get change :after))
+                (push path paths)
+                (puthash path change gptel-agent-edit--staged-changes))))
+        (error (error "Operation %d: %s" index (error-message-string err)))))
+    (mapcar (lambda (path) (gethash path gptel-agent-edit--staged-changes))
+            (nreverse paths))))
+
 (defun gptel-agent-edit-prepare (name args)
   "Return file change plists for tool NAME and argument plist ARGS.
 Each has :path, :before and :after.  Nil content means a missing file;
@@ -211,52 +288,58 @@ an empty string means an existing empty file.  Signal invalid or no-op edits."
   (let* ((path (plist-get args :path)) changes)
     (unless (stringp path) (error "Required argument `path' must be a string"))
     (setq changes
-          (pcase name
-            ("Edit"
-             (let ((old (plist-get args :old_str)) (new (plist-get args :new_str))
-                   (diff (plist-get args :diff)))
-               (unless (stringp new) (error "Required argument `new_str' must be a string"))
-               (if (and diff (not (eq diff :json-false)))
-                   (gptel-agent-edit--prepare-diff path new)
-                 (unless (and (stringp old) (not (string-empty-p old)))
-                   (error "String replacement requires a nonempty `old_str'"))
-                 (let ((change (gptel-agent-edit--snapshot path t)))
-                   (with-temp-buffer
-                     (insert (plist-get change :before))
-                     (goto-char (point-min))
-                     (let ((case-fold-search nil))
-                       (unless (search-forward old nil t)
-                         (error "Could not find old_str in %s" path))
-                       (let ((start (match-beginning 0)))
-                         (when (save-excursion
-                                 (goto-char (1+ start)) (search-forward old nil t))
-                           (error "old_str is not unique in %s; add context or use a diff" path)))
-                       ;; Searching for duplicates changes the match data.
-                       (goto-char (point-min)) (search-forward old)
-                       (replace-match new t t))
-                     (setf (plist-get change :after) (buffer-string)))
-                   (list change)))))
-            ("Insert"
-             (let ((line (plist-get args :line_number)) (new (plist-get args :new_str))
-                   (change (gptel-agent-edit--snapshot path t)))
-               (unless (and (integerp line) (>= line -1) (stringp new))
-                 (error "Insert requires line_number >= -1 and a string new_str"))
-               (with-temp-buffer
-                 (insert (plist-get change :before))
-                 (if (= line -1) (goto-char (point-max))
-                   (goto-char (point-min)) (forward-line line))
-                 (insert new)
-                 (unless (or (string-suffix-p "\n" new) (eobp)) (insert "\n"))
-                 (setf (plist-get change :after) (buffer-string)))
-               (list change)))
-            ("Write"
-             (let ((filename (plist-get args :filename)) (content (plist-get args :content)))
-               (unless (and (stringp filename) (stringp content))
-                 (error "Write requires string filename and content"))
-               (let ((change (gptel-agent-edit--snapshot (expand-file-name filename path))))
-                 (setf (plist-get change :after) content)
-                 (list change))))
-            (_ (error "Unsupported file tool: %s" name))))
+          (if (and (equal name "Edit") (plist-member args :operations))
+              (progn
+                (when (or (plist-get args :old_str) (plist-get args :new_str)
+                          (plist-get args :diff))
+                  (error "Use operations alone; omit top-level old_str, new_str and diff"))
+                (gptel-agent-edit--prepare-batch path (plist-get args :operations)))
+            (pcase name
+              ("Edit"
+               (let ((old (plist-get args :old_str)) (new (plist-get args :new_str))
+                     (diff (plist-get args :diff)))
+                 (unless (stringp new) (error "Required argument `new_str' must be a string"))
+                 (if (and diff (not (eq diff :json-false)))
+                     (gptel-agent-edit--prepare-diff path new)
+                   (unless (and (stringp old) (not (string-empty-p old)))
+                     (error "String replacement requires a nonempty `old_str'"))
+                   (let ((change (gptel-agent-edit--snapshot path t)))
+                     (with-temp-buffer
+                       (insert (plist-get change :before))
+                       (goto-char (point-min))
+                       (let ((case-fold-search nil))
+                         (unless (search-forward old nil t)
+                           (error "Could not find old_str in %s" path))
+                         (let ((start (match-beginning 0)))
+                           (when (save-excursion
+                                   (goto-char (1+ start)) (search-forward old nil t))
+                             (error "old_str is not unique in %s; add context or use a diff" path)))
+                         ;; Searching for duplicates changes the match data.
+                         (goto-char (point-min)) (search-forward old)
+                         (replace-match new t t))
+                       (setf (plist-get change :after) (buffer-string)))
+                     (list change)))))
+              ("Insert"
+               (let ((line (plist-get args :line_number)) (new (plist-get args :new_str))
+                     (change (gptel-agent-edit--snapshot path t)))
+                 (unless (and (integerp line) (>= line -1) (stringp new))
+                   (error "Insert requires line_number >= -1 and a string new_str"))
+                 (with-temp-buffer
+                   (insert (plist-get change :before))
+                   (if (= line -1) (goto-char (point-max))
+                     (goto-char (point-min)) (forward-line line))
+                   (insert new)
+                   (unless (or (string-suffix-p "\n" new) (eobp)) (insert "\n"))
+                   (setf (plist-get change :after) (buffer-string)))
+                 (list change)))
+              ("Write"
+               (let ((filename (plist-get args :filename)) (content (plist-get args :content)))
+                 (unless (and (stringp filename) (stringp content))
+                   (error "Write requires string filename and content"))
+                 (let ((change (gptel-agent-edit--snapshot (expand-file-name filename path))))
+                   (setf (plist-get change :after) content)
+                   (list change))))
+              (_ (error "Unsupported file tool: %s" name)))))
     (setq changes (cl-remove-if
                    (lambda (c) (equal (plist-get c :before) (plist-get c :after))) changes))
     (unless changes (error "No changes: the proposed content is identical to the original"))
