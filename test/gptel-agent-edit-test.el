@@ -371,12 +371,71 @@ diff --git a/sub/two b/sub/two
                                              "{\"path\":\".\",\"operations\":[{\"operation\":\"replace\",\"path\":\"old\",\"old_str\":\"old\",\"new_str\":\"new\"},{\"operation\":\"write\",\"path\":\"created\",\"content\":\"\"}]}"
                                              :object-type 'plist :false-object :json-false)))
                                  (should (equal (plist-get schema :required) ["path"]))
+                                 (should (= (or (plist-get (plist-get (plist-get schema :properties) :operations) :minItems) 0) 0))
                                  (should (equal (plist-get (plist-get (plist-get (plist-get schema :properties) :operations) :items) :required)
                                                 ["operation" "path"]))
                                  (apply (gptel-tool-function tool)
                                         (mapcar (lambda (arg) (plist-get args (intern (concat ":" (plist-get arg :name))))) (gptel-tool-args tool))))
                                (should (equal (gptel-edit-test--read "old") "new"))
                                (should (file-exists-p "created"))))
+
+(ert-deftest gptel-edit-batch-accepts-empty-top-level-fields-from-json ()
+  ;; Reproduce the call from the failure report, including unused item fields.
+  (gptel-edit-test--with-files '(("one" . "old\n") ("two" . "old\n"))
+    (let* ((args (json-parse-string
+                  "{\"path\":\".\",\"old_str\":\"\",\"new_str\":\"\",\"diff\":false,\"operations\":[{\"operation\":\"replace\",\"path\":\"one\",\"old_str\":\"old\",\"new_str\":\"first\",\"line_number\":0,\"content\":\"\"},{\"operation\":\"replace\",\"path\":\"two\",\"old_str\":\"old\",\"new_str\":\"second\",\"line_number\":0,\"content\":\"\"}]}"
+                  :object-type 'plist :false-object :json-false))
+           (changes (gptel-agent-edit-prepare "Edit" args)))
+      (should (= (length changes) 2))
+      (should (equal (gptel-edit-test--read "one") "old\n"))
+      (should (equal (gptel-edit-test--read "two") "old\n"))
+      (should-not (plist-get (gptel-edit-test--dispatch "Edit" args nil) :error))
+      (dolist (change changes)
+        (should (equal (gptel-edit-test--read (plist-get change :path))
+                       (plist-get change :after)))))))
+
+(ert-deftest gptel-edit-empty-operations-allow-single-edit-modes ()
+  (dolist (empty '(nil []))
+    (dolist (diff '(nil t))
+      (gptel-edit-test--with-files '(("one" . "old\n"))
+        (let* ((args (list :path "one" :old_str (if diff "" "old")
+                           :new_str (if diff "--- one\n+++ one\n@@ -1 +1 @@\n-old\n+new\n" "new")
+                           :diff (if diff t :json-false) :operations empty))
+               (changes (gptel-agent-edit-prepare "Edit" args)))
+          (should (equal (plist-get (car changes) :after) "new\n"))
+          (should-not (plist-get (gptel-edit-test--dispatch "Edit" args nil) :error))
+          (should (equal (gptel-edit-test--read "one") "new\n")))))))
+
+(ert-deftest gptel-edit-batch-rejects-competing-edits-with-recovery-hint ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+    (dolist (fields '((:old_str "old" :new_str "")
+                      (:old_str "" :new_str "new")
+                      (:old_str "" :new_str "" :diff t)))
+      (let ((err (should-error
+                  (gptel-agent-edit-prepare
+                   "Edit" (append (list :path directory :operations
+                                        '[(:operation "delete" :path "one")])
+                                  fields)))))
+        (should (string-match-p (regexp-quote "operations=[]") (error-message-string err)))))
+    ;; A made-up operation must never be silently discarded in single-file mode.
+    (should-error
+     (gptel-agent--edit-files "one" "old" "new" :json-false
+                              '[(:operation "replace" :path "" :old_str "" :new_str "")]))
+    (should (equal (gptel-edit-test--read "one") "old\n"))))
+
+(ert-deftest gptel-edit-fallback-preview-treats-empty-operations-as-single-edit ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+    (cl-letf (((symbol-function 'gptel-agent--confirm-overlay) (lambda (&rest _) nil)))
+      (gptel-agent--edit-files-preview-setup '("one" "old" "new" :json-false []) nil))
+    (should (string-match-p "ReplaceIn" (buffer-string)))
+    (should (equal (gptel-edit-test--read "one") "old\n"))))
+
+(ert-deftest gptel-edit-batch-fallback-preview-rejects-competing-edits ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+    (should-error
+     (gptel-agent--edit-files-preview-setup
+      '("." "old" "new" :json-false [(:operation "delete" :path "one")]) nil))
+    (should (equal (gptel-edit-test--read "one") "old\n"))))
 
 (ert-deftest gptel-edit-batch-fallback-preview-includes-all-changes ()
   (gptel-edit-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))

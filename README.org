@@ -224,6 +224,40 @@ review. Unified diffs can also create/delete files using =/dev/null=.
 Renames, binary files and mode changes remain unsupported. Shell/Elisp side
 effects are not intercepted; use the structured tools for reviewable changes.
 
+Select exactly one =Edit= mode:
+
+- Replacement: file =path=, nonempty =old_str=, literal =new_str= (empty
+  deletes the matched text), and =diff=false=.
+- Unified diff: file or directory =path=, =diff=true=, and the patch in
+  =new_str=. Omit =old_str= or set it to an empty string.
+- Batch: directory =path= and a nonempty =operations= array. Omit top-level
+  =old_str=, =new_str= and =diff=, or set them to =""=, =""= and =false=.
+
+For replacement or unified diff, omit =operations= or use =[]=. Never add
+dummy operations to fill an unused array. Nonempty operations combined with
+top-level replacement text or =diff=true= are rejected before changing files.
+Unused fields within an operation may be omitted; if the model supplies every
+field, use empty strings and =line_number=0= for unused fields.
+
+These examples include every top-level parameter:
+
+#+begin_src json
+{"path":"/project/a.txt","old_str":"old","new_str":"new","diff":false,"operations":[]}
+#+end_src
+
+#+begin_src json
+{
+  "path": "/project",
+  "old_str": "",
+  "new_str": "",
+  "diff": false,
+  "operations": [
+    {"operation":"replace","path":"a.txt","old_str":"old","new_str":"new"},
+    {"operation":"write","path":"b.txt","content":"created\n"}
+  ]
+}
+#+end_src
+
 Preparation and execution share =gptel-agent-edit.el=. Failed patches,
 ambiguous replacements and no-op edits report an error without altering the
 queue or target files. Replacements try exact matching first, then a unique

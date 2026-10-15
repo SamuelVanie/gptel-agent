@@ -394,6 +394,35 @@
     (should (equal (gptel-edit-test--read "created") "FINAL\n"))
     (should (equal (gptel-edit-test--read "empty") ""))))
 
+(ert-deftest gptel-review-edit-default-fields-work-through-prehook ()
+  (dolist (immediate '(nil t))
+    (gptel-review-test--with-files '(("one" . "old\n") ("two" . "old\n"))
+      (let ((gptel-agent-review-apply-immediately immediate))
+        (should-not
+         (plist-get
+          (gptel-review-test--submit
+           "Edit" '(:path "." :old_str "" :new_str "" :diff :json-false
+                          :operations
+                          [(:operation "replace" :path "one" :old_str "old" :new_str "first"
+                                       :line_number 0 :content "")
+                           (:operation "replace" :path "two" :old_str "old" :new_str "second"
+                                       :line_number 0 :content "")]))
+          :error))
+        (should-not
+         (plist-get
+          (gptel-review-test--submit
+           "Edit" '(:path "one" :old_str "first" :new_str "final" :diff :json-false :operations []))
+          :error))
+        (should (= 2 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
+        (should (equal (gptel-edit-test--read "one") (if immediate "final\n" "old\n")))
+        (should (equal (gptel-edit-test--read "two") (if immediate "second\n" "old\n")))
+        (gptel-review-test--in-queue
+          (gptel-agent-review-accept-all)
+          (gptel-agent-review-done))
+        (should (equal (gptel-edit-test--read "one") "final\n"))
+        (should (equal (gptel-edit-test--read "two") "second\n"))
+        (should-not gptel-agent-review--queue)))))
+
 (ert-deftest gptel-review-staged-read-ranges-deletions-and-symlinks ()
   (gptel-review-test--with-files '(("one" . "old\n"))
     (make-symbolic-link "one" "alias")

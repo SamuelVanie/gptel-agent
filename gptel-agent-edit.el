@@ -391,6 +391,13 @@ Each operation sees earlier results.  Return one original/final pair per file."
     (mapcar (lambda (path) (gethash path batch-changes))
             (nreverse paths))))
 
+(defun gptel-agent-edit--batch-p (operations)
+  "Validate OPERATIONS and return non-nil for a nonempty batch.
+Nil (including JSON null) and an empty array select a single edit."
+  (unless (or (listp operations) (vectorp operations))
+    (error "operations must be an array; omit it or use operations=[] for a single edit"))
+  (> (length operations) 0))
+
 (defun gptel-agent-edit-prepare (name args)
   "Return file change plists for tool NAME and argument plist ARGS.
 Each has :path, :before and :after.  Nil content means a missing file;
@@ -398,11 +405,15 @@ an empty string means an existing empty file.  Signal invalid or no-op edits."
   (let* ((path (plist-get args :path)) changes)
     (unless (stringp path) (error "Required argument `path' must be a string"))
     (setq changes
-          (if (and (equal name "Edit") (plist-member args :operations))
+          (if (and (equal name "Edit")
+                   (gptel-agent-edit--batch-p (plist-get args :operations)))
               (progn
-                (when (or (plist-get args :old_str) (plist-get args :new_str)
-                          (eq (plist-get args :diff) t))
-                  (error "Use operations alone; omit top-level old_str, new_str and diff"))
+                ;; Models may fill every optional field.  Empty strings and
+                ;; false are neutral defaults, not competing single-file edits.
+                (unless (and (member (plist-get args :old_str) '(nil ""))
+                             (member (plist-get args :new_str) '(nil ""))
+                             (memq (plist-get args :diff) '(nil :json-false)))
+                  (error "Conflicting Edit modes: for a batch, omit top-level old_str/new_str/diff or use old_str=\"\", new_str=\"\", diff=false; for a single edit, omit operations or use operations=[] (no dummy operations)"))
                 (gptel-agent-edit--prepare-batch path (plist-get args :operations)))
             (pcase name
               ("Edit"

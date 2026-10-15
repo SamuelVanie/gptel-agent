@@ -1268,9 +1268,11 @@ diagnostics."
                (operations (car tail)))
 
     (cond
-     (operations
+     ((gptel-agent-edit--batch-p operations)
       (setq description "BatchEdit")
-      (dolist (change (gptel-agent-edit-prepare "Edit" (list :path path :operations operations)))
+      (dolist (change (gptel-agent-edit-prepare
+                      "Edit" (list :path path :old_str old-str :new_str new-str-or-diff
+                                   :diff diffp :operations operations)))
         (let ((file (plist-get change :path))
               (before (plist-get change :before)) (after (plist-get change :after)))
           (push file files-affected)
@@ -1341,11 +1343,13 @@ Prepare every affected file before writing any of them.  Diff paths are
 relative to a directory PATH; standard a/ and b/ prefixes are accepted.
 In string mode OLD-STR must match uniquely, with case significant.  If exact
 matching fails, tolerate indentation and trailing whitespace on complete lines.
-OPERATIONS instead supplies an ordered mixed batch under directory PATH."
+Nonempty OPERATIONS supplies an ordered mixed batch under directory PATH;
+OLD-STR and NEW-STR-OR-DIFF must then be nil or empty, and DIFFP nil or false.
+Nil or empty OPERATIONS selects a single replacement or unified diff."
   (gptel-agent-edit-apply
    (gptel-agent-edit-prepare
-    "Edit" (append (list :path path :old_str old-str :new_str new-str-or-diff :diff diffp)
-                   (and operations (list :operations operations))))))
+    "Edit" (list :path path :old_str old-str :new_str new-str-or-diff
+                 :diff diffp :operations operations))))
 
 (defun gptel-agent--insert-in-file-preview-setup (arg-values _info)
   "Preview setup for Insert.
@@ -3379,13 +3383,25 @@ with restorable before/after snapshots; run relevant tests/builds with Bash afte
 Address incoming review comments and refusals in subsequent changes. The tool result \
 states whether changes are applied or only staged; only test on-disk changes.
 
-- Batch: set `path` to an existing root directory and supply `operations` to mix \
+- Batch: set `path` to an existing root directory and supply a nonempty `operations` array to mix \
 replacements, patches, insertions, file creation/overwrites and deletions. Paths are relative \
-to the root; operations see earlier results. Omit top-level old_str/new_str/diff.
+to the root; operations see earlier results. Omit top-level old_str/new_str/diff, or use \
+old_str=\"\", new_str=\"\", diff=false if all parameters must be supplied.
 - Replacement: file `path`, unique `old_str` copied from the file, literal `new_str` \
-(empty deletes). Indentation/trailing whitespace differences are tolerated if unique.
-- Unified diff: diff=true, `new_str` with ---/+++ headers and @@ hunks; omit `old_str`. \
+(empty deletes), diff=false. Omit operations or use operations=[]. \
+Indentation/trailing whitespace differences are tolerated if unique.
+- Unified diff: diff=true, `new_str` with ---/+++ headers and @@ hunks; omit `old_str` or use \"\". \
+Omit operations or use operations=[]. \
 Multi-file diffs require a directory `path` and relative headers; a/ and b/ prefixes work.
+
+Never add dummy operations to fill an unused array. Each batch item needs operation/path \
+and these fields: replace: old_str/new_str; patch: new_str; insert: line_number/new_str; \
+write: content (empty creates an empty file); delete: no other fields. Omit unused item \
+fields, or use empty strings and line_number=0 if all fields must be supplied.
+
+Examples (all top-level fields supplied):
+Replacement: {\"path\":\"/project/a.txt\",\"old_str\":\"old\",\"new_str\":\"new\",\"diff\":false,\"operations\":[]}
+Batch: {\"path\":\"/project\",\"old_str\":\"\",\"new_str\":\"\",\"diff\":false,\"operations\":[{\"operation\":\"replace\",\"path\":\"a.txt\",\"old_str\":\"old\",\"new_str\":\"new\"},{\"operation\":\"write\",\"path\":\"b.txt\",\"content\":\"created\"}]}
 
 Text changes only; no renames or permission changes."
  :function #'gptel-agent--edit-files
@@ -3393,22 +3409,22 @@ Text changes only; no renames or permission changes."
            :description "Existing file, or root directory for operations/multi-file diffs. Prefer an absolute path."
            :type string)
          ( :name "old_str"
-           :description "Copy a unique block from the current file, with enough context. Omit for diffs/batches."
+           :description "Replacement: required unique block copied from the current file. For diffs/batches, omit or use an empty string."
            :type string
            :optional t)
          ( :name "new_str"
-           :description "Required without operations: literal replacement (diff=false) or unified diff (diff=true)."
+           :description "Without a nonempty operations array: required literal replacement (empty deletes) or unified diff. For batches, omit or use an empty string."
            :type string
            :optional t)
          ( :name "diff"
-           :description "false for literal replacement; true for unified diff. Omit with operations."
+           :description "true for a top-level unified diff; false for replacement. For batches, omit or use false; select patch within each operation."
            :type boolean
            :optional t)
          ( :name "operations"
-           :description "Ordered mixed batch; use instead of top-level old_str/new_str/diff. One final preview per file."
+           :description "Nonempty array selects batch mode under directory path; top-level old_str/new_str must be omitted or empty, diff omitted or false. For a single replacement/diff, omit or use []; never add dummy operations."
            :type array
            :optional t
-           :minItems 1
+           :minItems 0
            :items
            ( :type object
              :required ["operation" "path"]
@@ -3416,10 +3432,10 @@ Text changes only; no renames or permission changes."
              :properties
              ( :operation (:type string :enum ["replace" "patch" "insert" "write" "delete"])
                :path (:type string :description "Path relative to the root, no ../; patch may use . for all files.")
-               :old_str (:type string :description "replace: required unique block copied from the current file.")
-               :new_str (:type string :description "replace/insert: text; patch: unified diff with ---/+++ and @@ headers.")
-               :line_number (:type integer :minimum -1 :description "insert: after this line; 0 = start, -1 = end. Uses earlier operation results.")
-               :content (:type string :description "write: complete content, possibly empty; creates or overwrites the file.")))))
+               :old_str (:type string :description "replace: required nonempty unique block copied from the current file. Otherwise omit or use an empty string.")
+               :new_str (:type string :description "replace/insert: required text (empty replacement deletes); patch: required unified diff with ---/+++ and @@ headers. Otherwise omit or use an empty string.")
+               :line_number (:type integer :minimum -1 :description "insert: required line to insert after; 0 = start, -1 = end. Uses earlier operation results. Otherwise omit or use 0.")
+               :content (:type string :description "write: required complete content, possibly empty; creates or overwrites the file. Otherwise omit or use an empty string.")))))
  :category "gptel-agent"
  :confirm t
  :include t)
