@@ -8,6 +8,7 @@
   (declare (indent 1))
   `(gptel-edit-test--with-files ,files
      (let ((ediff-window-setup-function #'ediff-setup-windows-plain)
+           (gptel-agent-review-apply-immediately nil)
            outcomes)
        (cl-letf (((symbol-function 'display-buffer) (lambda (&rest _) nil))
                  ((symbol-function 'gptel-agent-review--deliver)
@@ -350,7 +351,7 @@
       (gptel-agent-review-done))
     (should (equal (gptel-edit-test--read "one") "first\nfirst\nnew\n"))
     (should (equal (gptel-edit-test--read "created") "final\n"))
-    (should (= 1 (length outcomes)))
+    (should-not outcomes)
     (should-not gptel-agent-review--queue)
     (should-not (caddar outcomes))))
 
@@ -452,7 +453,7 @@
       (gptel-agent-review-cancel-all))
     (should-not (file-exists-p "new"))))
 
-(ert-deftest gptel-review-idle-feedback-sends-once-and-acceptance-does-not-send ()
+(ert-deftest gptel-review-idle-feedback-sends-once-and-acceptance-creates-nothing ()
   (dolist (revise '(nil t))
     (with-temp-buffer
       (let (sent)
@@ -461,8 +462,38 @@
           (gptel-agent-review--deliver (current-buffer) "Completed review" revise)
           (gptel-agent-review--flush (current-buffer))
           (gptel-agent-review--flush (current-buffer))
-          (should (equal (buffer-string) "\n\nCompleted review\n"))
+          (should (equal (buffer-string) (if revise "\n\nCompleted review\n" "")))
           (should (= (length sent) (if revise 1 0))))))))
+
+(ert-deftest gptel-review-acceptance-does-not-touch-an-active-request ()
+  (with-temp-buffer
+    (let* ((callback #'ignore)
+           (info (list :callback callback :buffer (current-buffer)))
+           (fsm (gptel-make-fsm :state 'WAIT :info info)))
+      (setq-local gptel--fsm-last fsm)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (&rest _) (ert-fail "Acceptance scheduled delivery"))))
+        (gptel-agent-review--deliver (current-buffer) "All changes accepted" nil)
+        (should-not gptel-agent-review--delivery)
+        (should-not gptel-agent-review--delivery-timer)
+        (should (eq (plist-get info :callback) callback))
+        (should-not (plist-get info :agent-review-callback))
+        (should (equal (buffer-string) ""))))))
+
+(ert-deftest gptel-review-stale-acceptance-notices-never-become-prompts ()
+  (with-temp-buffer
+    (let (sent)
+      (cl-letf (((symbol-function 'gptel-send)
+                 (lambda (&rest _) (push (buffer-string) sent))))
+        (setq gptel-agent-review--delivery '(("Old acceptance summary" nil nil)))
+        (gptel-agent-review--flush (current-buffer))
+        (should-not sent)
+        (should (equal (buffer-string) ""))
+        (setq gptel-agent-review--delivery '(("Old acceptance summary" nil nil)
+                                             ("User refused one file" t nil)))
+        (gptel-agent-review--flush (current-buffer))
+        (should (equal sent '("\n\nUser refused one file\n")))
+        (should-not gptel-agent-review--delivery)))))
 
 (ert-deftest gptel-review-feedback-after-final-response-starts-followup ()
   (with-temp-buffer

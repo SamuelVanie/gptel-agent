@@ -121,11 +121,12 @@ File proposals now collect in a separate =*File review: …*= buffer. The tool
 returns immediately, so the agent can continue proposing modifications while
 you review. Open the queue again with =M-x gptel-agent-review= from the
 conversation buffer. Each file has one cumulative diff: its original content
-on the left, its latest staged content on the right. Later proposals for that
+on the left, its latest proposed content on the right. Later proposals for that
 file, including writes, insertions and deletions, update the same entry and
 open Ediff in place. The list shows each file's revision and decision.
 Sub-agent changes join their parent conversation's queue. Different
-conversations have separate queues.
+conversations have separate queues; a file under review cannot be claimed by
+another conversation until its review is finished.
 
 In the review queue:
 
@@ -133,10 +134,10 @@ In the review queue:
 |-----+--------|
 | =RET= | Inspect the selected file's cumulative diff in Ediff |
 | =H= | Send a comment on this file immediately |
-| =r= | Refuse this file's staged changes and send optional feedback |
+| =r= | Restore this file's original contents and send optional feedback |
 | =a= | Explicitly accept all current file revisions |
-| =D= | Finish review and apply accepted file revisions |
-| =C= | Discard all staged changes and notify the agent immediately |
+| =D= | Finish review quietly once every file has a decision |
+| =C= | Restore all original contents and notify the agent immediately |
 | =g= | Refresh the list |
 | =q= | Hide the queue; changes remain pending |
 
@@ -149,41 +150,68 @@ In the Ediff control buffer:
 | =f= | Choose a file by path |
 | =q= | Accept this file's displayed revision and return to the list |
 | =Q= | Hide Ediff without making a decision |
-| =R= | Refuse this file's staged changes and send feedback immediately |
+| =R= | Restore this file's original contents and send feedback immediately |
 | =C= | Cancel the entire queue and finish review |
 | =H= | Send a comment; in A/B include the selected region or current line |
 | =C-]= | Refuse this file and close its Ediff |
 
-Nothing is written until =D=. It requires a decision on every current file
-revision; use =RET= to inspect pending files, or explicitly accept them all
-with =a=. A new change to an accepted file makes it pending again. Open
-comparisons refresh without rebuilding their windows or taking focus.
+By default, proposals are applied to working files immediately, with before/after
+copies saved before writing. Bash commands, tests, builds, =Read=, =Grep= and
+=Glob= can therefore use the proposed changes while you review. The agent is
+instructed to run relevant checks, fix failures and report the results before
+finishing. Bash keeps its normal tool confirmation behavior.
+
+=D= requires a decision on every current file revision; use =RET= to inspect
+pending files, or explicitly accept them all with =a=. A new change to an
+accepted file makes it pending again. Open comparisons refresh without
+rebuilding their windows or taking focus. Accepting everything closes review
+without appending a summary prompt or starting another agent response.
 
 Comments and refusals are submitted immediately, without waiting for =D=.
 An active agent receives feedback at the next completed tool boundary, before
 its next model request. If its response ends without another tool call, the
-feedback starts a follow-up response. An explicitly aborted or failed request
-is not restarted automatically. Active sub-agent authors also receive feedback
+feedback starts a follow-up response. Aborting or failing a request cancels
+feedback already waiting on it; a new comment/refusal afterward still sends
+automatically. Active sub-agent authors also receive feedback
 in their next tool result. Comments retain the displayed revision, filename,
 line range and selected text, even if changes arrive while you type.
 
-A comment leaves the staged content available for the agent to revise. =q=
+A comment leaves the proposed content available for the agent to revise. =q=
 waits for a revision on a file with feedback; =Q= lets you leave its Ediff.
-Refusing a file discards all its cumulative changes, so =Read= returns disk
-content again. Other files remain staged, including files from the same batch.
+Refusing a file restores its pre-review contents, including removing newly
+created files or recreating deleted ones. Other files keep their changes.
 An adjusted proposal for the refused file starts from disk in the same list
-entry. The agent receives completion details when accepted revisions are
-applied. Plain acceptance does not start another response.
+entry. Feedback is sent automatically; there is no draft to edit and submit.
+Restoration checks the whole batch before writing and refuses to overwrite
+later external edits or unsaved buffers. Save or reconcile those edits first.
 
 Preview buffers are read-only. If manually altered, they cannot be accepted;
 close with =Q= and reopen the file to restore the staged comparison.
 
-Later =Edit=, =Insert=, =Write= and =Read= calls see the cumulative staged
-contents, including files created or deleted by earlier proposals. Shell
-commands, tests, =Grep= and =Glob= still see disk contents. A queued tool result
-explicitly says the changes have not been applied. Turning confirmation off
-while a queue exists does not bypass its pending decisions. With confirmation
-nil and no pending queue, file tools apply directly as before.
+To retain the previous staging workflow, set
+=(setq gptel-agent-review-apply-immediately nil)= before starting a new review.
+In that mode only file tools and =Read= see proposals until =D= applies them;
+Bash, tests, =Grep= and =Glob= see the old disk contents. Tool results state
+whether changes are applied or only staged. Changing this setting or turning
+confirmation off during a review does not change that queue's behavior.
+With confirmation nil and no pending queue, file tools apply directly and
+still save history snapshots.
+
+Use =M-x gptel-agent-history= to browse saved batches, =RET= to inspect a file's
+diff, and =r= to restore the selected batch. =M-x gptel-agent-history-restore=
+also lets you choose a snapshot directly. Finish any active review for those
+files first. Restores require files to match that snapshot's after-state;
+restore newer changes first to step back through history. Each restore is
+itself saved, so it can be undone. Originals, proposed versions, encoding and
+file permissions are recorded, including creation and deletion of empty files.
+
+Snapshots live under =gptel-agent-history-directory=, by default a private
+=gptel-agent-history-UID/= directory in the system temporary folder. They
+survive closing conversations and restarting Emacs, but the operating system
+may clean temporary files. Set this variable to a permanent directory for
+long-term retention. Closing a conversation leaves applied changes on disk;
+use history to restore them later. History covers changes through file tools,
+not arbitrary side effects of Bash commands or external programs.
 
 =Edit= accepts string replacements, unified diffs, or an =operations= array
 with =path= set to an existing root directory. Operations can mix =replace=,

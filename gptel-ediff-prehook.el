@@ -302,7 +302,7 @@ Updates reuse the same buffers and control window; no recursive edit is used."
     (smv/gptel-ediff--view-control view)))
 
 (defun smv/gptel-ediff-tool-call (plist)
-  "Stage file tool PLIST without waiting for review, or read staged content.
+  "Prepare file tool PLIST without waiting for review, or read staged content.
 Return an immediate :result so gptel can continue with more proposals."
   (let* ((name (plist-get plist :name))
          (owner (gptel-agent-review--owner (plist-get plist :buffer)))

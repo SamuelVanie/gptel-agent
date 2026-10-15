@@ -11,6 +11,9 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+(declare-function gptel-agent-history--record "gptel-agent-history" (changes))
+(declare-function gptel-agent-history--complete "gptel-agent-history" (directory))
+
 (defvar gptel-agent-edit--staged-changes nil
   "Dynamically bound table of file changes while preparing proposals.
 Keys are canonical paths; values retain the original :before and latest :after.")
@@ -455,14 +458,20 @@ an empty string means an existing empty file.  Signal invalid or no-op edits."
           (write-region (point-min) (point-max) path nil 'silent)))
       (when (plist-get change :modes) (set-file-modes path (plist-get change :modes))))))
 
+(defun gptel-agent-edit-validate (changes)
+  "Check CHANGES against disk, including unsaved visiting buffers."
+  (let (gptel-agent-edit--staged-changes)
+    (dolist (change changes)
+      (let ((current (gptel-agent-edit--snapshot (plist-get change :path))))
+        (unless (equal (plist-get current :before) (plist-get change :before))
+          (error "File changed since preview; review again: %s" (plist-get change :path)))))))
+
 (defun gptel-agent-edit-apply (changes)
-  "Apply prepared CHANGES after verifying every original is still current.
+  "Snapshot and apply CHANGES after verifying every original is current.
 Refresh unmodified visiting buffers.  Restore originals on a write error."
-  (dolist (change changes)
-    (let ((current (gptel-agent-edit--snapshot (plist-get change :path))))
-      (unless (equal (plist-get current :before) (plist-get change :before))
-        (error "File changed since preview; review again: %s" (plist-get change :path)))))
-  (let (written)
+  (require 'gptel-agent-history)
+  (gptel-agent-edit-validate changes)
+  (let ((snapshot (gptel-agent-history--record changes)) written)
     (condition-case err
         (dolist (change changes)
           (push change written)
@@ -474,9 +483,10 @@ Refresh unmodified visiting buffers.  Restore originals on a write error."
                (gptel-agent-edit--write change (plist-get change :before))
              (error (push (error-message-string restore-error) failures))))
          (if failures
-             (error "%s; restoring originals also failed: %s"
-                    (error-message-string err) (string-join failures "; "))
-           (signal (car err) (cdr err)))))))
+             (error "%s; restoring originals also failed: %s; recover from snapshots in %s"
+                    (error-message-string err) (string-join failures "; ") snapshot)
+           (signal (car err) (cdr err))))))
+    (gptel-agent-history--complete snapshot))
   (dolist (change changes)
     (when-let* ((buffer (find-buffer-visiting (plist-get change :path))))
       (with-current-buffer buffer

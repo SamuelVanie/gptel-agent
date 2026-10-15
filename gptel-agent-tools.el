@@ -3211,6 +3211,9 @@ Use the provided file tools instead: `Read`, `Write`, `Edit`, \
 - Use absolute paths instead of cd when possible
 - For parallel commands, make multiple `Bash` calls in one message
 - Run tests, check your work or otherwise close the loop to verify changes you make.
+- File-tool results say whether proposals are already on disk. When applied, run \
+the relevant tests/build immediately, even while review remains open. Report failures \
+and fix them before finishing; rerun checks after revisions or refusals.
 
 EXAMPLES:
 - List files with details: 'ls -lah /path/to/dir'
@@ -3371,9 +3374,10 @@ too."
  :name "Edit"
  :description
  "Edit text files. Read existing files first. With confirmation enabled, proposals update \
-one cumulative diff per file without blocking; later edits and Read see staged content. \
-Address incoming review comments and refusals in subsequent changes. Staged does not \
-mean applied: wait for review completion before testing files on disk.
+one cumulative diff per file without blocking. By default changes are applied immediately \
+with restorable before/after snapshots; run relevant tests/builds with Bash after editing. \
+Address incoming review comments and refusals in subsequent changes. The tool result \
+states whether changes are applied or only staged; only test on-disk changes.
 
 - Batch: set `path` to an existing root directory and supply `operations` to mix \
 replacements, patches, insertions, file creation/overwrites and deletions. Paths are relative \
@@ -3427,8 +3431,8 @@ Text changes only; no renames or permission changes."
 Use this tool for purely additive actions: adding text to a file at a \
 specific location with no changes to the surrounding context.
 With confirmation enabled, this updates the file's cumulative review and returns immediately. \
-Later edits and Read see staged content. Address incoming review feedback; files on disk \
-change only when review is done."
+By default changes are applied with restorable snapshots, so Bash can test them during review. \
+Address review feedback and rerun relevant tests. The result states whether changes are applied or only staged."
  :function #'gptel-agent--insert-in-file
  :args '(( :name "path"
            :description "Path of file to edit."
@@ -3449,8 +3453,8 @@ change only when review is done."
  :name "Write"
  :description "Create or overwrite a text file with complete content.
 With confirmation enabled, this updates the file's cumulative review and returns immediately. \
-Later edits and Read see staged content. Address incoming review feedback; files on disk \
-change only when review is done."
+By default changes are applied with restorable snapshots, so Bash can test them during review. \
+Address review feedback and rerun relevant tests. The result states whether changes are applied or only staged."
  :function #'gptel-agent--write-file
  :args (list '( :name "path"
                 :type "string"

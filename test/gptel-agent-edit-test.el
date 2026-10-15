@@ -16,6 +16,7 @@
   (declare (indent 1))
   `(with-temp-buffer
      (let* ((directory (make-temp-file "gptel-edit-test-" t))
+            (gptel-agent-history-directory (expand-file-name "history/" directory))
             (default-directory (file-name-as-directory directory)))
        (unwind-protect
            (progn
