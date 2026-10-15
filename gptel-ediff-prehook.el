@@ -26,7 +26,7 @@
   "Key bound in the ediff control buffer to reject the proposed change.")
 
 (defvar smv/gptel-ediff-comment-key "H"
-  "Key bound in ediff review buffers to add a region-specific rejection comment.")
+  "Key bound in Ediff review buffers to send a region-specific comment.")
 
 (defvar-local smv/gptel-ediff-review-mode nil
   "Buffer-local flag enabling temporary gptel ediff review bindings.")
@@ -100,7 +100,7 @@ If none exists, split one off the frame root."
 
 
 (cl-defstruct (smv/gptel-ediff--view (:constructor smv/gptel-ediff--make-view))
-  queue file original proposed control revision before after config closing)
+  queue file original proposed control revision before after config closing updating)
 
 (defun smv/gptel-ediff--fill (buffer text)
   "Replace preview BUFFER with TEXT, retaining its approximate line position."
@@ -108,8 +108,8 @@ If none exists, split one off the frame root."
     (let ((line (line-number-at-pos)) (column (current-column)) (inhibit-read-only t))
       (save-restriction
         (widen)
-        (erase-buffer)
-        (insert (or text ""))
+        ;; Preserve window starts, marks and unchanged regions while updating.
+        (replace-region-contents (point-min) (point-max) (lambda () (or text "")))
         (goto-char (point-min))
         (forward-line (1- line))
         (move-to-column column))
@@ -149,18 +149,33 @@ If none exists, split one off the frame root."
   "Refresh QUEUE's active Ediff when the file's cumulative revision changes."
   (when-let* ((view (gptel-agent-review--queue-view queue))
               (control (smv/gptel-ediff--view-control view))
-              ((buffer-live-p control)))
+              ((buffer-live-p control))
+              ((not (smv/gptel-ediff--view-updating view))))
     (let ((file (smv/gptel-ediff--view-file view)))
-      (unless (= (smv/gptel-ediff--view-revision view) (plist-get file :revision))
-        (smv/gptel-ediff--validate-view view)
-        (save-selected-window
-          (smv/gptel-ediff--fill (smv/gptel-ediff--view-original view) (plist-get file :before))
-          (smv/gptel-ediff--fill (smv/gptel-ediff--view-proposed view) (plist-get file :after))
-          (with-current-buffer control
-            (let ((ediff-diff-options "")) (ediff-update-diffs))))
-        (setf (smv/gptel-ediff--view-revision view) (plist-get file :revision)
-              (smv/gptel-ediff--view-before view) (plist-get file :before)
-              (smv/gptel-ediff--view-after view) (plist-get file :after)))
+      (setf (smv/gptel-ediff--view-updating view) t)
+      (unwind-protect
+          ;; Diff subprocesses can run callbacks that enqueue another revision.
+          ;; Finish each snapshot before recomputing the most recent one.
+          (while (/= (smv/gptel-ediff--view-revision view) (plist-get file :revision))
+            (smv/gptel-ediff--validate-view view)
+            (let ((revision (plist-get file :revision))
+                  (before (plist-get file :before)) (after (plist-get file :after))
+                  (recenter (symbol-function 'ediff-recenter)))
+              (save-selected-window
+                (unless (equal before (smv/gptel-ediff--view-before view))
+                  (smv/gptel-ediff--fill (smv/gptel-ediff--view-original view) before))
+                (smv/gptel-ediff--fill (smv/gptel-ediff--view-proposed view) after)
+                ;; Recompute overlays without Ediff rebuilding the window layout.
+                (cl-letf (((symbol-function 'ediff-recenter)
+                           (lambda (&rest args)
+                             (unless (eq (current-buffer) control)
+                               (apply recenter args)))))
+                  (with-current-buffer control
+                    (let ((ediff-diff-options "")) (ediff-update-diffs)))))
+              (setf (smv/gptel-ediff--view-revision view) revision
+                    (smv/gptel-ediff--view-before view) before
+                    (smv/gptel-ediff--view-after view) after)))
+        (setf (smv/gptel-ediff--view-updating view) nil))
       (smv/gptel-ediff--headers view))))
 
 (defun smv/gptel-ediff--destroy (view)
@@ -270,7 +285,8 @@ Updates reuse the same buffers and control window; no recursive edit is used."
             (smv/gptel-ediff--buffer-local-set-key
              smv/gptel-ediff-comment-key
              (lambda () (interactive)
-               (gptel-agent-review--comment queue file (read-string "Review comment: "))))
+               (let ((revision (smv/gptel-ediff--view-revision view)))
+                 (gptel-agent-review--comment queue file (read-string "Review comment: ") nil revision))))
             (when (> ediff-number-of-differences 0)
               (ediff-jump-to-difference (1+ (max 0 (min (plist-get file :hunk) (1- ediff-number-of-differences)))))))
           (dolist (pair (list (cons (smv/gptel-ediff--view-original view) "original file")

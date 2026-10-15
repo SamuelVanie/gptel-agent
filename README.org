@@ -120,21 +120,25 @@ prehook to avoid overriding the bundled implementation.
 File proposals now collect in a separate =*File review: …*= buffer. The tool
 returns immediately, so the agent can continue proposing modifications while
 you review. Open the queue again with =M-x gptel-agent-review= from the
-conversation buffer. Each tool call is one proposal; =Edit= with =operations=
-is one proposal containing multiple files. Sub-agent proposals join their
-parent conversation's queue. Different conversations have separate queues.
+conversation buffer. Each file has one cumulative diff: its original content
+on the left, its latest staged content on the right. Later proposals for that
+file, including writes, insertions and deletions, update the same entry and
+open Ediff in place. The list shows each file's revision and decision.
+Sub-agent changes join their parent conversation's queue. Different
+conversations have separate queues.
 
 In the review queue:
 
 | Key | Action |
 |-----+--------|
-| =RET= | Inspect the selected proposal in Ediff |
-| =r= | Cancel the selected proposal, with optional feedback |
-| =a= | Mark all remaining proposals accepted |
-| =D= | Mark review done: apply accepted proposals and deliver feedback |
-| =C= | Cancel all proposals and finish without applying any |
+| =RET= | Inspect the selected file's cumulative diff in Ediff |
+| =H= | Send a comment on this file immediately |
+| =r= | Refuse this file's staged changes and send optional feedback |
+| =a= | Explicitly accept all current file revisions |
+| =D= | Finish review and apply accepted file revisions |
+| =C= | Discard all staged changes and notify the agent immediately |
 | =g= | Refresh the list |
-| =q= | Hide the queue; proposals remain pending |
+| =q= | Hide the queue; changes remain pending |
 
 In the Ediff control buffer:
 
@@ -143,26 +147,36 @@ In the Ediff control buffer:
 | =n= / =p= | Next / previous change in this file |
 | =N= / =P= | Next / previous file, keeping the current change position |
 | =f= | Choose a file by path |
-| =q= | Accept this proposal after visiting its files; with comments, request revision |
-| =R= | Cancel this proposal and record feedback |
+| =q= | Accept this file's displayed revision and return to the list |
+| =Q= | Hide Ediff without making a decision |
+| =R= | Refuse this file's staged changes and send feedback immediately |
 | =C= | Cancel the entire queue and finish review |
-| =H= | Add feedback for the region or current line in original/proposed buffer |
-| =C-]= | Cancel this proposal's review |
+| =H= | Send a comment; in A/B include the selected region or current line |
+| =C-]= | Refuse this file and close its Ediff |
 
-Nothing is written, and no review feedback is sent, until =D= (or =C=).
-=D= requires a decision on every proposal currently in the queue; use =RET=
-to inspect pending proposals, or explicitly accept them all with =a=.
-New proposals arriving during Ediff remain pending for a later decision.
-Comments retain filenames and line ranges. Preview buffers are snapshots;
-editing them invalidates the proposal.
+Nothing is written until =D=. It requires a decision on every current file
+revision; use =RET= to inspect pending files, or explicitly accept them all
+with =a=. A new change to an accepted file makes it pending again. Open
+comparisons refresh without rebuilding their windows or taking focus.
 
-Cancelling a proposal also cancels later proposals that modify any of its
-files, including transitive dependencies. This conservative rule prevents
-later edits from restoring rejected content. Other proposals can still be
-accepted. On completion, the agent receives the accepted/cancelled proposal
-IDs and feedback. Feedback reaches an active request at its next tool boundary;
-if the response has already finished, revision feedback starts a follow-up.
-Plain acceptance records the outcome without starting another response.
+Comments and refusals are submitted immediately, without waiting for =D=.
+An active agent receives feedback at the next completed tool boundary, before
+its next model request. If its response ends without another tool call, the
+feedback starts a follow-up response. An explicitly aborted or failed request
+is not restarted automatically. Active sub-agent authors also receive feedback
+in their next tool result. Comments retain the displayed revision, filename,
+line range and selected text, even if changes arrive while you type.
+
+A comment leaves the staged content available for the agent to revise. =q=
+waits for a revision on a file with feedback; =Q= lets you leave its Ediff.
+Refusing a file discards all its cumulative changes, so =Read= returns disk
+content again. Other files remain staged, including files from the same batch.
+An adjusted proposal for the refused file starts from disk in the same list
+entry. The agent receives completion details when accepted revisions are
+applied. Plain acceptance does not start another response.
+
+Preview buffers are read-only. If manually altered, they cannot be accepted;
+close with =Q= and reopen the file to restore the staged comparison.
 
 Later =Edit=, =Insert=, =Write= and =Read= calls see the cumulative staged
 contents, including files created or deleted by earlier proposals. Shell
@@ -178,7 +192,7 @@ has an =operation= name and a =path= relative to the root, plus the fields it
 needs: =old_str=/=new_str= for replacement, =new_str= for a patch,
 =line_number=/=new_str= for insertion, or =content= for writing. Operations
 run in order, with one original/final comparison per affected file in the
-proposal. Unified diffs can also create/delete files using =/dev/null=.
+review. Unified diffs can also create/delete files using =/dev/null=.
 Renames, binary files and mode changes remain unsupported. Shell/Elisp side
 effects are not intercepted; use the structured tools for reviewable changes.
 

@@ -3370,9 +3370,10 @@ too."
 (gptel-make-tool
  :name "Edit"
  :description
- "Edit text files. Read existing files first. With confirmation enabled, proposals queue \
-for review without blocking; later edits and Read see staged content. Queued does not \
-mean applied: wait for the completed review outcome before testing files on disk.
+ "Edit text files. Read existing files first. With confirmation enabled, proposals update \
+one cumulative diff per file without blocking; later edits and Read see staged content. \
+Address incoming review comments and refusals in subsequent changes. Staged does not \
+mean applied: wait for review completion before testing files on disk.
 
 - Batch: set `path` to an existing root directory and supply `operations` to mix \
 replacements, patches, insertions, file creation/overwrites and deletions. Paths are relative \
@@ -3425,8 +3426,9 @@ Text changes only; no renames or permission changes."
 
 Use this tool for purely additive actions: adding text to a file at a \
 specific location with no changes to the surrounding context.
-With confirmation enabled, this queues a proposal and returns immediately. Later \
-edits and Read see staged content; files on disk change only when review is done."
+With confirmation enabled, this updates the file's cumulative review and returns immediately. \
+Later edits and Read see staged content. Address incoming review feedback; files on disk \
+change only when review is done."
  :function #'gptel-agent--insert-in-file
  :args '(( :name "path"
            :description "Path of file to edit."
@@ -3446,8 +3448,9 @@ edits and Read see staged content; files on disk change only when review is done
 (gptel-make-tool
  :name "Write"
  :description "Create or overwrite a text file with complete content.
-With confirmation enabled, this queues a proposal and returns immediately. Later \
-edits and Read see staged content; files on disk change only when review is done."
+With confirmation enabled, this updates the file's cumulative review and returns immediately. \
+Later edits and Read see staged content. Address incoming review feedback; files on disk \
+change only when review is done."
  :function #'gptel-agent--write-file
  :args (list '( :name "path"
                 :type "string"

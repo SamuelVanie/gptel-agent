@@ -84,8 +84,23 @@
          (existing (buffer-local-value 'gptel-agent-review--queue owner))
          (queue (or existing (gptel-agent-review--make-queue :owner owner)))
          (gptel-agent-edit--staged-changes (gptel-agent-review--staged queue))
+         (versions (mapcar (lambda (file)
+                             (list (plist-get file :path) (plist-get file :revision)
+                                   (plist-get file :status)))
+                           (gptel-agent-review--queue-files queue)))
          ;; Prepare every operation before changing any existing review entry.
          (changes (gptel-agent-edit-prepare name args)))
+    ;; Patch subprocesses may run another tool callback or a review decision.
+    ;; Never overwrite a newer revision or silently restore a refused snapshot.
+    (unless (eq existing (buffer-local-value 'gptel-agent-review--queue owner))
+      (error "File review changed while preparing edits; reread staged files and retry"))
+    (dolist (change changes)
+      (let* ((path (plist-get change :path))
+             (file (cl-find path (gptel-agent-review--queue-files queue)
+                            :key (lambda (f) (plist-get f :path)) :test #'equal)))
+        (unless (equal (cdr (assoc path versions))
+                       (and file (list (plist-get file :revision) (plist-get file :status))))
+          (error "Review changed while preparing %s; reread the file and address current feedback before retrying" path))))
     (dolist (change changes)
       (let* ((path (plist-get change :path))
              (file (cl-find path (gptel-agent-review--queue-files queue)
@@ -311,20 +326,50 @@
 (defun gptel-agent-review--post-tool (call)
   "Attach immediate review feedback to a sub-agent's next tool CALL result."
   (when gptel-agent-review--tool-feedback
-    (prog1 (list :result (concat (plist-get call :result) "\n\n"
+    (prog1 (list :result (concat (gptel--to-string (plist-get call :result)) "\n\n"
                                 (mapconcat #'identity gptel-agent-review--tool-feedback "\n\n")))
       (setq gptel-agent-review--tool-feedback nil))))
+
+(defun gptel-agent-review--live-p (fsm)
+  "Return non-nil when FSM is still running."
+  (and fsm (not (memq (gptel-fsm-state fsm) '(DONE ABRT ERRS)))))
+
+(defun gptel-agent-review--steer (owner fsm)
+  "Send OWNER's review input after FSM has appended all its tool results.
+Keep review input separate from gptel's interactive steering slot, which
+can be replaced or relocated by the user while a response is running."
+  (when (buffer-live-p owner)
+    (with-current-buffer owner
+      (let ((entries (cl-remove-if-not
+                      (lambda (entry) (eq (nth 2 entry) fsm))
+                      gptel-agent-review--delivery)))
+        (when entries
+          (let* ((info (gptel-fsm-info fsm))
+                 (text (mapconcat #'car entries "\n\n")))
+            (gptel--inject-prompt
+             (plist-get info :backend) (plist-get info :data)
+             (gptel--parse-list (plist-get info :backend) (list text)))
+            (setq gptel-agent-review--delivery
+                  (cl-set-difference gptel-agent-review--delivery entries :test #'eq))
+            (when (eq (plist-get info :reasoning-block) 'in)
+              (funcall (plist-get info :callback) '(reasoning . t) info))
+            (funcall (plist-get info :callback) (concat "\n" text "\n") info 'raw)))))))
 
 (defun gptel-agent-review--deliver (owner text revise)
   "Deliver TEXT to OWNER once; REVISE requests a follow-up model response."
   (with-current-buffer owner
-    (let ((fsm (and (gptel--fsm-live-p gptel--fsm-last) gptel--fsm-last)))
-      (when fsm
-        ;; gptel handles steering at a tool boundary, after all tool results.
-        (let ((info (gptel-fsm-info fsm)))
-          (setf (gptel-fsm-info fsm)
-                (plist-put info :steering-message
-                           (append (ensure-list (plist-get info :steering-message)) (list text))))))
+    (let ((fsm (and (gptel-agent-review--live-p gptel--fsm-last) gptel--fsm-last)))
+      (when (and fsm (not (plist-get (gptel-fsm-info fsm) :agent-review-callback)))
+        ;; The tool-result callback runs after results enter the request and
+        ;; before its next transition.  Appending user input here preserves
+        ;; tool-call/result ordering, without depending on a TSTR state.
+        (let* ((info (gptel-fsm-info fsm)) (callback (plist-get info :callback)))
+          (setf (gptel-fsm-info fsm) (plist-put info :agent-review-callback t))
+          (setf (plist-get (gptel-fsm-info fsm) :callback)
+                (lambda (response info &rest args)
+                  (prog1 (apply callback response info args)
+                    (when (eq (car-safe response) 'tool-result)
+                      (gptel-agent-review--steer owner fsm)))))))
       (setq gptel-agent-review--delivery
             (append gptel-agent-review--delivery (list (list text revise fsm)))))
     (gptel-agent-review--schedule-delivery)))
@@ -341,19 +386,12 @@
   (when (buffer-live-p owner)
     (with-current-buffer owner
       (setq gptel-agent-review--delivery-timer nil)
-      (unless (gptel--fsm-live-p gptel--fsm-last)
+      (unless (gptel-agent-review--live-p gptel--fsm-last)
         (let (texts revise)
           (dolist (entry gptel-agent-review--delivery)
-            (pcase-let ((`(,text ,retry ,fsm) entry))
-              ;; If steering already consumed this outcome, do not repeat it.
-              (when (or (null fsm)
-                        (member text (ensure-list (plist-get (gptel-fsm-info fsm) :steering-message))))
-                (when fsm
-                  (let ((info (gptel-fsm-info fsm)))
-                    (setf (plist-get info :steering-message)
-                          (delete text (ensure-list (plist-get info :steering-message))))))
-                (push text texts)
-                (setq revise (or revise retry)))))
+            (pcase-let ((`(,text ,retry ,_fsm) entry))
+              (push text texts)
+              (setq revise (or revise retry))))
           (when texts
             (let ((inhibit-read-only t) beg)
               (save-excursion
