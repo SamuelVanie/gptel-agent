@@ -274,6 +274,60 @@ leave the queue available for cancellation or retry. Unmodified visiting
 buffers refresh after acceptance. Killing the conversation discards its queue;
 hiding or killing only the review list does not discard proposals.
 
+*** Background commands
+
+=Bash= normally waits for a command to finish. Set =background= to =true=
+for servers, watchers or long builds. It immediately returns a =process_id=,
+leaving the agent free to run other commands and inspect output later:
+
+#+begin_src json
+{"command":"npm run start","query":"Report the server URL or startup errors","background":true}
+#+end_src
+
+The =Process= tool manages these jobs using the returned ID:
+
+#+begin_src json
+{"action":"list"}
+{"action":"read","process_id":"bash-1"}
+{"action":"send","process_id":"bash-1","input":"yes\n"}
+{"action":"interrupt","process_id":"bash-1"}
+{"action":"kill","process_id":"bash-1"}
+{"action":"remove","process_id":"bash-1"}
+#+end_src
+
+=list= shows running and completed background jobs, their commands, working
+directories and status. =read= returns available stdout and stderr immediately,
+consuming unread output by default. Optional =offset= replays from an absolute
+character position without changing the unread cursor; =max_chars= limits a
+read to 1–20000 characters (default 12000). Results include =next_offset= and
+=output_end=. The unread cursor is shared by the chat and its sub-agents.
+
+Each job retains the most recent =gptel-agent-process-output-limit= characters
+(default 200000). Older output is discarded and a read reports any missing
+range. Redirect output to a file in the command if you need a complete durable
+log. Completed jobs retain their status and output until =remove= or chat
+cleanup. Ordinary foreground Bash output keeps its existing full-result
+persistence behavior.
+
+Jobs belong to the originating conversation buffer, including jobs started by
+its sub-agents. They survive later turns, request cancellation and sub-agent
+completion. Another chat cannot look up or control them through =Process=.
+Killing the conversation buffer kills its running jobs and releases their
+output; jobs are not restored after an Emacs restart. This ownership is a tool
+management boundary, not an OS sandbox: Bash still has normal shell access.
+
+Use =interrupt= for SIGINT, then =kill= for SIGKILL if needed; both target the
+job's process group, including ordinary child processes. Keep commands in the
+foreground of the managed shell: do not append =&=, use =nohup= or daemonize.
+Detached descendants are outside this lifecycle. Input uses pipes, so terminal
+UI programs and shell job control are not supported. Some programs buffer
+output when connected to a pipe. Remote process support depends on the Emacs
+file handler. Sending input follows normal tool confirmation; reading,
+listing and stopping owned jobs need no tool-specific confirmation.
+
+The default agent and executor include =Process=. Custom agents using
+background Bash should add =Process= to their tools as well.
+
 *** What is an "agent"?
 
 "Agent" is the (now common) parlance used to refer to a bundle of configuration,

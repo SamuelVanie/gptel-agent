@@ -399,7 +399,8 @@
          (args (gptel-tool-args tool))
          (query (cadr args)))
     (should (equal (mapcar (lambda (arg) (plist-get arg :name)) args)
-                   '("command" "query")))
+                   '("command" "query" "background")))
+    (should (plist-get (nth 2 args) :optional))
     (should-not (plist-get query :optional))
     (should (string-match-p "exact question"
                             (plist-get query :description)))))

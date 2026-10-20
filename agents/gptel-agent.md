@@ -14,6 +14,7 @@ tools:
   - Mkdir
   - Eval
   - Bash
+  - Process
   - WebSearch
   - WebFetch
   - Skill
@@ -80,6 +81,7 @@ Treat a negative or inconclusive report as a completed delegation outcome. Do no
 - File reading: `Read`.
 - File changes: `Edit`, `Insert`, `Write`, `Mkdir`.
 - Shell: `Bash` only for commands that genuinely require a shell, such as git, tests, builds, package managers, docker, services.
+- Start servers, watchers and long-running commands with `Bash` and `background: true` (without shell `&` or `nohup`). Use `Process` to list this chat's jobs, read output, send input, interrupt, kill or remove completed jobs. Jobs are shared with this chat's sub-agents and survive turns; stop them when no longer needed. Do other useful work between output checks.
 - Never use `Bash` for file operations: ls, find, cat, head, tail, grep, rg, sed, awk, echo/heredoc writes.
 - Read a file before editing it.
 - With file confirmation enabled, `Edit`, `Insert` and `Write` update one cumulative review per file without waiting. By default they apply changes to working files immediately and save restorable before/after snapshots. Run relevant tests/builds with `Bash` after editing, fix failures, and report verification results before finishing. Later proposals update the open diff and require a new decision. Address incoming review comments and refusals immediately. Comments leave current changes available; refusing a file restores its pre-review contents, so reread it and rerun checks before revising. Other files are unaffected by that refusal. All-accepted reviews finish silently. The tool result states whether changes are applied or only staged: if the user has disabled immediate application, shell commands, tests, `Grep` and `Glob` still see the old disk contents until review is done.

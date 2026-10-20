@@ -22,7 +22,8 @@
 
 ;; Adds the following gptel tools.
 ;; System:
-;; - "Bash"           : Execute a Bash command.
+;; - "Bash"           : Execute a Bash command, optionally in the background.
+;; - "Process"        : Manage this conversation's background shell jobs.
 ;;
 ;; Web:
 ;; - "WebSearch" : Search the web for the first five results to a query.
@@ -47,6 +48,7 @@
 (require 'url-http)
 (require 'cl-lib)
 (require 'gptel-agent-edit)
+(require 'gptel-agent-process)
 
 (declare-function org-escape-code-in-region "org-src")
 (declare-function gptel-agent--cached-read-file "gptel-agent")
@@ -488,6 +490,15 @@ Each entry is a plist with at least :name, :args and :signature.")
   "Pre-tool-call hook that detects repeated calls and initiates recovery.
 
 TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
+  ;; Polling a live job can produce new evidence with identical arguments.
+  ;; Do not feed these reads into the repetition/cycle detector.
+  (unless (and (equal (plist-get tool-call-info :name) "Process")
+               (member (plist-get (plist-get tool-call-info :args) :action)
+                       '("list" "read")))
+    (gptel-agent--detect-repeated-call tool-call-info)))
+
+(defun gptel-agent--detect-repeated-call (tool-call-info)
+  "Apply repetition and budget checks to TOOL-CALL-INFO."
   (let* ((name (plist-get tool-call-info :name))
          (args (plist-get tool-call-info :args))
          (key (cons name args))
@@ -674,9 +685,6 @@ properties persist through refontification."
 ;; The command will be executed in the current working directory. Output is
 ;; returned as a string. Oversized output is saved with a bounded preview."
 
-;; - Can run commands in background with `run_in_background: true`
-;; - Default timeout is 2 minutes (120000ms), max is 10 minutes
-
 (defun gptel-agent--eval-elisp-preview-setup (arg-values _info)
   "Setup preview overlay for Elisp evaluation tool call.
 
@@ -705,7 +713,7 @@ ARG-VALUES is the list of arguments for the tool call."
      "(" (propertize "Bash" 'font-lock-face 'font-lock-keyword-face)
      " in " (propertize (abbreviate-file-name default-directory)
                         'font-lock-face 'font-lock-string-face)
-     ")\n")
+     (if (eq (nth 2 arg-values) t) " background)\n" ")\n"))
     (setq inner-from (point))
     (insert command)
     (gptel-agent--fontify-block 'sh-mode inner-from (point))
@@ -714,40 +722,54 @@ ARG-VALUES is the list of arguments for the tool call."
      inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
     (gptel-agent--confirm-overlay from (point) t)))
 
-(defun gptel-agent--execute-bash (callback command query)
+(defun gptel-agent--execute-bash (callback command query &optional background)
   "Execute COMMAND asynchronously in bash and call CALLBACK with output.
 
 CALLBACK is called with the command output string when the process finishes.
 COMMAND is the bash command string to execute.  QUERY states what should be
-extracted from the result if it is too large to return directly."
+extracted from the result if it is too large to return directly.
+When BACKGROUND is t, return a session-owned job ID immediately."
   (unless (and (stringp query)
                (not (string-empty-p (string-trim query))))
     (error "QUERY must state what should be extracted from Bash output"))
-  (let* ((output-buffer (generate-new-buffer " *gptel-agent-bash*"))
-         (proc (make-process
-                :name "gptel-agent-bash"
-                :buffer output-buffer
-                :command (list "bash" "-c" command)
-                :connection-type 'pipe
-                :file-handler t
-                :sentinel
-                (lambda (process _event)
-                  (when (memq (process-status process) '(exit signal))
-                    (let* ((exit-code (process-exit-status process))
-                           (raw-output
-                            (with-current-buffer (process-buffer process)
-                              (buffer-string)))
-                           (output
-                            (if (zerop exit-code)
-                                raw-output
-                              (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
-                                      exit-code raw-output))))
-                      (kill-buffer (process-buffer process))
-                      (with-temp-buffer
-                        (insert output)
-                        (gptel-agent--truncate-buffer "bash" nil query)
-                        (funcall callback (buffer-string)))))))))
-    proc))
+  (unless (memq background '(nil t :json-false))
+    (error "background must be a boolean"))
+  (if (eq background t)
+      (let* ((process (gptel-agent--start-background-process command))
+             (job (process-get process 'gptel-agent-job)))
+        (funcall callback
+                 (concat (gptel-agent--process-summary job)
+                         "Use Process to read output, send input, interrupt or kill this job.\n"))
+        process)
+    (let* ((source (current-buffer))
+           (output-buffer (generate-new-buffer " *gptel-agent-bash*"))
+           (proc (make-process
+                  :name "gptel-agent-bash"
+                  :buffer output-buffer
+                  :command (list "bash" "-c" command)
+                  :connection-type 'pipe
+                  :file-handler t
+                  :sentinel
+                  (lambda (process _event)
+                    (when (memq (process-status process) '(exit signal))
+                      (let* ((exit-code (process-exit-status process))
+                             (raw-output
+                              (with-current-buffer (process-buffer process)
+                                (buffer-string)))
+                             (output
+                              (if (zerop exit-code)
+                                  raw-output
+                                (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
+                                        exit-code raw-output))))
+                        (kill-buffer (process-buffer process))
+                        (with-temp-buffer
+                          (insert output)
+                          (gptel-agent--truncate-buffer "bash" nil query)
+                          (let ((result (buffer-string)))
+                            (when (buffer-live-p source)
+                              (with-current-buffer source
+                                (funcall callback result)))))))))))
+      proc)))
 
 ;;; Web tools
 
@@ -3243,6 +3265,10 @@ Use the provided file tools instead: `Read`, `Write`, `Edit`, \
 - Chain dependent commands with && (or ; if failures are OK)
 - Use absolute paths instead of cd when possible
 - For parallel commands, make multiple `Bash` calls in one message
+- For servers, watchers or long jobs, set background=true. This returns a \
+session-owned process_id immediately; use `Process` to read output, send input, \
+interrupt or kill it while running other commands. Do not append & or use nohup; \
+keep the command in the foreground of its managed shell.
 - Run tests, check your work or otherwise close the loop to verify changes you make.
 - File-tool results say whether proposals are already on disk. When applied, run \
 the relevant tests/build immediately, even while review remains open. Report failures \
@@ -3254,8 +3280,8 @@ EXAMPLES:
 - Check file type: 'file document.pdf'
 - Count lines: 'wc -l *.txt'
 
-The command will be executed in the current working directory.  Output is
-returned as a string.  Outputs over `gptel-agent-tool-result-max-chars' are
+The command will be executed in the current working directory. Foreground output is
+returned as a string. Outputs over `gptel-agent-tool-result-max-chars' are
 saved in full and replaced with a bounded preview plus a required scoped
 `result-explorer' handoff."
  :args '(( :name "command"
@@ -3267,11 +3293,51 @@ Example: 'ls -la | head -20' or 'grep -i error app.log | tail -50'")
            :type string
            :minLength 1
            :maxLength 2000
-           :description "The exact question to answer or information to extract from this command's output. If the output is oversized, this exact query becomes the result-explorer's enforced scope contract."))
+           :description "The exact question to answer or information to extract from this command's output. If the output is oversized, this exact query becomes the result-explorer's enforced scope contract.")
+         ( :name "background"
+           :type boolean
+           :optional t
+           :description "Start a managed background job and return immediately. Defaults to false (wait for completion). Background output retains a bounded tail; use Process to read and manage the job."))
  :category "gptel-agent"
  :confirm t
  :include t
  :async t)
+
+(gptel-make-tool
+ :name "Process"
+ :function #'gptel-agent--manage-process
+ :description "Manage background Bash jobs belonging to this conversation.
+Sub-agents share their originating conversation's jobs. IDs from other chats \
+are rejected. Jobs survive turns and sub-agent completion; killing the \
+conversation buffer kills its jobs and releases their output.
+
+Actions: list shows running and completed jobs with commands and status; read \
+returns available stdout+stderr without waiting; send writes input verbatim \
+(include a newline when needed); interrupt sends SIGINT to the process group; \
+kill sends SIGKILL to the process group; remove forgets a completed job and \
+its retained output. Use interrupt for a graceful stop, then kill if needed.
+
+read consumes new output by default. Supply an absolute character offset to \
+replay retained output without advancing the unread cursor. next_offset and \
+output_end indicate remaining output. Old output is discarded beyond the \
+configured retention limit and reads report missing ranges. Poll when useful \
+while doing other work; a running process with no output is not finished.
+These are pipes, not an interactive terminal. Do not daemonize jobs or use \
+shell job control: detached children cannot be managed as part of the group."
+ :args '((:name "action" :type string
+          :enum ["list" "read" "send" "interrupt" "kill" "remove"]
+          :description "Operation to perform on this session's background jobs.")
+         (:name "process_id" :type string :optional t
+          :description "ID returned by Bash or Process list. Required except for list; never an OS PID.")
+         (:name "input" :type string :optional t
+          :description "For send: exact input to write, including any required newline.")
+         (:name "offset" :type integer :optional t :minimum 0
+          :description "For read: absolute character offset for replay. Omit to consume unread output.")
+         (:name "max_chars" :type integer :optional t :minimum 1 :maximum 20000
+          :description "For read: maximum output characters (default 12000, maximum 20000)."))
+ :category "gptel-agent"
+ :confirm (lambda (action &rest _) (equal action "send"))
+ :include t)
 
 (gptel-make-tool
  :name "Eval"
