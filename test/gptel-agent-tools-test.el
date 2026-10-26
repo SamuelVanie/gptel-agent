@@ -754,6 +754,80 @@
                             prompt))
     (should (string-match-p "cannot be established" prompt))))
 
+(ert-deftest gptel-agent-main-agents-exclude-opt-in-subagents ()
+  (let ((gptel-agent--enabled-agents nil))
+    (dolist (name '("gptel-agent" "gptel-plan" "ask"))
+      (with-temp-buffer
+        (setq-local
+         gptel-agent--current-agent name
+         gptel-agent--registry-snapshot
+         '(("gptel-agent" :description "Main")
+           ("gptel-plan" :description "Plan")
+           ("ask" :description "Ask")
+           ("executor" :description "Executes work")
+           ("introspector" :description "Inspects Emacs")
+           ("researcher" :description "Finds evidence")
+           ("result-explorer" :description "Reads saved results")
+           ("custom" :description "User-defined agent")))
+        (let* ((fsm (gptel-make-fsm :info (list :buffer (current-buffer))))
+               (snapshot (gptel-agent--snapshot-agent-definitions))
+               (message (gptel-agent--agents-tool-message
+                         gptel-agent--registry-snapshot)))
+          ;; Request transforms run in a separate buffer.
+          (with-temp-buffer
+            (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+            (gptel-agent--localize-agent-tool fsm)
+            (let ((tool (car gptel-tools)))
+              (should (equal (append (plist-get (car (gptel-tool-args tool))
+                                                :enum) nil)
+                             '("researcher" "result-explorer" "custom")))
+              (dolist (disabled '("executor" "introspector"))
+                (should-not (string-match-p disabled (gptel-tool-description tool)))
+                (should-not (string-match-p disabled message))
+                (let (response)
+                  (funcall (gptel-tool-function tool)
+                           (lambda (value) (setq response value))
+                           disabled "Do work" "Details")
+                  (should (string-match-p "not available for this request"
+                                          response))))))
+          ;; Children inherit the restricted registry.
+          (let ((gptel-agent--current-agent "researcher")
+                (gptel-agent--agent-snapshot snapshot))
+            (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                           '("result-explorer" "custom")))))))))
+
+(ert-deftest gptel-agent-default-exclusions-can-be-overridden ()
+  (with-temp-buffer
+    (setq-local gptel-agent--registry-snapshot
+                '(("executor" :description "Executes work")
+                  ("introspector" :description "Inspects Emacs")
+                  ("researcher" :description "Finds evidence")))
+    (let ((gptel-agent--enabled-agents '("executor" "introspector")))
+      (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                     '("executor" "introspector"))))
+    (let ((gptel-agent--enabled-agents nil)
+          (gptel-agent-default-disabled-agents nil))
+      (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                     '("executor" "introspector" "researcher"))))))
+
+(ert-deftest gptel-agent-selector-offers-opt-in-agents-without-preselecting ()
+  (let ((gptel-agent--agents '(("gptel-agent") ("gptel-plan") ("ask")
+                               ("executor") ("introspector")
+                               ("researcher") ("result-explorer")))
+        (gptel-agent--enabled-agents nil))
+    (cl-letf (((symbol-function 'completing-read-multiple)
+               (lambda (_prompt candidates _predicate _require-match initial
+                                &rest _args)
+                 (should (equal candidates
+                                '("executor" "introspector" "researcher"
+                                  "result-explorer")))
+                 (should (equal initial "researcher,result-explorer"))
+                 '("executor" "introspector" "researcher"))))
+      (gptel-agent-toggle-agent))
+    (should (gptel-agent--agent-enabled-p "executor"))
+    (should (gptel-agent--agent-enabled-p "introspector"))
+    (should-not (gptel-agent--agent-enabled-p "result-explorer"))))
+
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))
          (global-args (copy-tree (gptel-tool-args global-tool)))

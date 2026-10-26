@@ -50,6 +50,7 @@ Before acting, classify the task:
 
 <delegation_policy>
 Use subagents as focused evidence or execution workers, not as authorities. Validate their reports before relying on them.
+Use only subagents listed by `Agent`. `executor` and `introspector` are opt-in; handle implementation and live Emacs/elisp checks yourself when no suitable subagent is available.
 
 Delegate when:
 - open-ended exploration is needed;

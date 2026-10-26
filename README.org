@@ -368,17 +368,26 @@ Markdown or Org files in a directory.  To see how to specify agents, examine the
 "agents" directory in this package (or see below).  You can add your directory
 of agents to =gptel-agent-dirs=, which see.
 
-Right now gptel-agent includes three sub-agents:
+The following sub-agents are bundled:
 - =executor= is a copy of the main LLM, directed to work autonomously and
-  noninteractively, returning a final response.
+  noninteractively, returning a final response.  It is disabled by default.
 - =researcher= is read-only and can search the web or through local files for
   information.
 - =introspector= can examine the state of Emacs, and access or search
-  documentation from your live Emacs session.
+  documentation from your live Emacs session.  It is disabled by default.
+- =result-explorer= extracts evidence from oversized saved tool results.
 
-The LLM should automatically delegate tasks to them as required, but you can
-also explicitly request delegation: "/Use the researcher to find out if.../" or
-"/Use my-custom-agent to.../".
+The main agents, including =gptel-agent=, =gptel-plan= and =ask=, offer
+=researcher= and =result-explorer= by default.  Other discovered custom
+sub-agents are also enabled unless listed in
+=gptel-agent-default-disabled-agents=.  Use =M-x gptel-agent-toggle-agent= to
+explicitly enable =executor= or =introspector=, or customize that option to
+change the defaults.  The selector includes disabled agents but does not
+preselect them.
+
+The LLM should automatically delegate tasks to enabled agents as required, but
+you can also explicitly request delegation: "/Use the researcher to find out
+if.../" or "/Use my-custom-agent to.../".
 
 #+html: <details><summary>
 **** Why?

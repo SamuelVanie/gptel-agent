@@ -53,6 +53,7 @@
 (declare-function org-escape-code-in-region "org-src")
 (declare-function gptel-agent--cached-read-file "gptel-agent")
 (declare-function gptel-agent--agent-plist "gptel-agent")
+(declare-function gptel-agent--agent-enabled-p "gptel-agent")
 (declare-function gptel-agent--skills-system-message "gptel-agent")
 (declare-function gptel-agent--agents-tool-message "gptel-agent")
 
@@ -3803,13 +3804,14 @@ delegation unless a materially different source or strategy is available."
          (source (or inherited
                      gptel-agent--registry-snapshot
                      (gptel-agent--full-agent-definitions)))
-         ;; An inherited snapshot was already filtered by the parent request.
-         (enabled (and (not inherited) gptel-agent--enabled-agents))
          (current gptel-agent--current-agent))
     (cl-loop for (name . plist) in source
              unless (or (member name '("gptel-agent" "gptel-plan" "ask"))
                         (and current (string-equal name current))
-                        (and enabled (not (member name enabled))))
+                        ;; An inherited snapshot was already filtered by
+                        ;; the parent request; keep its explicit opt-ins.
+                        (and (not inherited)
+                             (not (gptel-agent--agent-enabled-p name))))
              collect (cons name (copy-tree plist)))))
 
 (defun gptel-agent--agent-snapshot-message (snapshot)

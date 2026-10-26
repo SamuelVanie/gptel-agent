@@ -95,6 +95,16 @@ for gptel sub-agent definitions by `gptel-agent'."
   :type '(repeat directory)
   :group 'gptel-agent)
 
+(defcustom gptel-agent-default-disabled-agents '("executor" "introspector")
+  "Sub-agents excluded from the default Agent tool selection.
+
+These agents remain discoverable and can be enabled explicitly with
+`gptel-agent-toggle-agent'.  Set this to nil to enable all discovered
+sub-agents by default.  An explicit `gptel-agent--enabled-agents'
+selection takes precedence over this option."
+  :type '(repeat string)
+  :group 'gptel-agent)
+
 (defcustom gptel-agent-skill-dirs '("~/.claude/skills/"
                                     ".claude/skills/"
                                     "~/.agents/skills" ;; codex
@@ -179,8 +189,9 @@ Use `gptel-agent-toggle-skill' to manage this list interactively.")
 (defvar gptel-agent--enabled-agents nil
   "List of currently enabled agent names.
 
-When nil, all discovered agents (except \"gptel-agent\" and
-\"gptel-plan\") are considered enabled.
+When nil, discovered sub-agents are enabled except those listed in
+`gptel-agent-default-disabled-agents'.  Main agents \"gptel-agent\",
+\"gptel-plan\" and \"ask\" are never offered as sub-agents.
 Use `gptel-agent-toggle-agent' to manage this list interactively.")
 
 (defvar gptel-agent--agent-files nil
@@ -349,24 +360,24 @@ AGENT-SKILLS is a alist of skill names and associated plist as value
                        skills "\n")
             "\n</available_skills>")))
 
+(defun gptel-agent--agent-enabled-p (name)
+  "Return non-nil when sub-agent NAME is enabled by the current selection."
+  (and (not (member name '("gptel-agent" "gptel-plan" "ask")))
+       (if gptel-agent--enabled-agents
+           (member name gptel-agent--enabled-agents)
+         (not (member name gptel-agent-default-disabled-agents)))))
+
 (defun gptel-agent--agents-tool-message (agents)
   "Parse AGENTS and return the message describing available sub-agents.
 
-Only agents whose names are in `gptel-agent--enabled-agents' are
-included.  When `gptel-agent--enabled-agents' is nil, all agents
-except \"gptel-agent\" and \"gptel-plan\" are included.
+Only agents enabled by `gptel-agent--agent-enabled-p' are included.
 
 AGENTS is an alist of agent names and associated plist as value
  (See `gptel-agent--agents').  The plist is expected to have
 :description as a key."
-  (let ((agents-list (if gptel-agent--enabled-agents
-                        (cl-remove-if-not
-                         (lambda (a) (member (car a) gptel-agent--enabled-agents))
-                         agents)
-                      (cl-remove-if
-                       (lambda (a)
-                         (member (car a) '("gptel-agent" "gptel-plan" "ask")))
-                       agents))))
+  (let ((agents-list
+         (cl-remove-if-not
+          (lambda (a) (gptel-agent--agent-enabled-p (car a))) agents)))
     (concat "Available sub-agents.  Use them when appropriate."
             "\n<available_agents>\n"
             (mapconcat (lambda (agent-def)
@@ -416,7 +427,7 @@ their original schema and registry snapshot."
                       (lambda (a)
                         (member a '("gptel-agent" "gptel-plan" "ask")))
                       (mapcar #'car gptel-agent--agents)))
-         (current (or gptel-agent--enabled-agents all-agents))
+         (current (cl-remove-if-not #'gptel-agent--agent-enabled-p all-agents))
          (selected
           (completing-read-multiple
            "Enable agents: "
