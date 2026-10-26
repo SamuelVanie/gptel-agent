@@ -108,7 +108,9 @@ Changing this setting affects new review queues only."
   (mapcar (lambda (file)
             (let ((change (copy-sequence file)))
               (setf (plist-get change :before) (plist-get file :after)
-                    (plist-get change :after) (plist-get file :before))
+                    (plist-get change :after) (plist-get file :before)
+                    (plist-get change :kind) 'cancellation
+                    (plist-get change :reverses) (plist-get file :history))
               change))
           (cl-remove-if (lambda (file) (eq (plist-get file :status) 'cancelled)) files)))
 
@@ -118,7 +120,7 @@ Check FILES, or all queue entries when nil.  Keep the cumulative originals,
 save the external transitions in history, and invalidate earlier acceptance.
 Never write working files or discard unsaved visiting-buffer edits."
   (when (gptel-agent-review--queue-applied queue)
-    (let (gptel-agent-edit--staged-changes updates refresh)
+    (let (gptel-agent-edit--staged-changes updates refresh history)
       ;; Read everything before changing history or any review entry.
       (dolist (file (or files (gptel-agent-review--queue-files queue)))
         (unless (eq (plist-get file :status) 'cancelled)
@@ -132,12 +134,14 @@ Never write working files or discard unsaved visiting-buffer edits."
                     (plist-get snapshot :before) (plist-get file :after))
               (push (cons file snapshot) updates)))))
       (when updates
-        (gptel-agent-history--complete
-         (gptel-agent-history--record (mapcar #'cdr updates)))
+        (setq history (gptel-agent-history--record (mapcar #'cdr updates)))
+        (gptel-agent-history--complete history)
         (dolist (update updates)
           (let* ((file (car update)) (snapshot (cdr update))
                  (merged (copy-sequence file)))
             (setf (plist-get merged :after) (plist-get snapshot :after)
+                  (plist-get merged :history)
+                  (cons (gptel-agent-history--id history) (plist-get file :history))
                   (plist-get merged :revision) (1+ (plist-get file :revision))
                   (plist-get merged :external) t
                   (plist-get merged :status)
@@ -188,7 +192,7 @@ can inspect the new revision before accepting or restoring it."
                                    (plist-get file :status)))
                            (gptel-agent-review--queue-files queue)))
          ;; Prepare every operation before changing any existing review entry.
-         (changes (gptel-agent-edit-prepare name args)) synced)
+         (changes (gptel-agent-edit-prepare name args)) synced history)
     ;; Patch subprocesses may run another tool callback or a review decision.
     ;; Never overwrite a newer revision or silently restore a refused snapshot.
     (unless (eq existing (buffer-local-value 'gptel-agent-review--queue owner))
@@ -212,7 +216,7 @@ can inspect the new revision before accepting or restoring it."
                          (gptel-agent-review--queue-files queue))))
         (setq synced (gptel-agent-review--sync queue files)))
       (condition-case err
-          (gptel-agent-edit-apply changes)
+          (setq history (gptel-agent-edit-apply changes t))
         ((error quit)
          (when synced
            (condition-case nil (gptel-agent-review--refresh queue) (error nil)))
@@ -224,6 +228,9 @@ can inspect the new revision before accepting or restoring it."
              (merged (copy-sequence
                       (if (and file (not (eq (plist-get file :status) 'cancelled))) file change))))
         (setf (plist-get merged :after) (plist-get change :after)
+              (plist-get merged :history)
+              (if history (cons (gptel-agent-history--id history) (plist-get merged :history))
+                (plist-get merged :history))
               (plist-get merged :id) (or (plist-get file :id)
                                         (with-current-buffer owner (cl-incf gptel-agent-review--next-id)))
               (plist-get merged :revision) (1+ (or (plist-get file :revision) 0))

@@ -488,9 +488,11 @@ an empty string means an existing empty file.  Signal invalid or no-op edits."
                               path (error-message-string err))))
           (clear-visited-file-modtime))))))
 
-(defun gptel-agent-edit-apply (changes)
+(defun gptel-agent-edit-apply (changes &optional return-snapshot)
   "Snapshot and apply CHANGES after verifying every original is current.
-Refresh unmodified visiting buffers.  Restore originals on a write error."
+Refresh unmodified visiting buffers.  Restore originals on a write error.
+Return a result message, or the snapshot directory when RETURN-SNAPSHOT
+is non-nil."
   (require 'gptel-agent-history)
   (gptel-agent-edit-validate changes)
   (let ((snapshot (gptel-agent-history--record changes)) written)
@@ -508,11 +510,12 @@ Refresh unmodified visiting buffers.  Restore originals on a write error."
              (error "%s; restoring originals also failed: %s; recover from snapshots in %s"
                     (error-message-string err) (string-join failures "; ") snapshot)
            (signal (car err) (cdr err))))))
-    (gptel-agent-history--complete snapshot))
-  (dolist (change changes)
-    (gptel-agent-edit--refresh-buffer (plist-get change :path)))
-  (format "Applied changes to %d file(s):\n%s" (length changes)
-          (mapconcat (lambda (c) (plist-get c :path)) changes "\n")))
+    (gptel-agent-history--complete snapshot)
+    (dolist (change changes)
+      (gptel-agent-edit--refresh-buffer (plist-get change :path)))
+    (if return-snapshot snapshot
+      (format "Applied changes to %d file(s):\n%s" (length changes)
+              (mapconcat (lambda (c) (plist-get c :path)) changes "\n")))))
 
 (provide 'gptel-agent-edit)
 ;;; gptel-agent-edit.el ends here

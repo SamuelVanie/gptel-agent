@@ -216,12 +216,32 @@ With confirmation nil and no pending queue, file tools apply directly and
 still save history snapshots.
 
 Use =M-x gptel-agent-history= to browse saved batches, =RET= to inspect a file's
-diff, and =r= to restore the selected batch. =M-x gptel-agent-history-restore=
+diff, and =r= to undo the selected batch's visible files. =M-x gptel-agent-history-restore=
 also lets you choose a snapshot directly. Finish any active review for those
 files first. Restores require files to match that snapshot's after-state;
 restore newer changes first to step back through history. Each restore is
 itself saved, so it can be undone. Originals, proposed versions, encoding and
 file permissions are recorded, including creation and deletion of empty files.
+
+Cancelled changes and the entries that cancelled them are hidden by default.
+Press =c= to show or hide them. The Status column marks =[-] Cancelled=,
+=[x] Cancellation=, and =[+] Recovery=; batch IDs and the Related batches column
+link each cancellation to its original changes. Review refusals include all
+revisions of the refused file, including observed external edits. A partially
+cancelled batch stays visible as =[~] Partly cancelled=, showing only its remaining
+files by default; =RET= and =r= act on the files shown by the current filter.
+To recover cancelled changes, press =c= and undo their cancellation entry.
+The original changes then reappear in the default view. Recovery entries are
+also kept in the expanded view. Older snapshots without cancellation links
+remain visible because their review decisions cannot be determined reliably.
+
+Press =d= to permanently delete the selected batch from history, or use
+=M-x gptel-agent-history-delete= to choose one directly. After confirmation,
+the saved snapshots are removed without changing working files. Cancellation
+and recovery links are followed in both directions: all connected batches
+are deleted together, including revisions or files sharing a cancellation.
+Deletion covers whole batches, including files hidden by the current filter;
+the confirmation reports the total number of batches to remove.
 
 Snapshots live under =gptel-agent-history-directory=, by default a private
 =gptel-agent-history-UID/= directory in the system temporary folder. They
