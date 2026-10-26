@@ -28,7 +28,8 @@
 (defcustom gptel-agent-review-apply-immediately t
   "Apply proposals to working files so the agent can test them during review.
 Originals and revisions are saved in `gptel-agent-history-directory'.
-Refusals restore originals.  Nil keeps proposals in memory until Done.
+Saved external changes join the review; refusals restore originals, including
+undoing those external changes.  Nil keeps proposals in memory until Done.
 Changing this setting affects new review queues only."
   :type 'boolean :group 'gptel)
 
@@ -111,6 +112,66 @@ Changing this setting affects new review queues only."
               change))
           (cl-remove-if (lambda (file) (eq (plist-get file :status) 'cancelled)) files)))
 
+(defun gptel-agent-review--sync (queue &optional files)
+  "Import saved external changes into applied QUEUE, returning changed files.
+Check FILES, or all queue entries when nil.  Keep the cumulative originals,
+save the external transitions in history, and invalidate earlier acceptance.
+Never write working files or discard unsaved visiting-buffer edits."
+  (when (gptel-agent-review--queue-applied queue)
+    (let (gptel-agent-edit--staged-changes updates refresh)
+      ;; Read everything before changing history or any review entry.
+      (dolist (file (or files (gptel-agent-review--queue-files queue)))
+        (unless (eq (plist-get file :status) 'cancelled)
+          (let ((snapshot (gptel-agent-edit--snapshot (plist-get file :path))))
+            (when-let* ((buffer (find-buffer-visiting (plist-get file :path))))
+              (when (or (not (verify-visited-file-modtime buffer))
+                        (not (equal (plist-get snapshot :before) (plist-get file :after))))
+                (push (plist-get file :path) refresh)))
+            (unless (equal (plist-get snapshot :before) (plist-get file :after))
+              (setf (plist-get snapshot :after) (plist-get snapshot :before)
+                    (plist-get snapshot :before) (plist-get file :after))
+              (push (cons file snapshot) updates)))))
+      (when updates
+        (gptel-agent-history--complete
+         (gptel-agent-history--record (mapcar #'cdr updates)))
+        (dolist (update updates)
+          (let* ((file (car update)) (snapshot (cdr update))
+                 (merged (copy-sequence file)))
+            (setf (plist-get merged :after) (plist-get snapshot :after)
+                  (plist-get merged :revision) (1+ (plist-get file :revision))
+                  (plist-get merged :external) t
+                  (plist-get merged :status)
+                  (cond ((eq (plist-get file :status) 'feedback) 'feedback)
+                        ((equal (plist-get file :before) (plist-get snapshot :after)) 'unchanged)
+                        (t 'pending)))
+            ;; Adding a plist key may allocate a new head.  Keep the entry's
+            ;; identity for both the queue and any open Ediff callbacks.
+            (setcar file (car merged))
+            (setcdr file (cdr merged)))))
+      (when refresh
+        (let ((versions (mapcar (lambda (file)
+                                  (list file (plist-get file :revision) (plist-get file :status)))
+                                (or files (gptel-agent-review--queue-files queue)))))
+          (dolist (path refresh) (gptel-agent-edit--refresh-buffer path))
+          ;; Revert hooks can run tool callbacks or close/refuse this review.
+          (unless (and (eq queue (buffer-local-value 'gptel-agent-review--queue
+                                                     (gptel-agent-review--queue-owner queue)))
+                       (cl-every (lambda (version)
+                                   (equal (cdr version)
+                                          (list (plist-get (car version) :revision)
+                                                (plist-get (car version) :status))))
+                                 versions))
+            (error "File review changed while refreshing buffers; reread and retry"))))
+      (mapcar #'car updates))))
+
+(defun gptel-agent-review--check-current (queue &optional files)
+  "Refresh external changes in QUEUE's FILES before a review decision.
+If anything changed, leave the decision to a subsequent command so the user
+can inspect the new revision before accepting or restoring it."
+  (when (gptel-agent-review--sync queue files)
+    (gptel-agent-review--refresh queue)
+    (user-error "Files changed on disk; inspect the refreshed review and retry (refusal also undoes external changes)")))
+
 (defun gptel-agent-review-enqueue (name args &optional buffer)
   "Prepare NAME with ARGS from BUFFER and update each affected file's diff."
   (let* ((source (or (and buffer (get-buffer buffer)) (current-buffer)))
@@ -127,7 +188,7 @@ Changing this setting affects new review queues only."
                                    (plist-get file :status)))
                            (gptel-agent-review--queue-files queue)))
          ;; Prepare every operation before changing any existing review entry.
-         (changes (gptel-agent-edit-prepare name args)))
+         (changes (gptel-agent-edit-prepare name args)) synced)
     ;; Patch subprocesses may run another tool callback or a review decision.
     ;; Never overwrite a newer revision or silently restore a refused snapshot.
     (unless (eq existing (buffer-local-value 'gptel-agent-review--queue owner))
@@ -141,15 +202,21 @@ Changing this setting affects new review queues only."
           (error "Review changed while preparing %s; reread the file and address current feedback before retrying" path))))
     (when (gptel-agent-review--queue-applied queue)
       (gptel-agent-review--check-owners changes owner)
-      ;; Detect external edits before extending a cumulative diff.  Otherwise a
-      ;; later refusal could silently undo changes made outside the file tools.
-      (gptel-agent-edit-validate
-       (gptel-agent-review--reverse
-        (cl-remove-if-not
-         (lambda (file) (cl-find (plist-get file :path) changes
-                                 :key (lambda (c) (plist-get c :path)) :test #'equal))
-         (gptel-agent-review--queue-files queue))))
-      (gptel-agent-edit-apply changes))
+      ;; Preparation already uses current disk content.  Import external
+      ;; changes before extending the diff, retaining the original baseline.
+      ;; Validation still rejects writes racing with preparation or apply.
+      (gptel-agent-edit-validate changes)
+      (when-let* ((files (cl-remove-if-not
+                         (lambda (file) (cl-find (plist-get file :path) changes
+                                                 :key (lambda (c) (plist-get c :path)) :test #'equal))
+                         (gptel-agent-review--queue-files queue))))
+        (setq synced (gptel-agent-review--sync queue files)))
+      (condition-case err
+          (gptel-agent-edit-apply changes)
+        ((error quit)
+         (when synced
+           (condition-case nil (gptel-agent-review--refresh queue) (error nil)))
+         (signal (car err) (cdr err)))))
     (dolist (change changes)
       (let* ((path (plist-get change :path))
              (file (cl-find path (gptel-agent-review--queue-files queue)
@@ -185,7 +252,8 @@ Changing this setting affects new review queues only."
                         "Before/after snapshots are saved in %s. "
                         "Bash, tests, builds, Read, Grep and Glob see these changes now. "
                         "Run the relevant tests/build and fix failures before finishing. "
-                        "Address incoming comments and refusals; refusing a file restores its original contents.")
+                        "Address incoming comments and refusals; saved external changes join this review. "
+                        "Refusing a file restores its pre-review contents, including undoing external changes shown in its diff.")
                 (mapconcat (lambda (c) (plist-get c :path)) changes "\n")
                 gptel-agent-history-directory)
       (format (concat "Updated cumulative file review; NOT applied to disk.\n%s\n"
@@ -197,6 +265,14 @@ Changing this setting affects new review queues only."
 
 (defun gptel-agent-review-read (args &optional buffer)
   "Return a tool result for staged Read ARGS in BUFFER, or nil for disk reads."
+  (when-let* (((not (bound-and-true-p gptel-agent--result-file-scope)))
+              (queue (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner buffer)))
+              ((gptel-agent-review--queue-applied queue))
+              (path (plist-get args :file_path))
+              (file (cl-find (file-truename path) (gptel-agent-review--queue-files queue)
+                             :key (lambda (f) (plist-get f :path)) :test #'equal)))
+    (when (gptel-agent-review--sync queue (list file))
+      (gptel-agent-review--refresh queue)))
   (when-let* (((not (bound-and-true-p gptel-agent--result-file-scope)))
               (queue (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner buffer)))
               ((not (gptel-agent-review--queue-applied queue)))
@@ -254,7 +330,9 @@ Changing this setting affects new review queues only."
                     (list (plist-get f :id)
                           (vector (number-to-string (plist-get f :id))
                                   (number-to-string (plist-get f :revision))
-                                  (symbol-name (plist-get f :status)) (plist-get f :path))))
+                                  (symbol-name (plist-get f :status))
+                                  (concat (plist-get f :path)
+                                          (when (plist-get f :external) " [external changes]")))))
                   (gptel-agent-review--queue-files queue)))
     (tabulated-list-print t))
   (smv/gptel-ediff-refresh queue))
@@ -266,12 +344,14 @@ Changing this setting affects new review queues only."
   (let ((queue (or gptel-agent-review--queue
                    (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner)))))
     (unless queue (user-error "No file changes pending review"))
+    (gptel-agent-review--sync queue)
     (gptel-agent-review--refresh queue)
     (pop-to-buffer (gptel-agent-review--queue-buffer queue))))
 
 (defun gptel-agent-review-refresh ()
   "Refresh the current file review."
   (interactive)
+  (gptel-agent-review--sync gptel-agent-review--queue)
   (gptel-agent-review--refresh gptel-agent-review--queue))
 
 (defun gptel-agent-review--selected ()
@@ -330,6 +410,7 @@ Changing this setting affects new review queues only."
   (when (eq (plist-get file :status) 'cancelled) (user-error "This file's changes were already refused"))
   (when (string-empty-p (string-trim reason)) (setq reason "Refused by user."))
   (when (gptel-agent-review--queue-applied queue)
+    (gptel-agent-review--check-current queue (list file))
     (gptel-agent-edit-apply (gptel-agent-review--reverse (list file))))
   (setf (plist-get file :status) 'cancelled)
   (gptel-agent-review--feedback
@@ -365,6 +446,7 @@ Changing this setting affects new review queues only."
   (let* ((queue (or gptel-agent-review--queue (user-error "No file changes pending review")))
          (files (gptel-agent-review--queue-files queue))
          (changes (cl-remove-if-not (lambda (f) (eq (plist-get f :status) 'accepted)) files)))
+    (gptel-agent-review--check-current queue)
     (when (cl-some (lambda (f) (memq (plist-get f :status) '(pending feedback))) files)
       (user-error "Review pending revisions with RET, or explicitly accept all with a"))
     (smv/gptel-ediff-validate queue)
@@ -379,6 +461,7 @@ Changing this setting affects new review queues only."
   (let* ((queue (or gptel-agent-review--queue (user-error "No file changes pending review")))
          (files (gptel-agent-review--queue-files queue)))
     (when (gptel-agent-review--queue-applied queue)
+      (gptel-agent-review--check-current queue)
       (when-let* ((changes (gptel-agent-review--reverse files)))
         (gptel-agent-edit-apply changes)))
     (gptel-agent-review--close queue)
@@ -391,11 +474,24 @@ Changing this setting affects new review queues only."
              "\nRead now sees disk contents. Adjust ongoing work; do not restore cancelled changes unless the user requests it.\n\n"))))
 
 (defun gptel-agent-review--post-tool (call)
-  "Attach immediate review feedback to a sub-agent's next tool CALL result."
-  (when gptel-agent-review--tool-feedback
-    (prog1 (list :result (concat (gptel--to-string (plist-get call :result)) "\n\n"
-                                (mapconcat #'identity gptel-agent-review--tool-feedback "\n\n")))
-      (setq gptel-agent-review--tool-feedback nil))))
+  "Sync shell changes and attach pending review feedback to tool CALL's result."
+  (let (notice)
+    (when (member (plist-get call :name) '("Bash" "Process"))
+      (when-let* ((queue (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner))))
+        (condition-case err
+            (when-let* ((files (gptel-agent-review--sync queue)))
+              (gptel-agent-review--refresh queue)
+              (setq notice
+                    (concat "External changes added to the pending file review (snapshots saved):\n"
+                            (mapconcat (lambda (f) (plist-get f :path)) files "\n")
+                            "\nReread these files before further edits. Refusing a file also undoes these external changes.")))
+          (error (setq notice (concat "File review could not refresh: " (error-message-string err)))))))
+    (when (or notice gptel-agent-review--tool-feedback)
+      (prog1 (list :result (concat (gptel--to-string (plist-get call :result)) "\n\n"
+                                  (mapconcat #'identity
+                                             (append (and notice (list notice))
+                                                     gptel-agent-review--tool-feedback) "\n\n")))
+        (setq gptel-agent-review--tool-feedback nil)))))
 
 (defun gptel-agent-review--live-p (fsm)
   "Return non-nil when FSM is still running."

@@ -477,6 +477,17 @@ an empty string means an existing empty file.  Signal invalid or no-op edits."
         (unless (equal (plist-get current :before) (plist-get change :before))
           (error "File changed since preview; review again: %s" (plist-get change :path)))))))
 
+(defun gptel-agent-edit--refresh-buffer (path)
+  "Refresh an unmodified buffer visiting PATH after an on-disk change."
+  (when-let* ((buffer (find-buffer-visiting path)))
+    (with-current-buffer buffer
+      (unless (buffer-modified-p)
+        (if (file-exists-p path)
+            (condition-case err (revert-buffer t t t)
+              (error (message "File %s changed, but buffer refresh failed: %s"
+                              path (error-message-string err))))
+          (clear-visited-file-modtime))))))
+
 (defun gptel-agent-edit-apply (changes)
   "Snapshot and apply CHANGES after verifying every original is current.
 Refresh unmodified visiting buffers.  Restore originals on a write error."
@@ -499,13 +510,7 @@ Refresh unmodified visiting buffers.  Restore originals on a write error."
            (signal (car err) (cdr err))))))
     (gptel-agent-history--complete snapshot))
   (dolist (change changes)
-    (when-let* ((buffer (find-buffer-visiting (plist-get change :path))))
-      (with-current-buffer buffer
-        (if (plist-get change :after)
-            (condition-case err (revert-buffer t t t)
-              (error (message "Saved %s, but buffer refresh failed: %s"
-                              (plist-get change :path) (error-message-string err))))
-          (clear-visited-file-modtime)))))
+    (gptel-agent-edit--refresh-buffer (plist-get change :path)))
   (format "Applied changes to %d file(s):\n%s" (length changes)
           (mapconcat (lambda (c) (plist-get c :path)) changes "\n")))
 

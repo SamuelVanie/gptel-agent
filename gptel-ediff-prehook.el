@@ -127,6 +127,7 @@ If none exists, split one off the frame root."
 
 (defun smv/gptel-ediff-validate (queue)
   "Ensure QUEUE's open view shows the current revision without manual edits."
+  (gptel-agent-review--check-current queue)
   (when-let* ((view (gptel-agent-review--queue-view queue)))
     (smv/gptel-ediff--validate-view view)
     (unless (= (smv/gptel-ediff--view-revision view)
@@ -136,10 +137,11 @@ If none exists, split one off the frame root."
 (defun smv/gptel-ediff--headers (view)
   "Display the file revision and decision throughout VIEW."
   (let* ((file (smv/gptel-ediff--view-file view))
-         (header (format "%s — revision %d — %s%s"
+         (header (format "%s — revision %d — %s%s%s"
                          (plist-get file :path) (plist-get file :revision) (plist-get file :status)
                          (cond ((null (plist-get file :before)) " [new file]")
-                               ((null (plist-get file :after)) " [delete file]") (t "")))))
+                               ((null (plist-get file :after)) " [delete file]") (t ""))
+                         (if (plist-get file :external) " [includes external changes]" ""))))
     (dolist (buffer (list (smv/gptel-ediff--view-control view)
                           (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-proposed view)))
       (when (buffer-live-p buffer)
@@ -227,6 +229,8 @@ If none exists, split one off the frame root."
 (defun smv/gptel-ediff-open (queue file)
   "Open FILE's cumulative diff from QUEUE and return immediately.
 Updates reuse the same buffers and control window; no recursive edit is used."
+  (when (gptel-agent-review--sync queue (list file))
+    (gptel-agent-review--refresh queue))
   (smv/gptel-ediff-close queue)
   (let* ((path (plist-get file :path))
          (view (smv/gptel-ediff--make-view

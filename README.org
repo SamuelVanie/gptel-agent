@@ -161,11 +161,27 @@ copies saved before writing. Bash commands, tests, builds, =Read=, =Grep= and
 instructed to run relevant checks, fix failures and report the results before
 finishing. Bash keeps its normal tool confirmation behavior.
 
+If a formatter, Bash command, or another program changes a file already under
+review, its saved contents become the next revision of that same cumulative
+diff. Further agent edits build on those contents, preserving the command's
+effects. The pre-review original stays fixed, and the external before/after
+transition is saved in history. Files that include external changes are marked
+in the review list and Ediff header.
+
+Synchronization runs after =Bash=/=Process= tool results, on =Read= and further
+file edits, and when opening, refreshing (=g=), or deciding a review. Unmodified
+visiting Emacs buffers refresh too. Unsaved buffer edits are never discarded;
+save or reconcile them before continuing. Changes made outside the agent are
+picked up at the next such operation; this is not a filesystem watcher.
+
 =D= requires a decision on every current file revision; use =RET= to inspect
 pending files, or explicitly accept them all with =a=. A new change to an
 accepted file makes it pending again. Open comparisons refresh without
 rebuilding their windows or taking focus. Accepting everything closes review
 without appending a summary prompt or starting another agent response.
+If an accept, refuse, or finish command discovers external changes, it refreshes
+the diff and leaves the decision pending. Inspect the updated revision and
+repeat the command.
 
 Comments and refusals are submitted immediately, without waiting for =D=.
 An active agent receives feedback at the next completed tool boundary, before
@@ -179,11 +195,13 @@ line range and selected text, even if changes arrive while you type.
 A comment leaves the proposed content available for the agent to revise. =q=
 waits for a revision on a file with feedback; =Q= lets you leave its Ediff.
 Refusing a file restores its pre-review contents, including removing newly
-created files or recreating deleted ones. Other files keep their changes.
+created files or recreating deleted ones. This also undoes formatter or other
+external changes included in that file's diff. Other files keep their changes.
 An adjusted proposal for the refused file starts from disk in the same list
 entry. Feedback is sent automatically; there is no draft to edit and submit.
 Restoration checks the whole batch before writing and refuses to overwrite
-later external edits or unsaved buffers. Save or reconcile those edits first.
+unsaved buffers or changes arriving during preparation. The restored version
+is also saved in history, so a refusal can itself be undone.
 
 Preview buffers are read-only. If manually altered, they cannot be accepted;
 close with =Q= and reopen the file to restore the staged comparison.
@@ -210,8 +228,10 @@ Snapshots live under =gptel-agent-history-directory=, by default a private
 survive closing conversations and restarting Emacs, but the operating system
 may clean temporary files. Set this variable to a permanent directory for
 long-term retention. Closing a conversation leaves applied changes on disk;
-use history to restore them later. History covers changes through file tools,
-not arbitrary side effects of Bash commands or external programs.
+use history to restore them later. History covers changes through file tools
+and external changes observed in files already under review. It does not track
+other files changed by Bash commands or external programs, or intermediate
+versions overwritten between synchronization points.
 
 =Edit= accepts string replacements, unified diffs, or an =operations= array
 with =path= set to an existing root directory. Operations can mix =replace=,
