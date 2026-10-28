@@ -819,15 +819,66 @@
                 '(("parent" :description "Parent")
                   ("executor" :description "Executes")
                   ("ask" :description "Explains")))
-    ;; No declaration: no package-specific exclusions, only prevent self-calls.
+    ;; No declaration: allow workers, but never main presets or self-calls.
     (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
-                   '("executor" "ask")))
+                   '("executor")))
     (setcdr (car gptel-agent--registry-snapshot) '(:agents nil))
     (should-not (gptel-agent--snapshot-agent-definitions))
     (setq-local gptel-tools (list (gptel-get-tool "Agent") (gptel-get-tool "Read")))
     (gptel-agent--localize-agent-tool
      (gptel-make-fsm :info (list :buffer (current-buffer))))
     (should (equal (mapcar #'gptel-tool-name gptel-tools) '("Read")))))
+
+(ert-deftest gptel-agent-subagent-lists-exclude-main-presets-and-self ()
+  (dolist (declared '(nil t))
+    (dolist (inherited '(nil t))
+      (with-temp-buffer
+        (let* ((names '("gptel-agent" "gptel-plan" "ask" "executor"
+                        "researcher" "custom-worker"))
+               (registry (mapcar (lambda (name) (list name :description name)) names)))
+          (when declared
+            (setcdr (assoc "executor" registry) (list :agents names)))
+          (setq-local gptel-agent--current-agent "executor"
+                      gptel-agent--enabled-agents names
+                      gptel-agent--registry-snapshot registry
+                      gptel-agent--agent-snapshot (and inherited registry))
+          (dolist (ignore-selection '(nil t))
+            (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions
+                                         ignore-selection))
+                           '("researcher" "custom-worker"))))
+          (let ((fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
+            (with-temp-buffer
+              (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+              (gptel-agent--localize-agent-tool fsm)
+              (should (equal (append (plist-get (car (gptel-tool-args
+                                                     (car gptel-tools))) :enum) nil)
+                             '("researcher" "custom-worker")))))
+          (let ((gptel-agent--agents registry))
+            (cl-letf (((symbol-function 'completing-read-multiple)
+                       (lambda (_prompt candidates _predicate _require-match initial
+                                        &rest _)
+                         (should (equal candidates '("researcher" "custom-worker")))
+                         (should (equal initial "researcher,custom-worker"))
+                         candidates)))
+              (gptel-agent-toggle-agent))))))))
+
+(ert-deftest gptel-agent-dispatch-rejects-main-presets-and-self ()
+  (with-temp-buffer
+    (setq-local gptel-agent--current-agent "executor")
+    (let* ((names '("gptel-agent" "gptel-plan" "ask" "executor" "EXECUTOR"))
+           ;; Simulate a stale or externally supplied snapshot containing
+           ;; invalid targets.  Dispatch must guard these independently.
+           (snapshot (mapcar (lambda (name) (list name :description name)) names))
+           (fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
+      (cl-letf (((symbol-function 'gptel-request)
+                 (lambda (&rest _) (ert-fail "Invalid sub-agent was started"))))
+        (dolist (name names)
+          (let (results)
+            (gptel-agent--task (lambda (result) (push result results))
+                               name "Invalid delegation" "Details" fsm snapshot)
+            (should (= (length results) 1))
+            (should (string-match-p "not available for this request" (car results))))))
+      (should-not gptel-agent--sessions))))
 
 (ert-deftest gptel-agent-selector-is-local-and-limited-by-parent ()
   (let ((gptel-agent--agents

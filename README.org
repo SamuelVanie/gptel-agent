@@ -400,8 +400,11 @@ The following sub-agents are bundled:
 Each parent's definition controls its sub-agents through an =agents= list.
 The default =gptel-agent= offers =executor=, =researcher=, =introspector= and
 =result-explorer=.  The read-only =gptel-plan= and =ask= definitions offer
-=researcher=, =introspector= and =result-explorer=.  There is no package-level
-exclusion list.  Add custom sub-agent names to the parent's =agents= list to
+=researcher=, =introspector= and =result-explorer=.  Worker availability has no
+package-level exclusion list.  The interactive =gptel-agent=, =gptel-plan= and
+=ask= presets are main agents, never sub-agents; an agent also cannot delegate
+to itself.  These guards apply even if those names appear in an =agents= list.
+Add custom sub-agent names to the parent's =agents= list to
 make them available there, then run =M-x gptel-agent-update= to refresh it.
 
 Use =M-x gptel-agent-toggle-agent= to narrow the current conversation's
@@ -539,7 +542,8 @@ to inherit the global defaults, which are unlimited.
 For an agent with the =Agent= tool, =agents= lists the sub-agent names it may
 call, for example =agents: [executor, researcher]=.  An empty list
 (=agents: []=) disables delegation.  Omitting the field allows all discovered
-agents except the caller itself.  A delegated agent may further restrict its
+sub-agents except the caller itself; main presets are always excluded.
+A delegated agent may further restrict its
 selection through its own definition; it cannot expand the inherited list.
 In Org definitions, use a space-separated property such as
 =:agents: executor researcher=, or an empty =:agents:= property for none.

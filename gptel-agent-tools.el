@@ -2848,7 +2848,10 @@ by the same parent buffer; nil or a blank string starts a new conversation."
         (funcall main-cb
                  (format "Error: agent_id %S must identify an idle, completed %s conversation belonging to this chat."
                          agent-id agent-type))))
-     ((not agent-plist)
+     ((or (not agent-plist)
+          (not (gptel-agent--subagent-p
+                agent-type
+                (buffer-local-value 'gptel-agent--current-agent parent-buffer))))
       (with-current-buffer parent-buffer
         (funcall main-cb
                  (format "Error: Agent %S is not available for this request."
@@ -3959,12 +3962,22 @@ delegation unless a materially different source or strategy is available."
                 (cdr entry)))))
    gptel-agent--agents))
 
+(defun gptel-agent--subagent-p (name &optional parent-agent)
+  "Return non-nil if NAME can be delegated to by PARENT-AGENT.
+The interactive main presets are never sub-agents, and an agent cannot
+delegate to itself.  These constraints also apply to explicit declarations."
+  (and (stringp name)
+       (not (member (downcase name) '("gptel-agent" "gptel-plan" "ask")))
+       (not (and parent-agent
+                 (equal (downcase name) (downcase parent-agent))))))
+
 (defun gptel-agent--snapshot-agent-definitions (&optional ignore-selection)
   "Return request-stable definitions allowed by this parent agent.
 
 The parent's `agents' field names its available sub-agents.  An absent
-field allows all discovered agents except itself; an empty list allows
-none.  Children can narrow, but not expand, the inherited snapshot.
+field allows all discovered sub-agents; an empty list allows none.
+Main presets and the caller itself are always excluded.  Children can
+narrow, but not expand, the inherited snapshot.
 IGNORE-SELECTION ignores the conversation's interactive selection."
   (let* ((inherited gptel-agent--agent-snapshot)
          (source (or inherited
@@ -3975,7 +3988,7 @@ IGNORE-SELECTION ignores the conversation's interactive selection."
          (declared (plist-member definition :agents))
          (allowed (plist-get definition :agents)))
     (cl-loop for (name . plist) in source
-             unless (or (and current (string-equal name current))
+             unless (or (not (gptel-agent--subagent-p name current))
                         (and declared (not (member name allowed)))
                         (and (not ignore-selection)
                              (not (gptel-agent--agent-enabled-p name))))

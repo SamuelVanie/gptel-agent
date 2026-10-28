@@ -250,7 +250,7 @@
           (pcase i
             (0
              (gptel-agent-followup-test--finish fsm "Done")
-             (gptel-agent--task deliver "researcher" "Nested" "Investigate"
+             (gptel-agent--task deliver "executor" "Nested" "Investigate"
                                 (gptel-make-fsm
                                  :info (list :buffer (car children) :position 1))
                                 snapshot)
