@@ -14,7 +14,8 @@
   `(let* ((parent (generate-new-buffer " *agent-followup-parent*"))
           (parent-fsm (gptel-make-fsm))
           (snapshot '(("researcher" :description "Research" :system "Original system"
-                       :task-timeout 60 :max-request-rounds 4)))
+                       :task-timeout 60 :max-request-rounds 4)
+                      ("executor" :description "Executes work" :system "Execute")))
           (gptel-agent--runs (make-hash-table :test #'equal))
           (gptel-agent--run-history nil)
           requests received

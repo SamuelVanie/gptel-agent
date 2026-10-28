@@ -95,16 +95,6 @@ for gptel sub-agent definitions by `gptel-agent'."
   :type '(repeat directory)
   :group 'gptel-agent)
 
-(defcustom gptel-agent-default-disabled-agents '("executor" "introspector")
-  "Sub-agents excluded from the default Agent tool selection.
-
-These agents remain discoverable and can be enabled explicitly with
-`gptel-agent-toggle-agent'.  Set this to nil to enable all discovered
-sub-agents by default.  An explicit `gptel-agent--enabled-agents'
-selection takes precedence over this option."
-  :type '(repeat string)
-  :group 'gptel-agent)
-
 (defcustom gptel-agent-skill-dirs '("~/.claude/skills/"
                                     ".claude/skills/"
                                     "~/.agents/skills" ;; codex
@@ -186,12 +176,11 @@ of the corresponding SKILL.md as a plist.")
 When nil, all discovered skills are considered enabled.
 Use `gptel-agent-toggle-skill' to manage this list interactively.")
 
-(defvar gptel-agent--enabled-agents nil
-  "List of currently enabled agent names.
+(defvar-local gptel-agent--enabled-agents nil
+  "Interactive sub-agent selection for this conversation.
 
-When nil, discovered sub-agents are enabled except those listed in
-`gptel-agent-default-disabled-agents'.  Main agents \"gptel-agent\",
-\"gptel-plan\" and \"ask\" are never offered as sub-agents.
+When nil, use the parent agent definition's `agents' list.  A list of
+names narrows that selection; `none' disables delegation entirely.
 Use `gptel-agent-toggle-agent' to manage this list interactively.")
 
 (defvar gptel-agent--agent-files nil
@@ -361,34 +350,23 @@ AGENT-SKILLS is a alist of skill names and associated plist as value
             "\n</available_skills>")))
 
 (defun gptel-agent--agent-enabled-p (name)
-  "Return non-nil when sub-agent NAME is enabled by the current selection."
-  (and (not (member name '("gptel-agent" "gptel-plan" "ask")))
-       (if gptel-agent--enabled-agents
-           (member name gptel-agent--enabled-agents)
-         (not (member name gptel-agent-default-disabled-agents)))))
+  "Return non-nil when the conversation's interactive selection allows NAME.
+The parent definition's `agents' list is enforced separately."
+  (or (null gptel-agent--enabled-agents)
+      (and (listp gptel-agent--enabled-agents)
+           (member name gptel-agent--enabled-agents))))
 
 (defun gptel-agent--agents-tool-message (agents)
   "Parse AGENTS and return the message describing available sub-agents.
 
-Only agents enabled by `gptel-agent--agent-enabled-p' are included.
+The current parent definition and interactive selection determine inclusion.
 
 AGENTS is an alist of agent names and associated plist as value
  (See `gptel-agent--agents').  The plist is expected to have
 :description as a key."
-  (let ((agents-list
-         (cl-remove-if-not
-          (lambda (a) (gptel-agent--agent-enabled-p (car a))) agents)))
-    (concat "Available sub-agents.  Use them when appropriate."
-            "\n<available_agents>\n"
-            (mapconcat (lambda (agent-def)
-                         (format "  <agent>
-    <name>%s</name>
-    <description>%s</description>
-  </agent>"
-                                 (car agent-def)
-                                 (plist-get (cdr agent-def) :description)))
-                       agents-list "\n")
-            "\n</available_agents>")))
+  (let ((gptel-agent--registry-snapshot agents))
+    (gptel-agent--agent-snapshot-message
+     (gptel-agent--snapshot-agent-definitions))))
 
 ;;;###autoload
 (defun gptel-agent-update ()
@@ -405,38 +383,40 @@ AGENTS is an alist of agent names and associated plist as value
 
   ;; Apply gptel-agent preset if it exists
   (when-let* ((gptel-agent-plist (gptel-agent--agent-plist "gptel-agent")))
-    (apply #'gptel-make-preset 'gptel-agent gptel-agent-plist))
+    (apply #'gptel-make-preset 'gptel-agent
+           (gptel-agent--plist-without-keys gptel-agent-plist '(:agents))))
   (when-let* ((gptel-plan-plist (gptel-agent--agent-plist "gptel-plan")))
-    (apply #'gptel-make-preset 'gptel-plan gptel-plan-plist))
+    (apply #'gptel-make-preset 'gptel-plan
+           (gptel-agent--plist-without-keys gptel-plan-plist '(:agents))))
   (when-let* ((ask-plist (gptel-agent--agent-plist "ask")))
-    (apply #'gptel-make-preset 'ask ask-plist))
+    (apply #'gptel-make-preset 'ask
+           (gptel-agent--plist-without-keys ask-plist '(:agents))))
   gptel-agent--agents)
 
 ;;;###autoload
 (defun gptel-agent-toggle-agent ()
   "Toggle which agents are enabled for the Agent tool.
 
-Prompts for agents to enable.  Agents not selected will be disabled.
+Prompts for agents allowed by the current parent definition.  Agents not
+selected will be disabled in this conversation; selecting none disables all.
 New requests receive an invocation-specific Agent schema immediately,
 without requiring `gptel-agent-update'.  Requests already in flight keep
 their original schema and registry snapshot."
   (interactive)
   (unless gptel-agent--agents
     (gptel-agent--update-agents))
-  (let* ((all-agents (cl-remove-if
-                      (lambda (a)
-                        (member a '("gptel-agent" "gptel-plan" "ask")))
-                      (mapcar #'car gptel-agent--agents)))
+  (let* ((all-agents (mapcar #'car
+                            (gptel-agent--snapshot-agent-definitions t)))
          (current (cl-remove-if-not #'gptel-agent--agent-enabled-p all-agents))
          (selected
           (completing-read-multiple
            "Enable agents: "
            all-agents nil t
            (mapconcat #'identity current ","))))
-    (setq gptel-agent--enabled-agents selected)
+    (setq-local gptel-agent--enabled-agents (or selected 'none))
     (gptel-agent--update-agent-tool)
     (message "Agents updated: %s enabled."
-             (length gptel-agent--enabled-agents))))
+             (length selected))))
 
 ;;;###autoload
 (defun gptel-agent-toggle-skill ()
@@ -501,9 +481,9 @@ Substitution happens in-place in the buffer."
             ;; :parents is a YAML list of strings read as a list.
             (:parents (plist-put parsed-yaml key
                                  (mapcar #'intern (ensure-list val))))
-            ;; :context and :tools: If a string (single-line YAML), split
+            ;; :context, :tools and :agents: If a string, split
             ;; by spaces. If already a list (YAML sequence), keep as-is.
-            ((or :context :tools)
+            ((or :context :tools :agents)
              (plist-put parsed-yaml key
                         (if (listp val) val (split-string val))))
             ;; Numeric properties: YAML already handles these correctly
@@ -586,7 +566,7 @@ opening delimiter '---' found but no closing delimiter" file-path))))))
              (value (cdr pair)))
         (pcase key-sym
           ;; Properties that should remain as lists
-          ((or :context :tools)
+          ((or :context :tools :agents)
            (setq value (split-string value)))
           ;; Numeric properties
           ((or :temperature :max-tokens :num-messages-to-send

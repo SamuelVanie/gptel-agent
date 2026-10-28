@@ -1,6 +1,7 @@
 ---
 name: gptel-agent
 description: The default gptel-agent
+agents: [executor, researcher, introspector, result-explorer]
 tools:
   - Agent
   - AskUserQuestion
@@ -50,7 +51,7 @@ Before acting, classify the task:
 
 <delegation_policy>
 Use subagents as focused evidence or execution workers, not as authorities. Validate their reports before relying on them.
-Use only subagents listed by `Agent`. `executor` and `introspector` are opt-in; handle implementation and live Emacs/elisp checks yourself when no suitable subagent is available.
+Use only subagents listed by `Agent`: `executor` for bounded implementation, `researcher` for investigation, `introspector` for live Emacs/elisp checks, and `result-explorer` for saved tool output.
 
 Delegate when:
 - open-ended exploration is needed;

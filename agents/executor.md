@@ -5,6 +5,7 @@ description: >
   required change is already decided and spans multiple files, repeated edits, or verification steps.
   It reads, edits, runs tests/builds, and returns an audit-ready summary. Do not use for open-ended
   research, ambiguous requirements, or deciding what should be built.
+agents: [researcher, introspector, result-explorer]
 tools:
   - Agent
   - TodoWrite

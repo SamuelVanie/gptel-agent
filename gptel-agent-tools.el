@@ -2763,7 +2763,7 @@ precedence."
       (gptel--apply-preset preset setter))
     (gptel--apply-preset
      (gptel-agent--plist-without-keys
-      (copy-tree agent-plist) '(:task-timeout :max-request-rounds))
+      (copy-tree agent-plist) '(:task-timeout :max-request-rounds :agents))
      setter)))
 
 (defun gptel-agent--supervision-value (agent-plist key fallback)
@@ -3959,19 +3959,25 @@ delegation unless a materially different source or strategy is available."
                 (cdr entry)))))
    gptel-agent--agents))
 
-(defun gptel-agent--snapshot-agent-definitions ()
-  "Return full, request-stable definitions for currently allowed agents."
+(defun gptel-agent--snapshot-agent-definitions (&optional ignore-selection)
+  "Return request-stable definitions allowed by this parent agent.
+
+The parent's `agents' field names its available sub-agents.  An absent
+field allows all discovered agents except itself; an empty list allows
+none.  Children can narrow, but not expand, the inherited snapshot.
+IGNORE-SELECTION ignores the conversation's interactive selection."
   (let* ((inherited gptel-agent--agent-snapshot)
          (source (or inherited
                      gptel-agent--registry-snapshot
                      (gptel-agent--full-agent-definitions)))
-         (current gptel-agent--current-agent))
+         (current gptel-agent--current-agent)
+         (definition (cdr (assoc current source)))
+         (declared (plist-member definition :agents))
+         (allowed (plist-get definition :agents)))
     (cl-loop for (name . plist) in source
-             unless (or (member name '("gptel-agent" "gptel-plan" "ask"))
-                        (and current (string-equal name current))
-                        ;; An inherited snapshot was already filtered by
-                        ;; the parent request; keep its explicit opt-ins.
-                        (and (not inherited)
+             unless (or (and current (string-equal name current))
+                        (and declared (not (member name allowed)))
+                        (and (not ignore-selection)
                              (not (gptel-agent--agent-enabled-p name))))
              collect (cons name (copy-tree plist)))))
 
@@ -4019,9 +4025,13 @@ the global registry while this request is in flight."
                                  fsm snapshot result-file query agent-id)))
       (setq-local
        gptel-tools
-       (mapcar (lambda (candidate)
-                 (if (eq candidate base-tool) tool candidate))
-               gptel-tools)))))
+       (if snapshot
+           (mapcar (lambda (candidate)
+                     (if (eq candidate base-tool) tool candidate))
+                   gptel-tools)
+         ;; An empty enum is invalid for some providers, and there is no
+         ;; useful Agent call when this parent permits no sub-agents.
+         (remq base-tool gptel-tools))))))
 
 (defun gptel-agent--update-agent-tool ()
   "Retain compatibility; Agent schemas are now built per request.
