@@ -245,7 +245,7 @@ override this with the `max-request-rounds' frontmatter/property key."
   "Whether to keep failed, timed-out and cancelled sub-agent buffers.
 
 Kept buffers contain the live diagnostic transcript and remain accessible
-from the Agent overlay until the user kills the buffer."
+from the Agent overlay until the user kills them or closes the parent chat."
   :type 'boolean
   :group 'gptel-agent)
 
@@ -260,6 +260,15 @@ from the Agent overlay until the user kills the buffer."
 
 (defvar-local gptel-agent--supervised-run nil
   "The `gptel-agent--run' owned by this sub-agent buffer.")
+
+(defvar-local gptel-agent--sessions nil
+  "Sub-agent conversations owned by this buffer, keyed by stable agent ID.")
+(put 'gptel-agent--sessions 'permanent-local t)
+
+(cl-defstruct (gptel-agent--session
+               (:constructor gptel-agent--make-session))
+  "A retained sub-agent conversation, with a fresh RUN for each task."
+  id run request-info resumable)
 
 (defvar gptel-agent--run-counter 0
   "Monotonic counter used to assign identifiers to sub-agent runs.")
@@ -279,7 +288,9 @@ from the Agent overlay until the user kills the buffer."
   parent-kill-hook terminal-reason started-at configuration
   task-timeout max-request-rounds
   tool-calls web-tool-calls finalization-reason
-  finalization-requested finalization-started)
+  finalization-requested finalization-started
+  ;; Append new fields to preserve accessors in already compiled consumers.
+  session)
 
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
@@ -2081,7 +2092,31 @@ file/query pair registered when an oversized tool result was persisted."
          'child-buffer-killed)))
     (unless (gptel-agent--run-active-p run)
       (gptel-agent--task-cleanup-overlay
-       (gptel-agent--run-overlay run)))))
+       (gptel-agent--run-overlay run)))
+    (when (buffer-live-p (gptel-agent--run-parent-buffer run))
+      (with-current-buffer (gptel-agent--run-parent-buffer run)
+        (setq gptel-agent--sessions
+              (rassq-delete-all (gptel-agent--run-session run)
+                               gptel-agent--sessions))))))
+
+(defun gptel-agent--close-sessions ()
+  "Cancel and close all sub-agent conversations owned by this buffer."
+  (let ((sessions gptel-agent--sessions))
+    (setq gptel-agent--sessions nil)
+    (dolist (entry sessions)
+      (let* ((run (gptel-agent--session-run (cdr entry)))
+             (child (gptel-agent--run-child-buffer run))
+             ;; The parent is already being killed.  Never ask separately
+             ;; about its children, or deliver into its dying request.
+             (gptel-agent-keep-failed-run-buffers t))
+        (gptel-agent--run-finish
+         run 'cancelled "Error: Parent chat buffer was closed." 'parent-killed t)
+        (when (buffer-live-p child)
+          (with-current-buffer child
+            (let ((kill-buffer-query-functions nil))
+              (set-buffer-modified-p nil)
+              (kill-buffer child))))))))
+(put 'gptel-agent--close-sessions 'permanent-local-hook t)
 
 (defun gptel-agent--run-inspect-button (run)
   "Return a clickable string that displays RUN's diagnostic buffer."
@@ -2205,24 +2240,12 @@ not send RESULT to the parent tool callback."
       (gptel-agent--run-abort-transport run))
     (gptel-agent--record-terminal-run run result)
     (gptel-agent--run-update-terminal-overlay run result)
-    (when (buffer-live-p (gptel-agent--run-parent-buffer run))
-      (with-current-buffer (gptel-agent--run-parent-buffer run)
-        (when-let* ((hook (gptel-agent--run-parent-kill-hook run)))
-          (remove-hook 'kill-buffer-hook hook t))))
     (remhash (gptel-agent--run-id run) gptel-agent--runs)
-    (when (and (not suppress-delivery)
-               (buffer-live-p (gptel-agent--run-parent-buffer run)))
-      ;; Async tool callbacks can arrive from a Curl/process buffer.  Resume
-      ;; the parent FSM in its own buffer so its buffer-local gptel settings
-      ;; cannot be taken from an unrelated concurrent request.
-      (with-current-buffer (gptel-agent--run-parent-buffer run)
-        (condition-case err
-            (funcall (gptel-agent--run-callback run) result)
-          (error
-           (message "gptel-agent: parent callback for run %s failed: %S"
-                    (gptel-agent--run-id run) err)))))
-    (if (and gptel-agent-keep-failed-run-buffers
-             (not (eq state 'completed))
+    (if (and (or (and (gptel-agent--run-session run)
+                      (gptel-agent--session-resumable
+                       (gptel-agent--run-session run)))
+                 (and gptel-agent-keep-failed-run-buffers
+                      (not (eq state 'completed))))
              (buffer-live-p (gptel-agent--run-child-buffer run)))
         (with-current-buffer (gptel-agent--run-child-buffer run)
           (rename-buffer
@@ -2232,6 +2255,23 @@ not send RESULT to the parent tool callback."
       (gptel-agent--task-cleanup-overlay (gptel-agent--run-overlay run))
       (when (buffer-live-p (gptel-agent--run-child-buffer run))
         (kill-buffer (gptel-agent--run-child-buffer run))))
+    (when (and (not suppress-delivery)
+               (buffer-live-p (gptel-agent--run-parent-buffer run)))
+      ;; Async tool callbacks can arrive from a Curl/process buffer.  Resume
+      ;; the parent FSM in its own buffer so its buffer-local gptel settings
+      ;; cannot be taken from an unrelated concurrent request.
+      (with-current-buffer (gptel-agent--run-parent-buffer run)
+        (condition-case err
+            (funcall
+             (gptel-agent--run-callback run)
+             (if-let* ((session (gptel-agent--run-session run))
+                       ((gptel-agent--session-resumable session)))
+                 (format "agent_id: %s\nUse Agent with this agent_id for related follow-up tasks.\n\n%s"
+                         (gptel-agent--session-id session) result)
+               result))
+          (error
+           (message "gptel-agent: parent callback for run %s failed: %S"
+                    (gptel-agent--run-id run) err)))))
     t))
 
 (defun gptel-agent--cancel-runs-for-buffer (parent-buffer)
@@ -2414,12 +2454,46 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
                  (plist-get info :error))
          (or (plist-get info :error) (plist-get info :status)))))))
 
+(defconst gptel-agent--tool-request-keys
+  '(:tools :tool_choice :toolChoice :tool_config :toolConfig)
+  "Payload fields restored after a tool-free finalization turn.")
+
+(defun gptel-agent--save-session-response (run info)
+  "Retain RUN's complete conversation from INFO for the next task."
+  (when-let* ((session (gptel-agent--run-session run))
+              (saved (gptel-agent--session-request-info session)))
+    (let* ((data (copy-tree (plist-get info :data) t))
+           (messages (or (plist-get data :messages)
+                         (plist-get data :contents)
+                         (plist-get data :input)))
+           (last-message (and (> (length messages) 0)
+                              (elt messages (1- (length messages)))))
+           ;; Gemini streaming already appends its final model message.
+           ;; Other parsers normally append only tool calls, so add the
+           ;; final round's answer without repeating earlier commentary.
+           (answer (substring (gptel-agent--run-response run)
+                              (gptel-agent--run-response-checkpoint run))))
+      (unless (or (string-empty-p answer)
+                  (member (plist-get last-message :role) '("assistant" "model")))
+        (gptel--inject-prompt
+         (plist-get info :backend) data
+         (gptel--parse-list (plist-get info :backend)
+                           (list (cons 'response answer)))))
+      (dolist (key gptel-agent--tool-request-keys)
+        (if (plist-member (plist-get saved :data) key)
+            (setq data (plist-put data key
+                                 (plist-get (plist-get saved :data) key)))
+          (cl-remf data key)))
+      (setf (plist-get saved :data) data
+            (gptel-agent--session-resumable session) t))))
+
 (defun gptel-agent--handle-task-done (fsm)
   "Complete a sub-agent FSM only when it enters DONE."
   (let* ((info (gptel-fsm-info fsm))
          (run (gptel-agent--run-from-fsm fsm))
          (response (and run (gptel-agent--run-response run))))
     (when (and run (gptel-agent--run-active-p run))
+      (gptel-agent--save-session-response run info)
       (if (string-blank-p (or response ""))
           (gptel-agent--run-finish
            run 'inconclusive
@@ -2455,6 +2529,19 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
                (gptel-agent--run-finalization-requested run)
                (not (gptel-agent--run-finalization-started run)))))
     (when (and run (gptel-agent--run-active-p run))
+      (when (and (zerop (gptel-agent--run-rounds run))
+                 (gptel-agent--run-session run))
+        ;; Retain only reusable request settings, never transport state,
+        ;; pending tool calls or callbacks from this invocation.
+        (let ((info (gptel-fsm-info fsm)) saved)
+          (dolist (key '(:backend :model :stream :tools :include-reasoning
+                        :transformer :data))
+            (when (plist-member info key)
+              (setq saved (plist-put saved key (plist-get info key)))))
+          (setq saved (plist-put saved :data
+                                 (copy-tree (plist-get info :data) t)))
+          (setf (gptel-agent--session-request-info
+                 (gptel-agent--run-session run)) saved)))
       (if (and (not retryp)
                (not finalization-turn-p)
                max-rounds
@@ -2524,9 +2611,9 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
 (defun gptel-agent--task-preview-setup (arg-values _info)
   "Preview setup for Agent.
 INFO is the tool call info plist.
-ARG-VALUES is a list: (type description prompt)"
+ARG-VALUES contains type, description, prompt and optional continuation args."
   (pcase-let ((from (point))
-              (`(,type ,desc ,prompt) arg-values))
+              (`(,type ,desc ,prompt . ,_) arg-values))
     (insert "("
             (propertize "Agent " 'font-lock-face 'font-lock-keyword-face)
             (propertize (prin1-to-string type)
@@ -2534,6 +2621,9 @@ ARG-VALUES is a list: (type description prompt)"
             " " (propertize (prin1-to-string desc)
                             'font-lock-face
                             '(:inherit font-lock-constant-face :inherit bold))
+            (if-let* ((id (nth 5 arg-values)))
+                (format " [follow-up: %s]" id)
+              "")
             "\n" (propertize (prin1-to-string prompt)
                              'line-prefix "  "
                              'wrap-prefix "  "
@@ -2687,9 +2777,31 @@ The value must be nil (unlimited) or a non-negative integer."
                   key value))
     value))
 
+(defun gptel-agent--resume-session (run fsm position callback)
+  "Start RUN in FSM from its saved conversation, at POSITION with CALLBACK."
+  (let* ((session (gptel-agent--run-session run))
+         (info (copy-sequence (gptel-agent--session-request-info session)))
+         (data (copy-tree (plist-get info :data) t)))
+    (gptel--inject-prompt
+     (plist-get info :backend) data
+     (gptel--parse-list (plist-get info :backend)
+                       (list (gptel-agent--run-prompt run))))
+    (dolist (entry (list (cons :data data)
+                        (cons :buffer (gptel-agent--run-child-buffer run))
+                        (cons :position position) (cons :context run)
+                        (cons :callback callback)))
+      (setq info (plist-put info (car entry) (cdr entry))))
+    (setf (gptel-fsm-info fsm) info)
+    (setq-local gptel-tools (copy-sequence (plist-get info :tools))
+                gptel-use-tools (and gptel-tools t))
+    ;; Nested Agent dispatchers must own this new invocation's FSM.
+    (gptel-agent--localize-agent-tool fsm)
+    (plist-put info :tools gptel-tools)
+    (gptel--fsm-transition fsm)))
+
 (defun gptel-agent--task (main-cb agent-type description prompt
                                   &optional parent-fsm agent-snapshot
-                                  result-file query)
+                                  result-file query agent-id)
   "Call a gptel agent to do specific compound tasks.
 
 MAIN-CB is the main callback to return a value to the main loop.
@@ -2698,10 +2810,16 @@ DESCRIPTION is a short description of the task.
 PROMPT is the detailed prompt instructing the agent on what is required.
 PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool.
 RESULT-FILE and QUERY are the enforced scope contract used only by the
-`result-explorer' agent."
+`result-explorer' agent.  AGENT-ID continues a completed conversation owned
+by the same parent buffer; nil starts a new conversation."
   (let* ((parent-info (and (gptel-fsm-p parent-fsm)
                            (gptel-fsm-info parent-fsm)))
          (parent-buffer (and parent-info (plist-get parent-info :buffer)))
+         (agent-id (unless (eq agent-id :null) agent-id))
+         (session (and agent-id (buffer-live-p parent-buffer)
+                       (with-current-buffer parent-buffer
+                         (cdr (assoc agent-id gptel-agent--sessions)))))
+         (previous (and session (gptel-agent--session-run session)))
          (agent-snapshot (or agent-snapshot gptel-agent--agent-snapshot
                              (gptel-agent--snapshot-agent-definitions)))
          (agent-plist (cdr (assoc-string agent-type agent-snapshot t)))
@@ -2715,6 +2833,16 @@ RESULT-FILE and QUERY are the enforced scope contract used only by the
     (cond
      ((not (buffer-live-p parent-buffer))
       (funcall main-cb "Error: Agent dispatch has no live parent request."))
+     ((and agent-id
+           (or (not previous)
+               (not (buffer-live-p (gptel-agent--run-child-buffer previous)))
+               (not (equal agent-type (gptel-agent--run-agent previous)))
+               (gptel-agent--run-active-p previous)
+               (not (gptel-agent--session-resumable session))))
+      (with-current-buffer parent-buffer
+        (funcall main-cb
+                 (format "Error: agent_id %S must identify an idle, completed %s conversation belonging to this chat."
+                         agent-id agent-type))))
      ((not agent-plist)
       (with-current-buffer parent-buffer
         (funcall main-cb
@@ -2725,6 +2853,13 @@ RESULT-FILE and QUERY are the enforced scope contract used only by the
         (funcall main-cb
                  (format "Error: Invalid result-explorer scope contract: %s. Pass result_file and query exactly as returned by the oversized tool result."
                          contract-error))))
+     ((and previous result-explorer-p
+           (not (equal result-file
+                       (buffer-local-value
+                        'gptel-agent--result-file-scope
+                        (gptel-agent--run-child-buffer previous)))))
+      (with-current-buffer parent-buffer
+        (funcall main-cb "Error: A result-explorer follow-up must keep the original result_file and query.")))
      (t
       (let* ((where (or (plist-get parent-info :tracking-marker)
                         (plist-get parent-info :position)))
@@ -2735,14 +2870,17 @@ RESULT-FILE and QUERY are the enforced scope contract used only by the
                 (with-current-buffer parent-buffer
                   (set-marker (make-marker) where))))
              (child-buffer
-              (generate-new-buffer
-               (format " *gptel-agent-run:%s*" agent-type)))
+              (if previous (gptel-agent--run-child-buffer previous)
+                (generate-new-buffer
+                 (format " *gptel-agent-run:%s*" agent-type))))
              (preset (buffer-local-value 'gptel-agent-preset parent-buffer))
              (task-prompt
               (gptel-agent--prepare-task-prompt
                (if result-explorer-p
-                   (gptel-agent--result-explorer-task-prompt
-                    result-file query)
+                   (concat (gptel-agent--result-explorer-task-prompt
+                            result-file query)
+                           (when previous
+                             (concat "\n\nFollow-up within this scope:\n" prompt)))
                  prompt)))
              (run (gptel-agent--make-run
                    :id (format "agent-%d" (cl-incf gptel-agent--run-counter))
@@ -2754,43 +2892,64 @@ RESULT-FILE and QUERY are the enforced scope contract used only by the
                    :finalization-reason nil :finalization-requested nil
                    :finalization-started nil
                    :started-at (float-time))))
+        (unless session
+          (setq session (gptel-agent--make-session
+                         :id (gptel-agent--run-id run))))
+        (setf (gptel-agent--run-session run) session
+              (gptel-agent--session-run session) run
+              (gptel-agent--session-resumable session) nil)
+        (with-current-buffer parent-buffer
+          (setf (alist-get (gptel-agent--session-id session)
+                           gptel-agent--sessions nil nil #'equal) session)
+          (add-hook 'kill-buffer-hook #'gptel-agent--close-sessions nil t))
+        (with-current-buffer child-buffer
+          (setq-local gptel-agent--supervised-run run)
+          (add-hook 'kill-buffer-query-functions
+                    #'gptel-agent--confirm-child-buffer-kill nil t)
+          (add-hook 'kill-buffer-hook
+                    #'gptel-agent--handle-child-buffer-kill nil t))
         (condition-case err
             (progn
               (setq task-timeout
-                    (gptel-agent--supervision-value
-                     agent-plist :task-timeout
-                     (buffer-local-value
-                      'gptel-agent-task-timeout parent-buffer))
+                    (if previous (gptel-agent--run-task-timeout previous)
+                      (gptel-agent--supervision-value
+                       agent-plist :task-timeout
+                       (buffer-local-value
+                        'gptel-agent-task-timeout parent-buffer)))
                     max-request-rounds
-                    (gptel-agent--supervision-value
-                     agent-plist :max-request-rounds
-                     (buffer-local-value
-                      'gptel-agent-max-request-rounds parent-buffer)))
+                    (if previous (gptel-agent--run-max-request-rounds previous)
+                      (gptel-agent--supervision-value
+                       agent-plist :max-request-rounds
+                       (buffer-local-value
+                        'gptel-agent-max-request-rounds parent-buffer))))
               (setf (gptel-agent--run-task-timeout run) task-timeout
                     (gptel-agent--run-max-request-rounds run)
                     max-request-rounds)
-              (setq preset (gptel-agent--resolve-subagent-preset preset))
-              (gptel-agent--copy-parent-request-config
-               parent-buffer child-buffer)
+              (unless previous
+                (setq preset (gptel-agent--resolve-subagent-preset preset))
+                (gptel-agent--copy-parent-request-config
+                 parent-buffer child-buffer))
               (with-current-buffer child-buffer
-                (setq default-directory
-                      (buffer-local-value 'default-directory parent-buffer))
-                (setq-local gptel-agent--current-agent agent-type
-                            gptel-agent--agent-snapshot agent-snapshot
-                            gptel-agent--supervised-run run
-                            gptel-agent--result-file-scope
-                            (and result-explorer-p result-file)
-                            gptel--preset nil)
-                (gptel-agent--apply-subagent-configuration
-                 preset agent-plist)
+                (unless previous
+                  (setq default-directory
+                        (buffer-local-value 'default-directory parent-buffer))
+                  (setq-local gptel-agent--current-agent agent-type
+                              gptel-agent--agent-snapshot agent-snapshot
+                              gptel-agent--supervised-run run
+                              gptel-agent--result-file-scope
+                              (and result-explorer-p result-file)
+                              gptel--preset nil)
+                  (gptel-agent--apply-subagent-configuration
+                   preset agent-plist))
                 (gptel-agent--reset-tool-call-counts)
                 (setf (gptel-agent--run-configuration run)
-                      (list :backend gptel-backend :model gptel-model
-                            :stream gptel-stream :system gptel-system-prompt
-                            :tools (copy-sequence gptel-tools)
-                            :request-params (copy-tree gptel--request-params)))
+                      (if previous (gptel-agent--run-configuration previous)
+                        (list :backend gptel-backend :model gptel-model
+                              :stream gptel-stream :system gptel-system-prompt
+                              :tools (copy-sequence gptel-tools)
+                              :request-params (copy-tree gptel--request-params))))
                 (let ((inhibit-read-only t))
-                  (erase-buffer)
+                  (goto-char (point-max))
                   (insert (format "Sub-agent run: %s\nAgent: %s\nTask: %s\nModel: %s\nTimeout: %s\nRound limit: %s\n\nPrompt:\n%s\n\n"
                                   (gptel-agent--run-id run) agent-type description
                                   (gptel--model-name gptel-model)
@@ -2805,21 +2964,9 @@ RESULT-FILE and QUERY are the enforced scope contract used only by the
                       (gptel-agent--task-overlay
                        where agent-type description run)))
               (puthash (gptel-agent--run-id run) run gptel-agent--runs)
-              (let ((parent-kill-hook
-                     (lambda ()
-                       (gptel-agent--run-finish
-                        run 'cancelled
-                        "Error: Parent buffer was killed during sub-agent task."
-                        'parent-killed t))))
-                (setf (gptel-agent--run-parent-kill-hook run)
-                      parent-kill-hook)
-                (with-current-buffer parent-buffer
-                  (add-hook 'kill-buffer-hook parent-kill-hook nil t)))
-              (with-current-buffer child-buffer
-                (add-hook 'kill-buffer-query-functions
-                          #'gptel-agent--confirm-child-buffer-kill nil t)
-                (add-hook 'kill-buffer-hook
-                          #'gptel-agent--handle-child-buffer-kill nil t))
+              (when previous
+                (gptel-agent--task-cleanup-overlay
+                 (gptel-agent--run-overlay previous)))
               (when task-timeout
                 (setf (gptel-agent--run-timeout-timer run)
                       (run-at-time
@@ -2845,43 +2992,47 @@ RESULT-FILE and QUERY are the enforced scope contract used only by the
                        (task-callback
                         (lambda (resp info)
                           (condition-case callback-error
-                              (pcase resp
-                                ((pred stringp)
-                                 (setf (gptel-agent--run-response run)
-                                       (concat
-                                        (gptel-agent--run-response run) resp))
-                                 (gptel-agent--run-append-model-output run resp))
-                                (`(tool-call . ,calls)
-                                 (unless (plist-get info :tracking-marker)
-                                   (plist-put info :tracking-marker where))
-                                 (gptel--display-tool-calls calls info))
-                                (`(tool-result . ,_results)
-                                 (gptel-agent--begin-finalization run info))
-                                ;; ERRS, DONE and ABRT handlers own terminal
-                                ;; completion.  Other callback events are data.
-                                (_ nil))
+                              (when (gptel-agent--run-active-p run)
+                                (pcase resp
+                                  ((pred stringp)
+                                   (setf (gptel-agent--run-response run)
+                                         (concat
+                                          (gptel-agent--run-response run) resp))
+                                   (gptel-agent--run-append-model-output run resp))
+                                  (`(tool-call . ,calls)
+                                   (unless (plist-get info :tracking-marker)
+                                     (plist-put info :tracking-marker where))
+                                   (gptel--display-tool-calls calls info))
+                                  (`(tool-result . ,_results)
+                                   (gptel-agent--begin-finalization run info))
+                                  ;; ERRS, DONE and ABRT handlers own terminal
+                                  ;; completion.  Other callback events are data.
+                                  (_ nil)))
                             (error
                              (gptel-agent--run-finish
                               run 'failed
                               (format "Error: Internal callback error in task %S: %S"
                                       description callback-error)
                               callback-error)))))
-                       (fsm
-                        (gptel-request task-prompt
-                          :buffer child-buffer
-                          ;; Keep confirmation UI in the visible parent while
-                          ;; all request configuration and tool execution stay
-                          ;; isolated in CHILD-BUFFER.
-                          :position parent-position
-                          :stream gptel-stream
-                          :system gptel-system-prompt
-                          :context run
-                          :fsm (gptel-make-fsm
-                                :table gptel-send--transitions
-                                :handlers gptel-agent-request--handlers)
-                          :transforms transforms
-                          :callback task-callback)))
-                  (setf (gptel-agent--run-fsm run) fsm))))
+                       (fsm (gptel-make-fsm
+                             :table gptel-send--transitions
+                             :handlers gptel-agent-request--handlers)))
+                  (setf (gptel-agent--run-fsm run) fsm)
+                  (if previous
+                      (gptel-agent--resume-session
+                       run fsm parent-position task-callback)
+                    (gptel-request task-prompt
+                      :buffer child-buffer
+                      ;; Keep confirmation UI in the visible parent while
+                      ;; all request configuration and tool execution stay
+                      ;; isolated in CHILD-BUFFER.
+                      :position parent-position
+                      :stream gptel-stream
+                      :system gptel-system-prompt
+                      :context run
+                      :fsm fsm
+                      :transforms transforms
+                      :callback task-callback)))))
           (error
            (gptel-agent--run-finish
             run 'failed
@@ -3782,6 +3933,11 @@ Agents run independently and return results in one message.  \
 Use for open-ended searches, complex research, exploration tasks, \
 or when a task matches an available agent's description.  \
 You can launch multiple agents in parallel for independent tasks.  \
+Results include an agent_id. To assign a related follow-up or correction, \
+call Agent again with that agent_id, the same subagent_type, and the new \
+description and prompt. The agent retains its conversation and tool evidence. \
+Omit agent_id to start a new conversation. Only idle, completed agents in \
+this chat can be continued; each follow-up gets fresh task limits. \
 Treat agent results as evidence reports: inspect their evidence, assumptions, \
 verification gaps and confidence before relying on them.  A negative or \
 inconclusive report is a valid completed outcome; do not repeat the same \
@@ -3853,9 +4009,9 @@ the global registry while this request is in flight."
             (plist-get (car args) :enum) (vconcat (mapcar #'car snapshot))
             (gptel-tool-function tool)
             (lambda (main-cb agent-type description prompt
-                             &optional result-file query)
+                             &optional result-file query agent-id)
               (gptel-agent--task main-cb agent-type description prompt
-                                 fsm snapshot result-file query)))
+                                 fsm snapshot result-file query agent-id)))
       (setq-local
        gptel-tools
        (mapcar (lambda (candidate)
@@ -3870,10 +4026,10 @@ The registered tool is deliberately immutable.  See
   (gptel-get-tool "Agent"))
 
 (defun gptel-agent--task-tool-dispatch
-    (main-cb agent-type description prompt &optional result-file query)
+    (main-cb agent-type description prompt &optional result-file query agent-id)
   "Dispatch an Agent tool call before request-local FSM ownership is attached."
   (gptel-agent--task main-cb agent-type description prompt
-                     nil nil result-file query))
+                     nil nil result-file query agent-id))
 
 (gptel-make-tool
  :name "Agent"
@@ -3900,7 +4056,11 @@ automatically appended.")
            :optional t
            :minLength 1
            :maxLength 2000
-           :description "Required only for result-explorer. Pass the exact extraction query returned with result_file."))
+           :description "Required only for result-explorer, including follow-ups. Pass the exact original extraction query returned with result_file.")
+         ( :name "agent_id"
+           :type string
+           :optional t
+           :description "Continue an idle, completed agent using the agent_id from its result. Keep the same subagent_type; supply the follow-up in prompt. Omit to start a new agent."))
  :category "gptel-agent"
  :async t
  :confirm t

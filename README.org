@@ -409,6 +409,22 @@ The LLM should automatically delegate tasks to enabled agents as required, but
 you can also explicitly request delegation: "/Use the researcher to find out
 if.../" or "/Use my-custom-agent to.../".
 
+The =Agent= tool returns an =agent_id= with each completed task.  The main
+agent can pass it to =Agent= again, with the same =subagent_type= and a new
+=description= and =prompt=, to request a related follow-up or correction.
+The sub-agent keeps its original configuration, conversation and full tool
+results, including evidence shortened in the inspection buffer.  Each follow-up
+gets fresh timeout, round, retry and tool budgets.  Omitting =agent_id= starts
+a separate conversation.  IDs belong to the calling chat; a running agent
+cannot receive another task until it finishes.  Failed or cancelled requests
+remain diagnostic-only and cannot be resumed.
+
+Completed sub-agent buffers stay available for follow-ups until you close them
+or their parent chat.  Closing the parent chat cancels active sub-agent requests
+and closes all its sub-agent buffers, including nested agents and retained
+failure transcripts.  A =result-explorer= follow-up must retain its original
+=result_file= and =query= scope.
+
 #+html: <details><summary>
 **** Why?
 #+html: </summary>
@@ -447,7 +463,8 @@ forms, and =:pre=/=:post= hooks are honored at each layer.
 
 The Agent task overlay includes an =[Inspect sub-agent]= action.  Its buffer
 shows the prompt, model rounds, streamed output, tool arguments and results,
-retries, and terminal reason.  Non-completed runs keep this buffer by default; set
+retries, and terminal reason.  Failed, timed-out and cancelled runs keep this
+buffer by default; set
 =gptel-agent-keep-failed-run-buffers= to nil to clean them up immediately.
 Repeated similar/cyclic calls are skipped once so the model can change
 strategy.  At =gptel-agent-max-loop-violations= the same sub-agent enters a
