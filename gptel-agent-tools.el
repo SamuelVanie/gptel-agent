@@ -2621,7 +2621,9 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
             " " (propertize (prin1-to-string desc)
                             'font-lock-face
                             '(:inherit font-lock-constant-face :inherit bold))
-            (if-let* ((id (nth 5 arg-values)))
+            (if-let* ((id (nth 5 arg-values))
+                      ((stringp id))
+                      ((not (string-blank-p id))))
                 (format " [follow-up: %s]" id)
               "")
             "\n" (propertize (prin1-to-string prompt)
@@ -2811,11 +2813,14 @@ PROMPT is the detailed prompt instructing the agent on what is required.
 PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool.
 RESULT-FILE and QUERY are the enforced scope contract used only by the
 `result-explorer' agent.  AGENT-ID continues a completed conversation owned
-by the same parent buffer; nil starts a new conversation."
+by the same parent buffer; nil or a blank string starts a new conversation."
   (let* ((parent-info (and (gptel-fsm-p parent-fsm)
                            (gptel-fsm-info parent-fsm)))
          (parent-buffer (and parent-info (plist-get parent-info :buffer)))
-         (agent-id (unless (eq agent-id :null) agent-id))
+         (agent-id (unless (or (eq agent-id :null)
+                              (and (stringp agent-id)
+                                   (string-blank-p agent-id)))
+                     agent-id))
          (session (and agent-id (buffer-live-p parent-buffer)
                        (with-current-buffer parent-buffer
                          (cdr (assoc agent-id gptel-agent--sessions)))))
@@ -3936,8 +3941,8 @@ You can launch multiple agents in parallel for independent tasks.  \
 Results include an agent_id. To assign a related follow-up or correction, \
 call Agent again with that agent_id, the same subagent_type, and the new \
 description and prompt. The agent retains its conversation and tool evidence. \
-Omit agent_id to start a new conversation. Only idle, completed agents in \
-this chat can be continued; each follow-up gets fresh task limits. \
+Omit agent_id or leave it empty to start a new conversation. Only idle, \
+completed agents in this chat can be continued; each follow-up gets fresh task limits. \
 Treat agent results as evidence reports: inspect their evidence, assumptions, \
 verification gaps and confidence before relying on them.  A negative or \
 inconclusive report is a valid completed outcome; do not repeat the same \
@@ -4060,7 +4065,7 @@ automatically appended.")
          ( :name "agent_id"
            :type string
            :optional t
-           :description "Continue an idle, completed agent using the agent_id from its result. Keep the same subagent_type; supply the follow-up in prompt. Omit to start a new agent."))
+           :description "Optional. Continue an idle, completed agent using the agent_id from its result. Keep the same subagent_type; supply the follow-up in prompt. Omit or leave empty to start a new agent."))
  :category "gptel-agent"
  :async t
  :confirm t

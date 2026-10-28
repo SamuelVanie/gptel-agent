@@ -414,9 +414,10 @@ agent can pass it to =Agent= again, with the same =subagent_type= and a new
 =description= and =prompt=, to request a related follow-up or correction.
 The sub-agent keeps its original configuration, conversation and full tool
 results, including evidence shortened in the inspection buffer.  Each follow-up
-gets fresh timeout, round, retry and tool budgets.  Omitting =agent_id= starts
-a separate conversation.  IDs belong to the calling chat; a running agent
-cannot receive another task until it finishes.  Failed or cancelled requests
+gets fresh timeout, round, retry and tool budgets.  The =agent_id= argument is
+optional; omitting it or passing a blank string starts a separate conversation.
+IDs belong to the calling chat; a running agent cannot receive another task
+until it finishes.  Failed or cancelled requests
 remain diagnostic-only and cannot be resumed.
 
 Completed sub-agent buffers stay available for follow-ups until you close them

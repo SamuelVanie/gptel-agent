@@ -48,6 +48,33 @@
     (funcall (plist-get info :callback) text info)
     (gptel--fsm-transition fsm 'DONE)))
 
+(ert-deftest gptel-agent-followup-empty-id-starts-a-new-conversation ()
+  (gptel-agent-followup-test--with-chat
+    (with-current-buffer parent
+      (setq-local gptel-agent--agent-snapshot snapshot)
+      (gptel-agent--localize-agent-tool parent-fsm)
+      (let ((tool (cl-find "Agent" gptel-tools
+                           :key #'gptel-tool-name :test #'equal))
+            ids)
+        (should (plist-get (cl-find "agent_id" (gptel-tool-args tool)
+                                    :key (lambda (arg) (plist-get arg :name))
+                                    :test #'equal)
+                           :optional))
+        (dolist (id '(nil :null "" " \t\n"))
+          (apply (gptel-tool-function tool) deliver
+                 (gptel--map-tool-args
+                  tool (append (list :subagent_type "researcher"
+                                     :description "New task" :prompt "Find evidence")
+                               (when id (list :agent_id id)))))
+          (should (= (length requests) (1+ (length ids))))
+          (let* ((fsm (car requests))
+                 (run (plist-get (gptel-fsm-info fsm) :context))
+                 (new-id (gptel-agent--session-id (gptel-agent--run-session run))))
+            (should-not (member new-id ids))
+            (push new-id ids)
+            (gptel-agent-followup-test--finish fsm "Done")
+            (should (string-prefix-p (concat "agent_id: " new-id) (car received)))))))))
+
 (ert-deftest gptel-agent-followup-keeps-evidence-and-renews-supervision ()
   (gptel-agent-followup-test--with-chat
     (gptel-agent--task deliver "researcher" "First task" "Find evidence"
