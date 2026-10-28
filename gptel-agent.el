@@ -368,29 +368,35 @@ AGENTS is an alist of agent names and associated plist as value
     (gptel-agent--agent-snapshot-message
      (gptel-agent--snapshot-agent-definitions))))
 
+(defun gptel-agent--refresh-registry ()
+  "Read current agent files and return a fresh full registry snapshot."
+  (gptel-agent--update-agents)
+  (gptel-agent--full-agent-definitions))
+
 ;;;###autoload
 (defun gptel-agent-update ()
-  "Update agents."
-  (gptel-agent--update-agents)
+  "Update agent definitions and presets in the current buffer."
+  (interactive)
   ;; Keep this buffer/project independent from registry updates elsewhere.
   (setq-local gptel-agent--registry-snapshot
-              (gptel-agent--full-agent-definitions))
+              (gptel-agent--refresh-registry))
 
   ;; Update skills and tools
   (gptel-agent--update-skills)
   (gptel-agent--update-skill-tool)
   (gptel-agent--update-agent-tool)
 
-  ;; Apply gptel-agent preset if it exists
-  (when-let* ((gptel-agent-plist (gptel-agent--agent-plist "gptel-agent")))
-    (apply #'gptel-make-preset 'gptel-agent
-           (gptel-agent--plist-without-keys gptel-agent-plist '(:agents))))
-  (when-let* ((gptel-plan-plist (gptel-agent--agent-plist "gptel-plan")))
-    (apply #'gptel-make-preset 'gptel-plan
-           (gptel-agent--plist-without-keys gptel-plan-plist '(:agents))))
-  (when-let* ((ask-plist (gptel-agent--agent-plist "ask")))
-    (apply #'gptel-make-preset 'ask
-           (gptel-agent--plist-without-keys ask-plist '(:agents))))
+  ;; Include identity in the preset itself so menu selection, inheritance,
+  ;; and @preset activation enforce the same parent declaration as the
+  ;; dedicated session command.  Use normal preset keys to honor its setter.
+  (dolist (name '("gptel-agent" "gptel-plan" "ask"))
+    (when-let* ((plist (gptel-agent--agent-plist name)))
+      (apply #'gptel-make-preset (intern name)
+             (append
+              (gptel-agent--plist-without-keys plist '(:agents))
+              (list :agent--current-agent name
+                    :agent--registry-snapshot
+                    '(:eval (gptel-agent--refresh-registry)))))))
   gptel-agent--agents)
 
 ;;;###autoload

@@ -398,14 +398,19 @@ The following sub-agents are bundled:
 - =result-explorer= extracts evidence from oversized saved tool results.
 
 Each parent's definition controls its sub-agents through an =agents= list.
-The default =gptel-agent= offers =executor=, =researcher=, =introspector= and
+The default =gptel-agent= offers =executor=, =researcher= and
 =result-explorer=.  The read-only =gptel-plan= and =ask= definitions offer
-=researcher=, =introspector= and =result-explorer=.  Worker availability has no
-package-level exclusion list.  The interactive =gptel-agent=, =gptel-plan= and
+=researcher= and =result-explorer=.  The =executor= definition also lists
+=introspector=, subject to its parent's allowed list.
+Worker availability has no package-level exclusion list.
+The interactive =gptel-agent=, =gptel-plan= and
 =ask= presets are main agents, never sub-agents; an agent also cannot delegate
 to itself.  These guards apply even if those names appear in an =agents= list.
 Add custom sub-agent names to the parent's =agents= list to
-make them available there, then run =M-x gptel-agent-update= to refresh it.
+make them available there, then run =M-x gptel-agent-update= in the chat to
+refresh it.  Activating or reapplying a main preset also refreshes its
+sub-agent definitions.  Selecting a preset through gptel's menu enforces
+the same =agents= list as starting a dedicated agent session.
 
 Use =M-x gptel-agent-toggle-agent= to narrow the current conversation's
 selection; choosing none disables delegation.  This does not affect other

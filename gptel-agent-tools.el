@@ -2755,8 +2755,12 @@ The buffer's inherited request state is already installed.  Apply harness
 defaults first, then PRESET, then the per-agent settings so every layer's
 parents, hooks and composition forms run independently and later layers take
 precedence."
+  ;; A shared preset may inherit a main agent preset.  Its identity and
+  ;; registry must not replace this worker's inherited request state.
   (let ((setter (lambda (symbol value)
-                  (set (make-local-variable symbol) value))))
+                  (unless (memq symbol '(gptel-agent--current-agent
+                                         gptel-agent--registry-snapshot))
+                    (set (make-local-variable symbol) value)))))
     (gptel--apply-preset
      '(:include-reasoning nil :use-tools t :context nil) setter)
     (when preset
@@ -4016,13 +4020,19 @@ the global registry while this request is in flight."
                (cl-find "Agent" gptel-tools
                         :key #'gptel-tool-name :test #'string=)))
     (let* ((source-buffer (plist-get (gptel-fsm-info fsm) :buffer))
+           (prompt-agent (and (local-variable-p 'gptel-agent--current-agent)
+                              gptel-agent--current-agent))
            ;; gptel copies only its own buffer-local variables into the prompt
            ;; transform buffer.  Read our project/agent identity from the
-           ;; explicit request buffer recorded in FSM instead.
+           ;; explicit request buffer recorded in FSM, unless an @preset has
+           ;; supplied a request-specific identity.  Keep the source registry,
+           ;; inherited restrictions and interactive selection in either case.
            (snapshot
             (if (buffer-live-p source-buffer)
                 (with-current-buffer source-buffer
-                  (gptel-agent--snapshot-agent-definitions))
+                  (let ((gptel-agent--current-agent
+                         (or prompt-agent gptel-agent--current-agent)))
+                    (gptel-agent--snapshot-agent-definitions)))
               (gptel-agent--snapshot-agent-definitions)))
            (tool (gptel--copy-tool base-tool))
            (args (copy-tree (gptel-tool-args base-tool))))
