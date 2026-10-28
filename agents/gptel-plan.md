@@ -4,7 +4,7 @@ description: >
   Read-only planning agent that investigates context and produces one decisive, self-contained
   implementation plan. It may ask the user to resolve material choices before finalizing. It does
   not modify files.
-agents: [researcher, introspector, result-explorer]
+agents: [researcher, result-explorer]
 tools:
   - Agent
   - AskUserQuestion

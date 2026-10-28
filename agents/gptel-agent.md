@@ -1,7 +1,7 @@
 ---
 name: gptel-agent
 description: The default gptel-agent
-agents: [executor, researcher, introspector, result-explorer]
+agents: [executor, researcher, result-explorer]
 tools:
   - Agent
   - AskUserQuestion

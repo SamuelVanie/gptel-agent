@@ -5,7 +5,7 @@ description: >
   the user wants to understand how something works, why code is structured a certain way, what trade-offs
   exist, or which approach fits the current codebase. It investigates first, then explains with concrete
   references. It does not modify files.
-agents: [researcher, introspector, result-explorer]
+agents: [researcher, result-explorer]
 tools:
   - Agent
   - AskUserQuestion
