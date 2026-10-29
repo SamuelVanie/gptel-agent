@@ -2169,7 +2169,7 @@ The caller must have appended all tool results before entering this function."
       (when-let* ((ov (gptel-agent--run-overlay run)) ((overlay-buffer ov)))
         (overlay-put ov 'count (1+ (overlay-get ov 'count)))
         (overlay-put ov 'after-string
-                     (concat (overlay-get ov 'msg) text "\n" gptel-agent--hrule))))))
+                     (concat (overlay-get ov 'msg) text "\n" gptel-agent--hrule "\n"))))))
 
 (defun gptel-agent--workers-done (gate)
   "Gate normal finalization until GATE's descendants and inbox are settled."
@@ -2524,7 +2524,7 @@ steers current work without creating a run or resetting supervision budgets."
         (format "%s\n"
                 (truncate-string-to-width
                  (gptel--to-string result) 500 nil nil t)))
-      gptel-agent--hrule))))
+      gptel-agent--hrule "\n"))))
 
 (defun gptel-agent--run-cancel-timer (run accessor setter)
   "Cancel RUN timer returned by ACCESSOR and clear it with SETTER."
@@ -3037,8 +3037,7 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                  (concat task-msg
                          (concat
                           (propertize "Running... " 'face 'warning) "\n"
-                          (propertize "\n" 'face
-                                      '(:inherit shadow :underline t :extend t))))))
+                          gptel-agent--hrule "\n"))))
            (overlay-put ov 'after-string new-info-msg))))
      info-ov count run)))
 
@@ -3064,7 +3063,7 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                                    (plist-get call :name)
                                    (map-values (plist-get call :args))))
                                 tool-use)
-                     "\n" gptel-agent--hrule)))
+                     "\n" gptel-agent--hrule "\n")))
       (overlay-put ov 'count (+ info-count (length tool-use)))
       (overlay-put ov 'after-string new-info-msg))))
 
@@ -3088,8 +3087,7 @@ button for its live diagnostic buffer."
                                    gptel-model)))
                       'face 'font-lock-comment-face))
          (msg (concat
-               (unless (eq (char-after (car bounds)) 10) "\n")
-               "\n" gptel-agent--hrule
+               "\n\n" gptel-agent--hrule
                (propertize (concat (capitalize agent-type) " Task: ")
                            'face 'font-lock-escape-face)
                (propertize (or description "(no description)") 'face 'font-lock-doc-face)
@@ -3109,7 +3107,23 @@ button for its live diagnostic buffer."
       (overlay-put
        ov 'after-string
        (concat msg (propertize "Waiting..." 'face 'warning) "\n"
-               gptel-agent--hrule)))))
+               gptel-agent--hrule "\n")))))
+
+(defun gptel-agent--task-response-position (fsm)
+  "Return FSM's response position, initializing normal chat output if needed."
+  (let* ((info (gptel-fsm-info fsm))
+         (gate (gptel-agent--workers-for fsm))
+         (callback (or (and gate (gptel-agent--workers-callback gate))
+                       (plist-get info :callback))))
+    ;; A tool-only first response has no prefix yet.  Let gptel insert it
+    ;; before anchoring the overlay, and establish its tracking marker so
+    ;; later tool results do not insert another prefix.  Custom callbacks
+    ;; (including nested agents) own their output and must be left alone.
+    (when (and (not (plist-get info :tracking-marker))
+               (memq callback '(gptel--insert-response
+                                gptel-curl--stream-insert-response)))
+      (funcall callback "" info t))
+    (or (plist-get info :tracking-marker) (plist-get info :position))))
 
 (defun gptel-agent--copy-parent-request-config (parent-buffer child-buffer)
   "Copy owned gptel request settings from PARENT-BUFFER to CHILD-BUFFER."
@@ -3264,8 +3278,7 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
       (with-current-buffer parent-buffer
         (funcall main-cb "Error: A result-explorer follow-up must keep the original result_file and query.")))
      (t
-      (let* ((where (or (plist-get parent-info :tracking-marker)
-                        (plist-get parent-info :position)))
+      (let* ((where (gptel-agent--task-response-position parent-fsm))
              task-timeout max-request-rounds
              (parent-position
               (if (markerp where)

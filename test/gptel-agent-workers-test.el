@@ -133,6 +133,62 @@
       (setq start (match-end 0) count (1+ count)))
     count))
 
+(ert-deftest gptel-agent-workers-first-agent-overlay-follows-response-prefix ()
+  (dolist (stream '(nil t))
+    (dolist (prefix '("ASSISTANT> " "ASSISTANT>\n"))
+      (dolist (background '(nil t))
+        (let ((gptel-agent-workers-test--stream stream)
+              (gptel-response-prefix-alist `((fundamental-mode . ,prefix))))
+          (gptel-agent-workers-test--with-chat
+            (gptel-agent-workers-test--tool
+             fsm "Agent" `(:subagent_type "researcher" :description "Research"
+                                         :prompt "Investigate" :background ,background))
+            (let* ((run (car (hash-table-values gptel-agent--runs)))
+                   (ov (gptel-agent--run-overlay run))
+                   (anchor (overlay-end ov)))
+              (with-current-buffer parent
+                ;; The prefix must already be visible while the first agent runs.
+                (goto-char (point-min))
+                (should (search-forward prefix nil t))
+                (should (<= (point) anchor)))
+              (gptel-agent-workers-test--answer
+               (gptel-agent--run-fsm run) "RESEARCH-RESULT")
+              (gptel-agent-workers-test--tool fsm "WorkerTestTool" nil)
+              (funcall tool-callback "NEXT-TOOL-RESULT")
+              (with-current-buffer parent
+                (should (= 1 (gptel-agent-workers-test--count prefix (buffer-string))))
+                (should (= anchor (overlay-end ov)))
+                (goto-char anchor)
+                (should (search-forward "NEXT-TOOL-RESULT" nil t))))))))))
+
+(ert-deftest gptel-agent-workers-overlay-keeps-spacing-through-status-updates ()
+  (gptel-agent-workers-test--with-chat
+    (let* ((run (gptel-agent-workers-test--launch fsm))
+           (child (gptel-agent--run-fsm run))
+           (ov (gptel-agent--run-overlay run))
+           (displays (list (overlay-get ov 'after-string))))
+      ;; Run the delayed indicator synchronously, without leaving a timer behind.
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest args)
+                   (apply function args))))
+        (gptel-agent--indicate-wait child))
+      (push (overlay-get ov 'after-string) displays)
+      (setf (plist-get (gptel-fsm-info child) :tool-use)
+            '((:name "Read" :args (:file_path "example.el"))))
+      (gptel-agent--indicate-tool-call child)
+      (push (overlay-get ov 'after-string) displays)
+      (gptel-agent--workers-status (gptel-agent--workers-for child) "Waiting for agents")
+      (push (overlay-get ov 'after-string) displays)
+      (setf (gptel-agent--run-state run) 'completed)
+      (gptel-agent--run-update-terminal-overlay run "Done")
+      (push (overlay-get ov 'after-string) displays)
+      (dolist (display displays)
+        ;; Adjacent tool overlays need plain blank lines outside both rules.
+        (should (string-prefix-p "\n\n" display))
+        (should (string-suffix-p "\n\n" display))
+        (should-not (get-text-property 0 'face display))
+        (should-not (get-text-property (1- (length display)) 'face display))))))
+
 (ert-deftest gptel-agent-workers-parent-uses-tools-before-worker-finishes ()
   (gptel-agent-workers-test--with-chat
     ;; Agent's immediate acknowledgement goes through the normal tool pipeline.
