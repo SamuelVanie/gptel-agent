@@ -10,6 +10,7 @@
 
 (defvar gptel-agent-workers-test--backend nil)
 (defvar gptel-agent-workers-test--stream nil)
+(defvar gptel-agent-workers-test--mode #'fundamental-mode)
 
 (cl-defmacro gptel-agent-workers-test--with-chat (&body body)
   "Run BODY through real request/tool handlers with only transport mocked."
@@ -39,6 +40,7 @@
                    ((symbol-function 'gptel--url-get-response)
                     (lambda (&rest _) (ert-fail "Unexpected URL transport"))))
            (with-current-buffer parent
+             (funcall gptel-agent-workers-test--mode)
              (insert "User request\n")
              (setq-local gptel-backend
                          (or gptel-agent-workers-test--backend
@@ -162,32 +164,45 @@
                 (should (search-forward "NEXT-TOOL-RESULT" nil t))))))))))
 
 (ert-deftest gptel-agent-workers-overlay-keeps-spacing-through-status-updates ()
-  (gptel-agent-workers-test--with-chat
-    (let* ((run (gptel-agent-workers-test--launch fsm))
-           (child (gptel-agent--run-fsm run))
-           (ov (gptel-agent--run-overlay run))
-           (displays (list (overlay-get ov 'after-string))))
-      ;; Run the delayed indicator synchronously, without leaving a timer behind.
-      (cl-letf (((symbol-function 'run-at-time)
-                 (lambda (_time _repeat function &rest args)
-                   (apply function args))))
-        (gptel-agent--indicate-wait child))
-      (push (overlay-get ov 'after-string) displays)
-      (setf (plist-get (gptel-fsm-info child) :tool-use)
-            '((:name "Read" :args (:file_path "example.el"))))
-      (gptel-agent--indicate-tool-call child)
-      (push (overlay-get ov 'after-string) displays)
-      (gptel-agent--workers-status (gptel-agent--workers-for child) "Waiting for agents")
-      (push (overlay-get ov 'after-string) displays)
-      (setf (gptel-agent--run-state run) 'completed)
-      (gptel-agent--run-update-terminal-overlay run "Done")
-      (push (overlay-get ov 'after-string) displays)
-      (dolist (display displays)
-        ;; Adjacent tool overlays need plain blank lines outside both rules.
-        (should (string-prefix-p "\n\n" display))
-        (should (string-suffix-p "\n\n" display))
-        (should-not (get-text-property 0 'face display))
-        (should-not (get-text-property (1- (length display)) 'face display))))))
+  (let ((gptel-agent-workers-test--mode #'org-mode))
+    (gptel-agent-workers-test--with-chat
+      (gptel-agent-workers-test--tool fsm "WorkerTestTool" nil)
+      (funcall tool-callback "PRECEDING-TOOL-RESULT")
+      (let* ((run (gptel-agent-workers-test--launch fsm))
+             (child (gptel-agent--run-fsm run))
+             (ov (gptel-agent--run-overlay run))
+             (displays (list (overlay-get ov 'after-string))))
+        (gptel-agent-workers-test--tool fsm "WorkerTestTool" nil)
+        (funcall tool-callback "FOLLOWING-TOOL-RESULT")
+        (with-current-buffer parent (font-lock-ensure))
+        ;; Run the delayed indicator synchronously, without leaving a timer behind.
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_time _repeat function &rest args)
+                     (apply function args))))
+          (gptel-agent--indicate-wait child))
+        (push (overlay-get ov 'after-string) displays)
+        (setf (plist-get (gptel-fsm-info child) :tool-use)
+              '((:name "Read" :args (:file_path "example.el"))))
+        (gptel-agent--indicate-tool-call child)
+        (let* ((display (overlay-get ov 'after-string))
+               (name (1+ (string-match "(Read " display))))
+          (should (memq 'font-lock-keyword-face
+                        (get-text-property name 'face display))))
+        (push (overlay-get ov 'after-string) displays)
+        (gptel-agent--workers-status (gptel-agent--workers-for child) "Waiting for agents")
+        (push (overlay-get ov 'after-string) displays)
+        (setf (gptel-agent--run-state run) 'completed)
+        (gptel-agent--run-update-terminal-overlay run "Done")
+        (push (overlay-get ov 'after-string) displays)
+        (dolist (display displays)
+          ;; Blank lines must reset the surrounding tool block's face and
+          ;; prefixes, including after every asynchronous status update.
+          (should (string-prefix-p "\n\n" display))
+          (should (string-suffix-p "\n\n" display))
+          (should (eq (get-text-property 0 'face display) 'default))
+          (should (eq (get-text-property (1- (length display)) 'face display) 'default))
+          (should-not (text-property-not-all 0 (length display) 'line-prefix "" display))
+          (should-not (text-property-not-all 0 (length display) 'wrap-prefix "" display)))))))
 
 (ert-deftest gptel-agent-workers-parent-uses-tools-before-worker-finishes ()
   (gptel-agent-workers-test--with-chat

@@ -2168,8 +2168,8 @@ The caller must have appended all tool results before entering this function."
       (setf (gptel-agent--run-state run) 'waiting-for-agents)
       (when-let* ((ov (gptel-agent--run-overlay run)) ((overlay-buffer ov)))
         (overlay-put ov 'count (1+ (overlay-get ov 'count)))
-        (overlay-put ov 'after-string
-                     (concat (overlay-get ov 'msg) text "\n" gptel-agent--hrule "\n"))))))
+        (gptel-agent--task-display
+         ov (overlay-get ov 'msg) text "\n" gptel-agent--hrule "\n")))))
 
 (defun gptel-agent--workers-done (gate)
   "Gate normal finalization until GATE's descendants and inbox are settled."
@@ -2507,24 +2507,23 @@ steers current work without creating a run or resetting supervision budgets."
   "Show RUN's terminal RESULT and inspection action in its overlay."
   (when-let* ((overlay (gptel-agent--run-overlay run))
               ((overlay-buffer overlay)))
-    (overlay-put
-     overlay 'after-string
-     (concat
-      (overlay-get overlay 'msg)
-      (propertize
-       (format "%s after %d rounds and %d tool calls.\n"
-               (capitalize (symbol-name (gptel-agent--run-state run)))
-               (or (gptel-agent--run-rounds run) 0)
-               (or (gptel-agent--run-tool-calls run) 0))
-       'face (pcase (gptel-agent--run-state run)
-               ('completed 'success)
-               ('inconclusive 'warning)
-               (_ 'error)))
-      (unless (eq (gptel-agent--run-state run) 'completed)
-        (format "%s\n"
-                (truncate-string-to-width
-                 (gptel--to-string result) 500 nil nil t)))
-      gptel-agent--hrule "\n"))))
+    (gptel-agent--task-display
+     overlay
+     (overlay-get overlay 'msg)
+     (propertize
+      (format "%s after %d rounds and %d tool calls.\n"
+              (capitalize (symbol-name (gptel-agent--run-state run)))
+              (or (gptel-agent--run-rounds run) 0)
+              (or (gptel-agent--run-tool-calls run) 0))
+      'face (pcase (gptel-agent--run-state run)
+              ('completed 'success)
+              ('inconclusive 'warning)
+              (_ 'error)))
+     (unless (eq (gptel-agent--run-state run) 'completed)
+       (format "%s\n"
+               (truncate-string-to-width
+                (gptel--to-string result) 500 nil nil t)))
+     gptel-agent--hrule "\n")))
 
 (defun gptel-agent--run-cancel-timer (run accessor setter)
   "Cancel RUN timer returned by ACCESSOR and clear it with SETTER."
@@ -3038,7 +3037,7 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                          (concat
                           (propertize "Running... " 'face 'warning) "\n"
                           gptel-agent--hrule "\n"))))
-           (overlay-put ov 'after-string new-info-msg))))
+           (gptel-agent--task-display ov new-info-msg))))
      info-ov count run)))
 
 (defun gptel-agent--indicate-tool-call (fsm)
@@ -3065,7 +3064,27 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                                 tool-use)
                      "\n" gptel-agent--hrule "\n")))
       (overlay-put ov 'count (+ info-count (length tool-use)))
-      (overlay-put ov 'after-string new-info-msg))))
+      (gptel-agent--task-display ov new-info-msg))))
+
+(defun gptel-agent--task-display (overlay &rest strings)
+  "Display STRINGS in task OVERLAY without inheriting surrounding tool styles."
+  (let ((text (apply #'concat strings)))
+    ;; An after-string inherits the faces and line prefixes at its anchor.
+    ;; At a tool block boundary these include Org's block background, font
+    ;; size, and org-modern's fringe border.  Put the defaults on the string
+    ;; itself: properties on OVERLAY do not cover its after-string.
+    ;; Preserve tool-call syntax colors before an explicit face masks the
+    ;; font-lock-face alias used by `gptel--format-tool-call'.
+    (let ((pos 0))
+      (while (< pos (length text))
+        (let ((end (next-single-property-change
+                    pos 'font-lock-face text (length text)))
+              (face (get-text-property pos 'font-lock-face text)))
+          (when face (add-face-text-property pos end face t text))
+          (setq pos end))))
+    (add-face-text-property 0 (length text) 'default t text)
+    (add-text-properties 0 (length text) '(line-prefix "" wrap-prefix "") text)
+    (overlay-put overlay 'after-string text)))
 
 (defun gptel-agent--task-overlay (where &optional agent-type description run)
   "Create an Agent task overlay at WHERE.
@@ -3104,10 +3123,9 @@ button for its live diagnostic buffer."
       (overlay-put ov 'count 0)
       (overlay-put ov 'msg msg)
       (overlay-put ov 'line-prefix "")
-      (overlay-put
-       ov 'after-string
-       (concat msg (propertize "Waiting..." 'face 'warning) "\n"
-               gptel-agent--hrule "\n")))))
+      (gptel-agent--task-display
+       ov msg (propertize "Waiting..." 'face 'warning) "\n"
+       gptel-agent--hrule "\n"))))
 
 (defun gptel-agent--task-response-position (fsm)
   "Return FSM's response position, initializing normal chat output if needed."
