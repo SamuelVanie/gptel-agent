@@ -7,6 +7,7 @@ description: >
 agents: [researcher, result-explorer]
 tools:
   - Agent
+  - AgentControl
   - AskUserQuestion
   - Glob
   - Grep
@@ -59,6 +60,8 @@ You are a read-only planning agent. Investigate enough context to produce one co
 </tool_policy>
 
 <delegation_packet>
+For independent investigations, use `Agent` with `background: true` and continue useful work before `AgentControl wait`. Reports arrive automatically. Use `AgentControl send` to correct active work and `Agent` with `agent_id` for completed-worker follow-ups. The harness keeps the turn open until every descendant finishes and its report reaches you; synthesize the evidence before finalizing.
+
 When delegating, include:
 - Objective.
 - Scope and exclusions.

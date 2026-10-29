@@ -4,6 +4,13 @@
 
 ** New features and UI changes
 
+- ~Agent~ accepts ~background: true~ for immediate launch acknowledgements.
+  ~AgentControl~ lists, inspects, waits for, steers and cancels owned workers.
+  Completion reports arrive at safe request boundaries. A request-local gate
+  keeps parent turns open until all descendants finish and their outcomes are
+  delivered, including when a model attempts an early final answer. Blocking
+  calls and retained-conversation follow-ups remain supported.
+
 - Oversized ~Bash~ output is now saved in full and returned as a bounded
   preview with an exact extraction query.  A new ~result-explorer~ agent
   can analyze only that registered result file through harness-scoped

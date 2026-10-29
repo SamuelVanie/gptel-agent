@@ -1054,7 +1054,7 @@
       (should (equal (mapcar (lambda (arg) (plist-get arg :name))
                              (gptel-tool-args local-tool))
                      '("subagent_type" "description" "prompt"
-                       "result_file" "query" "agent_id")))
+                       "result_file" "query" "agent_id" "background")))
       (should (equal (gptel-tool-args global-tool) global-args))
       (cl-letf (((symbol-function 'gptel-agent--task)
                  (lambda (&rest args) (setq captured args))))

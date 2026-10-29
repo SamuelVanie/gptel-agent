@@ -265,10 +265,14 @@ from the Agent overlay until the user kills them or closes the parent chat."
   "Sub-agent conversations owned by this buffer, keyed by stable agent ID.")
 (put 'gptel-agent--sessions 'permanent-local t)
 
+(defvar gptel-agent--disposing-run-buffer nil
+  "Run whose diagnostic buffer the harness is disposing of automatically.
+Its lightweight session/result record remains available to AgentControl.")
+
 (cl-defstruct (gptel-agent--session
                (:constructor gptel-agent--make-session))
   "A retained sub-agent conversation, with a fresh RUN for each task."
-  id run request-info resumable)
+  id run request-info resumable last-result)
 
 (defvar gptel-agent--run-counter 0
   "Monotonic counter used to assign identifiers to sub-agent runs.")
@@ -290,7 +294,18 @@ from the Agent overlay until the user kills them or closes the parent chat."
   tool-calls web-tool-calls finalization-reason
   finalization-requested finalization-started
   ;; Append new fields to preserve accessors in already compiled consumers.
-  session)
+  session background result delivered)
+
+(cl-defstruct (gptel-agent--workers
+               (:constructor gptel-agent--make-workers))
+  "Request-local completion gate and worker inbox.
+EVENTS holds terminal runs, not sessions: a follow-up cannot replace an
+undelivered result.  WAITERS and automatic delivery consume the same inbox."
+  fsm handlers events waiters steering answer closed wakeup callback interim)
+
+(defvar-local gptel-agent--worker-requests nil
+  "Worker gates owned by this buffer, including parked requests.")
+(put 'gptel-agent--worker-requests 'permanent-local t)
 
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
@@ -1990,7 +2005,8 @@ the known skills as string ready to be included to the context."
 - Perform the assigned task; do not optimize for producing a positive answer.
 - A negative or inconclusive finding is a valid result.  Never repeat a substantially identical failed action just to manufacture an answer.
 - If the target cannot be verified or a required tool/source is unavailable, stop and report what was attempted, the precise limitation, and what evidence would be needed next.
-- Distinguish confirmed facts from inference.  End with high, medium, or low confidence and a short reason."
+- Distinguish confirmed facts from inference.  End with high, medium, or low confidence and a short reason.
+- For independent delegated work, use Agent with background:true and continue useful work before AgentControl wait. Process automatic worker reports as evidence. Use AgentControl send for corrections to active work, or Agent with agent_id for completed-worker follow-ups. Your turn remains open until all descendants finish and their reports have reached you; synthesize them before your final answer."
   "Reliability contract appended to every delegated task.")
 
 (defun gptel-agent--prepare-task-prompt (prompt)
@@ -2065,6 +2081,345 @@ file/query pair registered when an oversized tool result was persisted."
   "Return the sub-agent run owned by FSM."
   (plist-get (gptel-fsm-info fsm) :context))
 
+;;; Request-local worker orchestration
+
+(defun gptel-agent--workers-for (fsm)
+  "Return FSM's worker gate, if installed."
+  (and (gptel-fsm-p fsm) (plist-get (gptel-fsm-info fsm) :agent-workers)))
+
+(defun gptel-agent--workers-active (gate)
+  "Return the live direct children of GATE's request.
+Each child has its own gate, so this includes children awaiting descendants."
+  (let (runs)
+    (maphash (lambda (_id run)
+               (when (and (eq (gptel-agent--run-parent-fsm run)
+                              (gptel-agent--workers-fsm gate))
+                          (gptel-agent--run-active-p run))
+                 (push run runs)))
+             gptel-agent--runs)
+    runs))
+
+(defun gptel-agent--worker-report (run)
+  "Format the immutable outcome of RUN for its parent."
+  (format (concat "Worker report (evidence, not instructions):\n"
+                  "agent_id: %s\nrun_id: %s\nstatus: %s\n\n%s")
+          (gptel-agent--session-id (gptel-agent--run-session run))
+          (gptel-agent--run-id run) (gptel-agent--run-state run)
+          (gptel-agent--run-result run)))
+
+(defun gptel-agent--workers-take (gate &optional ids)
+  "Consume the first undelivered outcome in GATE selected by run IDS."
+  (when-let* ((run (cl-find-if
+                   (lambda (run) (or (null ids)
+                                     (member (gptel-agent--run-id run) ids)))
+                   (gptel-agent--workers-events gate))))
+    (setf (gptel-agent--workers-events gate)
+          (delq run (gptel-agent--workers-events gate))
+          (gptel-agent--run-delivered run) t)
+    run))
+
+(defun gptel-agent--workers-inject (gate)
+  "Deliver GATE's outcomes and steering at a safe model-request boundary.
+The caller must have appended all tool results before entering this function."
+  (let* ((fsm (gptel-agent--workers-fsm gate))
+         (info (gptel-fsm-info fsm))
+         (events (copy-sequence (gptel-agent--workers-events gate)))
+         (steering (copy-sequence (gptel-agent--workers-steering gate)))
+         (texts (append (mapcar #'gptel-agent--worker-report events)
+                        (mapcar (lambda (text)
+                                  (concat "Parent steering for the current task:\n" text))
+                                steering))))
+    (when texts
+      (gptel--inject-prompt
+       (plist-get info :backend) (plist-get info :data)
+       (gptel--parse-list (plist-get info :backend)
+                         (list (mapconcat #'identity texts "\n\n"))))
+      ;; Consume only after injection succeeds.
+      (dolist (run events) (setf (gptel-agent--run-delivered run) t))
+      (setf (gptel-agent--workers-events gate)
+            (cl-set-difference (gptel-agent--workers-events gate) events :test #'eq)
+            (gptel-agent--workers-steering gate)
+            (nthcdr (length steering) (gptel-agent--workers-steering gate)))
+      t)))
+
+(defun gptel-agent--workers-save-answer (gate)
+  "Retain the interim answer in GATE before resuming the same request."
+  (let* ((info (gptel-fsm-info (gptel-agent--workers-fsm gate)))
+         (data (plist-get info :data))
+         (messages (or (plist-get data :messages) (plist-get data :contents)
+                       (plist-get data :input)))
+         (last (and (length> messages 0) (elt messages (1- (length messages))))))
+    ;; Gemini streaming already includes the model's answer in the payload.
+    (when (and (gptel-agent--workers-answer gate)
+               (not (member (plist-get last :role) '("assistant" "model"))))
+      (gptel--inject-prompt
+       (plist-get info :backend) data
+       (gptel--parse-list (plist-get info :backend)
+                         (list (cons 'response (gptel-agent--workers-answer gate))))))
+    (setf (gptel-agent--workers-answer gate) nil)))
+
+(defun gptel-agent--workers-status (gate text)
+  "Display TEXT for GATE and its owning worker overlay."
+  (let* ((info (gptel-fsm-info (gptel-agent--workers-fsm gate)))
+         (run (plist-get info :context)))
+    (with-current-buffer (plist-get info :buffer)
+      (gptel--update-status (concat " " text) 'font-lock-escape-face))
+    (when (gptel-agent--run-p run)
+      (setf (gptel-agent--run-state run) 'waiting-for-agents)
+      (when-let* ((ov (gptel-agent--run-overlay run)) ((overlay-buffer ov)))
+        (overlay-put ov 'count (1+ (overlay-get ov 'count)))
+        (overlay-put ov 'after-string
+                     (concat (overlay-get ov 'msg) text "\n" gptel-agent--hrule))))))
+
+(defun gptel-agent--workers-done (gate)
+  "Gate normal finalization until GATE's descendants and inbox are settled."
+  (let ((fsm (gptel-agent--workers-fsm gate)))
+    (if (or (gptel-agent--workers-active gate)
+            (gptel-agent--workers-events gate)
+            (gptel-agent--workers-steering gate))
+        (progn
+          (gptel-agent--workers-save-answer gate)
+          (setf (gptel-agent--workers-interim gate) t
+                (gptel-fsm-state fsm) 'AGWT)
+          (gptel-agent--workers-status gate "Waiting for agents")
+          (gptel-agent--workers-schedule gate))
+      (setf (gptel-fsm-state fsm) 'DONE)
+      (gptel-agent--workers-close gate)
+      (mapc (lambda (handler) (funcall handler fsm))
+            (alist-get 'DONE (gptel-agent--workers-handlers gate))))))
+
+(defun gptel-agent--workers-close (gate)
+  "Invalidate GATE's inbox, callbacks and scheduled wakeup."
+  (setf (gptel-agent--workers-closed gate) t
+        (gptel-agent--workers-events gate) nil
+        (gptel-agent--workers-steering gate) nil
+        (gptel-agent--workers-waiters gate) nil)
+  (when-let* ((timer (gptel-agent--workers-wakeup gate)))
+    (cancel-timer timer)
+    (setf (gptel-agent--workers-wakeup gate) nil))
+  (when-let* ((buffer (plist-get (gptel-fsm-info
+                                  (gptel-agent--workers-fsm gate)) :buffer))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (setq gptel-agent--worker-requests (delq gate gptel-agent--worker-requests)))))
+
+(defun gptel-agent--workers-stop (gate)
+  "Close GATE and cancel its entire worker subtree without delivering results."
+  (gptel-agent--workers-close gate)
+  (dolist (run (gptel-agent--workers-active gate))
+    (gptel-agent--run-finish
+     run 'cancelled "Error: Owning request stopped." 'parent-stopped t)))
+
+(defun gptel-agent--workers-dispatch (gate state)
+  "Run request-local handlers for STATE, enforcing GATE's lifecycle."
+  (unless (gptel-agent--workers-closed gate)
+    (let* ((fsm (gptel-agent--workers-fsm gate))
+           (info (gptel-fsm-info fsm))
+           (run (plist-get info :context)))
+      (condition-case err
+          (with-current-buffer (plist-get info :buffer)
+            (pcase state
+              ((or 'DONE 'AGCK) (gptel-agent--workers-done gate))
+              (_
+               (when (eq state 'WAIT)
+                 (gptel-agent--workers-wrap-callback gate)
+                 (gptel-agent--workers-inject gate)
+                 (setf (gptel-agent--workers-answer gate) nil))
+               ;; Supervised workers own transient-error retry decisions.
+               ;; Their terminal run-finish also stops their subtree.
+               (when (or (eq state 'ABRT)
+                         (and (eq state 'ERRS) (not (gptel-agent--run-p run))))
+                 (gptel-agent--workers-stop gate))
+               (mapc (lambda (handler)
+                       ;; gptel recognizes its default insertion callbacks by
+                       ;; identity when relocating output from read-only buffers.
+                       (if (eq handler #'gptel--handle-pre-insert)
+                           (let ((callback (plist-get info :callback)))
+                             (unwind-protect
+                                 (progn
+                                   (setf (plist-get info :callback)
+                                         (gptel-agent--workers-callback gate))
+                                   (funcall handler fsm))
+                               (setf (plist-get info :callback) callback)))
+                         (funcall handler fsm)))
+                     (alist-get state (gptel-agent--workers-handlers gate))))))
+        (error
+         (gptel-agent--workers-stop gate)
+         (if (gptel-agent--run-p run)
+             (gptel-agent--run-finish
+              run 'failed (format "Error: Worker orchestration failed: %S" err) err)
+           (setf (gptel-fsm-state fsm) 'ERRS
+                 (plist-get (gptel-fsm-info fsm) :error) (error-message-string err))
+           (mapc (lambda (handler) (funcall handler fsm))
+                 (alist-get 'ERRS (gptel-agent--workers-handlers gate)))))))))
+
+(defun gptel-agent--workers-wrap-callback (gate)
+  "Capture GATE's response after gptel has resolved streaming support."
+  (unless (gptel-agent--workers-callback gate)
+    (let* ((info (gptel-fsm-info (gptel-agent--workers-fsm gate)))
+           (callback (or (plist-get info :callback)
+                         (if (and gptel-use-curl (plist-get info :stream))
+                             #'gptel-curl--stream-insert-response
+                           #'gptel--insert-response))))
+      (setf (gptel-agent--workers-callback gate) callback
+            (plist-get (gptel-fsm-info (gptel-agent--workers-fsm gate)) :callback)
+            (lambda (response info &rest args)
+              (unless (gptel-agent--workers-closed gate)
+                (when (and (stringp response) (not (car args)))
+                  (setf (gptel-agent--workers-answer gate)
+                        (concat (gptel-agent--workers-answer gate) response)))
+                (apply callback response info args)))))))
+
+(defun gptel-agent--workers-install (fsm)
+  "Install a completion gate on FSM without changing global gptel handlers."
+  (or (gptel-agent--workers-for fsm)
+      (let* ((info (gptel-fsm-info fsm))
+             (buffer (plist-get info :buffer))
+             (gate (gptel-agent--make-workers
+                    :fsm fsm :handlers (gptel-fsm-handlers fsm))))
+        (setf (gptel-fsm-info fsm) (plist-put info :agent-workers gate)
+              (gptel-fsm-table fsm) (copy-tree (gptel-fsm-table fsm)))
+        (dolist (entry (gptel-fsm-table fsm))
+          (dolist (transition (cdr entry))
+            (when (eq (cdr transition) 'DONE) (setcdr transition 'AGCK))))
+        (setf (gptel-fsm-handlers fsm)
+              (mapcar (lambda (state)
+                        (list state (lambda (_fsm)
+                                      (gptel-agent--workers-dispatch gate state))))
+                      (delete-dups (cons 'AGCK (cons 'DONE
+                                         (mapcar #'car (gptel-fsm-handlers fsm)))))))
+        (unless (eq (gptel-fsm-state fsm) 'INIT)
+          (gptel-agent--workers-wrap-callback gate))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (push gate gptel-agent--worker-requests)
+            (add-hook 'kill-buffer-hook #'gptel-agent--workers-kill-buffer nil t)))
+        gate)))
+
+(defun gptel-agent--workers-kill-buffer ()
+  "Stop parked as well as requesting worker trees when their chat is closed."
+  (dolist (gate (copy-sequence gptel-agent--worker-requests))
+    (gptel-agent--workers-stop gate)))
+(put 'gptel-agent--workers-kill-buffer 'permanent-local-hook t)
+
+(defun gptel-agent--workers-schedule (gate)
+  "Schedule an event-driven wakeup for GATE after the current callback unwinds."
+  (unless (or (gptel-agent--workers-closed gate)
+              (gptel-agent--workers-wakeup gate))
+    (setf (gptel-agent--workers-wakeup gate)
+          (run-at-time 0 nil #'gptel-agent--workers-wake gate))))
+
+(defun gptel-agent--workers-wake (gate)
+  "Resolve explicit waits or resume a parked GATE; never poll a model."
+  (when-let* ((timer (gptel-agent--workers-wakeup gate))) (cancel-timer timer))
+  (setf (gptel-agent--workers-wakeup gate) nil)
+  (unless (gptel-agent--workers-closed gate)
+    (let* ((fsm (gptel-agent--workers-fsm gate))
+           (buffer (plist-get (gptel-fsm-info fsm) :buffer)))
+      (if (not (buffer-live-p buffer))
+          (gptel-agent--workers-stop gate)
+        (with-current-buffer buffer
+          (dolist (waiter (copy-sequence (gptel-agent--workers-waiters gate)))
+            (unless (gptel-agent--workers-closed gate)
+              (let* ((ids (car waiter))
+                     (run (gptel-agent--workers-take gate ids))
+                     (active (cl-some (lambda (run)
+                                       (member (gptel-agent--run-id run) ids))
+                                     (gptel-agent--workers-active gate))))
+                (when (or run (not active))
+                  ;; Remove before calling back: the callback may reenter us.
+                  (setf (gptel-agent--workers-waiters gate)
+                        (delq waiter (gptel-agent--workers-waiters gate)))
+                  (funcall (cdr waiter)
+                           (if run (gptel-agent--worker-report run)
+                             "status: no_eligible_work\nNo undelivered outcome or active selected worker."))))))
+          (when (and (not (gptel-agent--workers-closed gate))
+                     (eq (gptel-fsm-state fsm) 'AGWT)
+                     (or (gptel-agent--workers-events gate)
+                         (gptel-agent--workers-steering gate)))
+            (gptel--fsm-transition fsm 'WAIT)))))))
+
+(defun gptel-agent--workers-enqueue (run)
+  "Queue terminal RUN once, independently of its launch callback."
+  (when-let* ((gate (gptel-agent--workers-for (gptel-agent--run-parent-fsm run)))
+              ((not (gptel-agent--workers-closed gate))))
+    (setf (gptel-agent--workers-events gate)
+          (nconc (gptel-agent--workers-events gate) (list run)))
+    (gptel-agent--workers-schedule gate)))
+
+(defun gptel-agent--control (callback fsm action &optional agent-id agent-ids message)
+  "Perform parent-owned worker ACTION in FSM and complete CALLBACK once.
+AGENT-ID selects one worker; AGENT-IDS selects any-of waiting.  MESSAGE
+steers current work without creating a run or resetting supervision budgets."
+  (let* ((gate (gptel-agent--workers-for fsm))
+         (buffer (and gate (plist-get (gptel-fsm-info fsm) :buffer))))
+    (if (or (not gate) (gptel-agent--workers-closed gate)
+            (not (buffer-live-p buffer)))
+        (funcall callback "Error: AgentControl has no live owning request.")
+      (with-current-buffer buffer
+        (let* ((session (cdr (assoc agent-id gptel-agent--sessions)))
+               (run (and session (gptel-agent--session-run session))))
+          (cond
+           ((equal action "list")
+            (funcall callback
+                     (if gptel-agent--sessions
+                         (mapconcat
+                          (lambda (entry)
+                            (let ((run (gptel-agent--session-run (cdr entry))))
+                              (format "agent_id: %s | run_id: %s | status: %s | %s"
+                                      (car entry) (gptel-agent--run-id run)
+                                      (gptel-agent--run-state run)
+                                      (gptel-agent--run-description run))))
+                          gptel-agent--sessions "\n")
+                       "status: no_workers")))
+           ((equal action "wait")
+            (let* ((ids (and (not (eq agent-ids :null)) (append agent-ids nil)))
+                   (unknown (cl-find-if (lambda (id) (not (assoc id gptel-agent--sessions))) ids))
+                   (eligible (cl-remove-if-not
+                              (lambda (run)
+                                (or (null ids)
+                                    (member (gptel-agent--session-id
+                                             (gptel-agent--run-session run)) ids)))
+                              (append (gptel-agent--workers-events gate)
+                                      (gptel-agent--workers-active gate)))))
+              (cond
+               (unknown (funcall callback (format "Error: Unknown agent_id %S in this chat." unknown)))
+               ((null eligible) (funcall callback "status: no_eligible_work\nNo undelivered outcome or active selected worker."))
+               (t
+                (setf (gptel-agent--workers-waiters gate)
+                      (nconc (gptel-agent--workers-waiters gate)
+                             (list (cons (mapcar #'gptel-agent--run-id eligible) callback))))
+                (gptel-agent--workers-status gate "Waiting for agents")
+                (gptel-agent--workers-wake gate)))))
+           ((not run) (funcall callback (format "Error: Unknown agent_id %S in this chat." agent-id)))
+           ((equal action "read")
+            (funcall callback
+                     (concat (format "agent_id: %s\nrun_id: %s\nstatus: %s"
+                                     agent-id (gptel-agent--run-id run)
+                                     (gptel-agent--run-state run))
+                             (when-let* ((last (gptel-agent--session-last-result session)))
+                               (concat "\n\nLatest completed invocation (inspection):\n"
+                                       (gptel-agent--worker-report last))))))
+           ((equal action "send")
+            (cond
+             ((not (gptel-agent--run-active-p run))
+              (funcall callback "Error: Worker is complete. Use Agent with agent_id for a follow-up task."))
+             ((not (and (stringp message) (not (string-blank-p message))))
+              (funcall callback "Error: send requires a nonempty message."))
+             (t
+              ;; An asynchronous prompt transform can still be preparing this
+              ;; request, before our normal localization transform has run.
+              (let ((inbox (gptel-agent--workers-install (gptel-agent--run-fsm run))))
+                (setf (gptel-agent--workers-steering inbox)
+                      (nconc (gptel-agent--workers-steering inbox) (list message)))
+                (gptel-agent--run-log run "PARENT STEERING queued: %s" message)
+                (gptel-agent--workers-schedule inbox)
+                (funcall callback "status: accepted\nSteering queued for the current task's next request boundary.")))))
+           ((equal action "cancel")
+            (gptel-agent--run-finish run 'cancelled "Cancelled by the parent agent." 'parent-cancel)
+            (funcall callback (format "agent_id: %s\nstatus: %s" agent-id (gptel-agent--run-state run))))
+           (t (funcall callback (format "Error: Unknown AgentControl action %S." action)))))))))
+
 (defun gptel-agent--display-run-buffer (run &rest _)
   "Display RUN's live diagnostic buffer."
   (if (buffer-live-p (gptel-agent--run-child-buffer run))
@@ -2093,7 +2448,8 @@ file/query pair registered when an oversized tool result was persisted."
     (unless (gptel-agent--run-active-p run)
       (gptel-agent--task-cleanup-overlay
        (gptel-agent--run-overlay run)))
-    (when (buffer-live-p (gptel-agent--run-parent-buffer run))
+    (when (and (not (eq gptel-agent--disposing-run-buffer run))
+               (buffer-live-p (gptel-agent--run-parent-buffer run)))
       (with-current-buffer (gptel-agent--run-parent-buffer run)
         (setq gptel-agent--sessions
               (rassq-delete-all (gptel-agent--run-session run)
@@ -2101,6 +2457,7 @@ file/query pair registered when an oversized tool result was persisted."
 
 (defun gptel-agent--close-sessions ()
   "Cancel and close all sub-agent conversations owned by this buffer."
+  (gptel-agent--workers-kill-buffer)
   (let ((sessions gptel-agent--sessions))
     (setq gptel-agent--sessions nil)
     (dolist (entry sessions)
@@ -2225,7 +2582,16 @@ REASON is retained for diagnostics.  When SUPPRESS-DELIVERY is non-nil, do
 not send RESULT to the parent tool callback."
   (when (gptel-agent--run-active-p run)
     (setf (gptel-agent--run-state run) state
-          (gptel-agent--run-terminal-reason run) reason)
+          (gptel-agent--run-terminal-reason run) reason
+          (gptel-agent--run-result run) result)
+    (when-let* ((session (gptel-agent--run-session run)))
+      (setf (gptel-agent--session-last-result session) run))
+    ;; Terminal failures/budget limits must not orphan nested workers.  Close
+    ;; their inbox first so cancelled descendants cannot wake a dying parent.
+    (when-let* ((fsm (gptel-agent--run-fsm run))
+                ((plist-get (gptel-fsm-info fsm) :buffer)))
+      ;; Also guard requests still inside asynchronous prompt transforms.
+      (gptel-agent--workers-stop (gptel-agent--workers-install fsm)))
     (gptel-agent--run-log
      run "TERMINAL %s: %s" state (gptel--to-string result))
     (gptel-agent--run-cancel-timer
@@ -2236,7 +2602,7 @@ not send RESULT to the parent tool callback."
      run #'gptel-agent--run-retry-timer
      (lambda (value object)
        (setf (gptel-agent--run-retry-timer object) value)))
-    (when (memq state '(timed-out cancelled))
+    (when (memq state '(failed timed-out cancelled))
       (gptel-agent--run-abort-transport run))
     (gptel-agent--record-terminal-run run result)
     (gptel-agent--run-update-terminal-overlay run result)
@@ -2254,7 +2620,8 @@ not send RESULT to the parent tool callback."
            t))
       (gptel-agent--task-cleanup-overlay (gptel-agent--run-overlay run))
       (when (buffer-live-p (gptel-agent--run-child-buffer run))
-        (kill-buffer (gptel-agent--run-child-buffer run))))
+        (let ((gptel-agent--disposing-run-buffer run))
+          (kill-buffer (gptel-agent--run-child-buffer run)))))
     (when (and (not suppress-delivery)
                (buffer-live-p (gptel-agent--run-parent-buffer run)))
       ;; Async tool callbacks can arrive from a Curl/process buffer.  Resume
@@ -2262,13 +2629,16 @@ not send RESULT to the parent tool callback."
       ;; cannot be taken from an unrelated concurrent request.
       (with-current-buffer (gptel-agent--run-parent-buffer run)
         (condition-case err
-            (funcall
-             (gptel-agent--run-callback run)
-             (if-let* ((session (gptel-agent--run-session run))
-                       ((gptel-agent--session-resumable session)))
-                 (format "agent_id: %s\nUse Agent with this agent_id for related follow-up tasks.\n\n%s"
-                         (gptel-agent--session-id session) result)
-               result))
+            (if (gptel-agent--run-background run)
+                (gptel-agent--workers-enqueue run)
+              (setf (gptel-agent--run-delivered run) t)
+              (funcall
+               (gptel-agent--run-callback run)
+               (if-let* ((session (gptel-agent--run-session run))
+                         ((gptel-agent--session-resumable session)))
+                   (format "agent_id: %s\nUse Agent with this agent_id for related follow-up tasks.\n\n%s"
+                           (gptel-agent--session-id session) result)
+                 result)))
           (error
            (message "gptel-agent: parent callback for run %s failed: %S"
                     (gptel-agent--run-id run) err)))))
@@ -2298,6 +2668,12 @@ ABRT after its children have stopped."
 
 (defun gptel-agent--abort-with-owned-runs (original buffer)
   "Around advice for `gptel-abort' that also cancels BUFFER's children."
+  ;; Parked requests have no transport in `gptel--request-alist'.
+  (when (buffer-live-p buffer)
+    (dolist (gate (copy-sequence
+                  (buffer-local-value 'gptel-agent--worker-requests buffer)))
+      (unless (gptel-agent--workers-closed gate)
+        (gptel--fsm-transition (gptel-agent--workers-fsm gate) 'ABRT))))
   (gptel-agent--cancel-runs-for-buffer buffer)
   (funcall original buffer))
 
@@ -2491,7 +2867,15 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
   "Complete a sub-agent FSM only when it enters DONE."
   (let* ((info (gptel-fsm-info fsm))
          (run (gptel-agent--run-from-fsm fsm))
-         (response (and run (gptel-agent--run-response run))))
+         (gate (gptel-agent--workers-for fsm))
+         ;; An attempted final answer held by the gate is interim output.
+         ;; It stays in the conversation and diagnostic buffer, but only the
+         ;; final synthesis belongs in the worker's completion report.
+         (response (and run
+                        (if (and gate (gptel-agent--workers-interim gate))
+                            (substring (gptel-agent--run-response run)
+                                       (gptel-agent--run-response-checkpoint run))
+                          (gptel-agent--run-response run)))))
     (when (and run (gptel-agent--run-active-p run))
       (gptel-agent--save-session-response run info)
       (if (string-blank-p (or response ""))
@@ -2626,6 +3010,7 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                       ((not (string-blank-p id))))
                 (format " [follow-up: %s]" id)
               "")
+            (if (eq (nth 6 arg-values) t) " [background]" "")
             "\n" (propertize (prin1-to-string prompt)
                              'line-prefix "  "
                              'wrap-prefix "  "
@@ -2643,18 +3028,19 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
               (count (overlay-get info-ov 'count)))
     (run-at-time
      1.5 nil
-     (lambda (ov count)
+     (lambda (ov count run)
        (when (and (overlay-buffer ov)
+                  (gptel-agent--run-active-p run)
                   (eql (overlay-get ov 'count) count))
          (let* ((task-msg (overlay-get ov 'msg))
                 (new-info-msg
                  (concat task-msg
                          (concat
-                          (propertize "Waiting... " 'face 'warning) "\n"
+                          (propertize "Running... " 'face 'warning) "\n"
                           (propertize "\n" 'face
                                       '(:inherit shadow :underline t :extend t))))))
            (overlay-put ov 'after-string new-info-msg))))
-     info-ov count)))
+     info-ov count run)))
 
 (defun gptel-agent--indicate-tool-call (fsm)
   "Display tool call indicator for agent task FSM."
@@ -2807,7 +3193,7 @@ The value must be nil (unlimited) or a non-negative integer."
 
 (defun gptel-agent--task (main-cb agent-type description prompt
                                   &optional parent-fsm agent-snapshot
-                                  result-file query agent-id)
+                                  result-file query agent-id background)
   "Call a gptel agent to do specific compound tasks.
 
 MAIN-CB is the main callback to return a value to the main loop.
@@ -2817,7 +3203,9 @@ PROMPT is the detailed prompt instructing the agent on what is required.
 PARENT-FSM and AGENT-SNAPSHOT are supplied by the request-local Agent tool.
 RESULT-FILE and QUERY are the enforced scope contract used only by the
 `result-explorer' agent.  AGENT-ID continues a completed conversation owned
-by the same parent buffer; nil or a blank string starts a new conversation."
+by the same parent buffer; nil or a blank string starts a new conversation.
+BACKGROUND equal to t acknowledges launch immediately; completion is queued
+on PARENT-FSM and cannot finish that parent turn before delivery."
   (let* ((parent-info (and (gptel-fsm-p parent-fsm)
                            (gptel-fsm-info parent-fsm)))
          (parent-buffer (and parent-info (plist-get parent-info :buffer)))
@@ -2842,6 +3230,9 @@ by the same parent buffer; nil or a blank string starts a new conversation."
     (cond
      ((not (buffer-live-p parent-buffer))
       (funcall main-cb "Error: Agent dispatch has no live parent request."))
+     ((and (gptel-agent--workers-for parent-fsm)
+           (gptel-agent--workers-closed (gptel-agent--workers-for parent-fsm)))
+      (funcall main-cb "Error: The owning request is already complete."))
      ((and agent-id
            (or (not previous)
                (not (buffer-live-p (gptel-agent--run-child-buffer previous)))
@@ -2899,11 +3290,13 @@ by the same parent buffer; nil or a blank string starts a new conversation."
                    :state 'created :agent agent-type :description description
                    :prompt task-prompt :parent-fsm parent-fsm
                    :parent-buffer parent-buffer :child-buffer child-buffer
-                   :callback main-cb :response "" :response-checkpoint 0
+                   :callback main-cb :background (eq background t)
+                   :response "" :response-checkpoint 0
                    :rounds 0 :retries 0 :tool-calls 0 :web-tool-calls 0
                    :finalization-reason nil :finalization-requested nil
                    :finalization-started nil
                    :started-at (float-time))))
+        (gptel-agent--workers-install parent-fsm)
         (unless session
           (setq session (gptel-agent--make-session
                          :id (gptel-agent--run-id run))))
@@ -3050,7 +3443,14 @@ by the same parent buffer; nil or a blank string starts a new conversation."
             run 'failed
             (format "Error: Could not start sub-agent task %S: %S"
                     description err)
-            err))))))))
+            err)))
+        (when (gptel-agent--run-background run)
+          (with-current-buffer parent-buffer
+            (funcall main-cb
+                     (format "agent_id: %s\nrun_id: %s\nstatus: %s\nCompletion will be delivered automatically. Continue useful work; use AgentControl to steer or wait."
+                             (gptel-agent--session-id session)
+                             (gptel-agent--run-id run)
+                             (gptel-agent--run-state run))))))))))
 
 ;;; Register tool call preview functions
 
@@ -3945,6 +4345,12 @@ Agents run independently and return results in one message.  \
 Use for open-ended searches, complex research, exploration tasks, \
 or when a task matches an available agent's description.  \
 You can launch multiple agents in parallel for independent tasks.  \
+Set background:true to receive agent_id/run_id immediately and continue useful \
+work while the worker runs. Omit background to wait for its result as before. \
+Background completions arrive automatically at request boundaries. Use \
+AgentControl to list/read status, send steering, cancel, or explicitly wait \
+when no useful work remains. A turn stays open until all descendants finish \
+and their outcomes reach you; synthesize their evidence before your final answer. \
 Results include an agent_id. To assign a related follow-up or correction, \
 call Agent again with that agent_id, the same subagent_type, and the new \
 description and prompt. The agent retains its conversation and tool evidence. \
@@ -4016,6 +4422,11 @@ IGNORE-SELECTION ignores the conversation's interactive selection."
 The clone captures FSM and a snapshot of the allowed agent registry.  Its
 schema and dispatcher therefore cannot change when another project updates
 the global registry while this request is in flight."
+  (when (or (gptel-agent--run-p (plist-get (gptel-fsm-info fsm) :context))
+            (cl-find-if (lambda (tool) (member (gptel-tool-name tool)
+                                               '("Agent" "AgentControl")))
+                        gptel-tools))
+    (gptel-agent--workers-install fsm))
   (when-let* ((base-tool
                (cl-find "Agent" gptel-tools
                         :key #'gptel-tool-name :test #'string=)))
@@ -4043,9 +4454,9 @@ the global registry while this request is in flight."
             (plist-get (car args) :enum) (vconcat (mapcar #'car snapshot))
             (gptel-tool-function tool)
             (lambda (main-cb agent-type description prompt
-                             &optional result-file query agent-id)
+                             &optional result-file query agent-id background)
               (gptel-agent--task main-cb agent-type description prompt
-                                 fsm snapshot result-file query agent-id)))
+                                 fsm snapshot result-file query agent-id background)))
       (setq-local
        gptel-tools
        (if snapshot
@@ -4054,7 +4465,19 @@ the global registry while this request is in flight."
                    gptel-tools)
          ;; An empty enum is invalid for some providers, and there is no
          ;; useful Agent call when this parent permits no sub-agents.
-         (remq base-tool gptel-tools))))))
+         (remq base-tool gptel-tools)))))
+  ;; Make control available wherever delegation is available, including custom
+  ;; presets that listed only Agent before background workers existed.
+  (when (or (cl-find "Agent" gptel-tools :key #'gptel-tool-name :test #'equal)
+            (cl-find "AgentControl" gptel-tools :key #'gptel-tool-name :test #'equal))
+    (let ((control (gptel--copy-tool (gptel-get-tool "AgentControl"))))
+      (setf (gptel-tool-function control)
+            (lambda (callback action &optional agent-id agent-ids message)
+              (gptel-agent--control callback fsm action agent-id agent-ids message)))
+      (setq-local gptel-tools
+                  (append (cl-remove "AgentControl" gptel-tools
+                                     :key #'gptel-tool-name :test #'equal)
+                          (list control))))))
 
 (defun gptel-agent--update-agent-tool ()
   "Retain compatibility; Agent schemas are now built per request.
@@ -4064,10 +4487,10 @@ The registered tool is deliberately immutable.  See
   (gptel-get-tool "Agent"))
 
 (defun gptel-agent--task-tool-dispatch
-    (main-cb agent-type description prompt &optional result-file query agent-id)
+    (main-cb agent-type description prompt &optional result-file query agent-id background)
   "Dispatch an Agent tool call before request-local FSM ownership is attached."
   (gptel-agent--task main-cb agent-type description prompt
-                     nil nil result-file query agent-id))
+                     nil nil result-file query agent-id background))
 
 (gptel-make-tool
  :name "Agent"
@@ -4098,10 +4521,31 @@ automatically appended.")
          ( :name "agent_id"
            :type string
            :optional t
-           :description "Optional. Continue an idle, completed agent using the agent_id from its result. Keep the same subagent_type; supply the follow-up in prompt. Omit or leave empty to start a new agent."))
+           :description "Optional. Continue an idle, completed agent using the agent_id from its result. Keep the same subagent_type; supply the follow-up in prompt. Omit or leave empty to start a new agent.")
+         ( :name "background"
+           :type boolean
+           :optional t
+           :description "Return immediately with agent_id and run_id; completion is delivered automatically. Omit or false preserves blocking behavior."))
  :category "gptel-agent"
  :async t
  :confirm t
+ :include t)
+
+(gptel-make-tool
+ :name "AgentControl"
+ :description "Manage this parent's workers. list/read inspect without waiting; read does not consume completion delivery. wait suspends until any selected worker has a new terminal outcome (defaults to this request's workers), returning immediately if one is queued or no work is eligible. send queues a correction for current work at its next safe boundary without resetting budgets; use Agent with agent_id for completed-worker follow-ups. cancel stops a worker and all descendants. Reports arrive automatically; do useful work before waiting, and synthesize evidence before finishing."
+ :function (lambda (callback &rest _)
+             (funcall callback "Error: AgentControl requires a request-local dispatcher."))
+ :args '((:name "action" :type string :enum ["list" "read" "wait" "send" "cancel"]
+          :description "Worker operation.")
+         (:name "agent_id" :type string :optional t
+          :description "Owned worker ID for read, send or cancel.")
+         (:name "agent_ids" :type array :items (:type string) :optional t
+          :description "Optional IDs for wait; wait for any selected worker.")
+         (:name "message" :type string :optional t
+          :description "Correction for the active task, required for send."))
+ :category "gptel-agent"
+ :async t
  :include t)
 
 (gptel-make-tool

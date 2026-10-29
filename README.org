@@ -429,8 +429,44 @@ results, including evidence shortened in the inspection buffer.  Each follow-up
 gets fresh timeout, round, retry and tool budgets.  The =agent_id= argument is
 optional; omitting it or passing a blank string starts a separate conversation.
 IDs belong to the calling chat; a running agent cannot receive another task
-until it finishes.  Failed or cancelled requests
+until it finishes, but can receive steering for its current task. Failed or cancelled requests
 remain diagnostic-only and cannot be resumed.
+
+Set =background: true= on =Agent= (including follow-ups) to receive an
+=agent_id=, invocation-specific =run_id= and status immediately. Omitting it,
+or passing false, preserves the blocking call. Configuration, evidence, scope
+restrictions and supervision limits apply in both modes.
+
+=AgentControl= operates on the calling parent's workers:
+
+| action | arguments | behavior |
+|--------+-----------+----------|
+| list   |           | Concise statuses of owned workers |
+| read   | agent_id  | Current status and latest completed invocation; does not consume delivery |
+| wait   | agent_ids (optional) | Wait for a new terminal outcome from any selected worker |
+| send   | agent_id, message | Queue a correction for the active task without resetting its budgets |
+| cancel | agent_id  | Cancel that worker and all its descendants |
+
+Results arrive automatically at the next safe model-request boundary, after
+any outstanding tool results. Explicit waits consume the same completion
+queue, return immediately for queued results, and report =no_eligible_work=
+when there is nothing to await. There is no polling or repeated model request
+while waiting. Use =Agent= with =agent_id= for a completed worker's next task;
+=send= only steers work that is still active.
+
+The harness keeps the parent turn open until every descendant is terminal and
+its outcomes have reached its parent. An early final answer is interim output:
+the chat shows =Waiting for agents=, retains its request history, and inserts
+no next-user prompt or =Ready= status. A completion resumes the same request
+for synthesis, even while other workers are running. The same gate applies to
+nested workers and to accepted steering queued near completion. Workers waiting
+for tools, permissions, retries or descendants remain active; task timeouts
+continue to apply. Aborting or closing a chat cancels its worker subtree and
+pending wakeups. Unrecoverable parent failures also stop descendants.
+
+Worker orchestration is scoped to the existing chat and workspace. It does not
+add peer messaging, shared scheduling, worktree isolation or persistence across
+Emacs restarts. Background shell jobs keep their separate existing lifecycle.
 
 Completed sub-agent buffers stay available for follow-ups until you close them
 or their parent chat.  Closing the parent chat cancels active sub-agent requests
