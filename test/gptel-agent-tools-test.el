@@ -54,7 +54,7 @@
   (should-not (gptel-agent--transient-request-error-p
                '(:http-status "400" :error "Stream must be set to true"))))
 
-(ert-deftest gptel-agent-similar-tool-loop-escalates-to-finalization ()
+(ert-deftest gptel-agent-repetition-search-loop-escalates-to-finalization ()
   (with-temp-buffer
     (gptel-agent--reset-tool-call-counts)
     (let ((run (gptel-agent--make-run :tool-calls 0 :web-tool-calls 0))
@@ -63,11 +63,9 @@
           (gptel-agent-max-loop-violations 2)
           results)
       (setq-local gptel-agent--supervised-run run)
-      (dolist (suffix '("one" "two" "three" "four" "five"))
+      (dotimes (_ 5)
         (push (gptel-agent--detect-repetition
-               (list :name "WebSearch"
-                     :args (list :query
-                                 (format "alpha beta gamma %s" suffix))))
+               '(:name "WebSearch" :args (:query "alpha beta gamma")))
               results))
       (setq results (nreverse results))
       (should (plist-get (nth 3 results) :result))
@@ -79,6 +77,114 @@
       (should (gptel-agent--run-finalization-reason run))
       (should-not (cl-find-if (lambda (result) (plist-get result :stop))
                               results)))))
+
+(ert-deftest gptel-agent-repetition-compares-every-search-parameter ()
+  (dolist (case
+           '(("Glob" (:pattern "*.el" :path "." :depth 1)
+              (:pattern "*.EL") (:path "./") (:depth 5))
+             ("Grep" (:regex "alpha.*beta" :path "." :glob "*.el" :context_lines 0)
+              (:regex "alpha.+beta") (:path "./") (:glob "*.EL") (:context_lines 5))
+             ("Read" (:file_path "file.el" :start_line 1 :end_line 100)
+              (:file_path "./file.el") (:start_line 2) (:end_line 101))
+             ("WebSearch" (:query "alpha beta gamma one" :count 10)
+              (:query "alpha beta gamma two") (:count 20) (:new_parameter t))
+             ("WebFetch" (:url "https://example.com/Path" :max_chars 1000)
+              (:url "https://example.com/path") (:max_chars 2000))))
+    (pcase-let ((`(,name ,args . ,changes) case))
+      (dolist (change changes)
+        (ert-info ((format "%s changing %S" name change))
+          (with-temp-buffer
+            (gptel-agent--reset-tool-call-counts)
+            (let ((gptel-agent-max-tool-repetitions 2)
+                  (gptel-agent-max-similar-tool-calls 2))
+              (should-not (gptel-agent--detect-repetition
+                           (list :name name :args args)))
+              (should-not (gptel-agent--detect-repetition
+                           (list :name name
+                                 :args (plist-put (copy-tree args)
+                                                  (car change) (cadr change))))))))))))
+
+(ert-deftest gptel-agent-repetition-allows-progressively-deeper-globs ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 3)
+          (gptel-agent-max-similar-tool-calls 4)
+          (gptel-agent-tool-cycle-length 4))
+      (dolist (depth '(1 2 3 4 5 6 nil))
+        (should-not
+         (gptel-agent--detect-repetition
+          (list :name "Glob" :args (append '(:pattern "*.el" :path ".")
+                                          (and depth (list :depth depth)))))))
+      (should (zerop gptel-agent--tool-loop-violations)))))
+
+(ert-deftest gptel-agent-repetition-ignores-argument-field-order ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 2)
+          (gptel-agent-max-similar-tool-calls nil))
+      (should-not (gptel-agent--detect-repetition
+                   '(:name "Glob" :args (:pattern "*.el" :path "." :depth 5))))
+      (should (gptel-agent--detect-repetition
+               '(:name "Glob" :args (:depth 5 :path "." :pattern "*.el")))))))
+
+(ert-deftest gptel-agent-repetition-counts-exact-searches-across-history ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions nil)
+          (gptel-agent-max-similar-tool-calls 3)
+          (gptel-agent-tool-cycle-length nil))
+      (dolist (call '((:name "Glob" :args (:pattern "*.el" :depth 1))
+                      (:name "Read" :args (:file_path "first.el"))
+                      (:name "Glob" :args (:depth 1 :pattern "*.el"))
+                      (:name "Glob" :args (:depth 5 :pattern "*.el"))
+                      (:name "Read" :args (:file_path "second.el"))))
+        (should-not (gptel-agent--detect-repetition call)))
+      (let ((result (gptel-agent--detect-repetition
+                     '(:name "Glob" :args (:pattern "*.el" :depth 1)))))
+        (should (string-match-p "3 Glob calls with identical arguments"
+                                (plist-get result :result)))))))
+
+(ert-deftest gptel-agent-repetition-cycles-use-exact-arguments ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions nil)
+          (gptel-agent-max-similar-tool-calls nil)
+          (gptel-agent-tool-cycle-length 4))
+      (dolist (call '((:name "Glob" :args (:pattern "*.el" :depth 1))
+                      (:name "Glob" :args (:pattern "*.el" :depth 5))
+                      (:name "Glob" :args (:depth 1 :pattern "*.el"))))
+        (should-not (gptel-agent--detect-repetition call)))
+      (let ((result (gptel-agent--detect-repetition
+                     '(:name "Glob" :args (:depth 5 :pattern "*.el")))))
+        (should (string-match-p "A-B-A-B" (plist-get result :result)))))))
+
+(ert-deftest gptel-agent-repetition-preserves-nested-values-and-array-order ()
+  (let ((args '(:options (:pattern "A.*B" :limit 5) :paths ["a" "b"])))
+    (dolist (case `(("Custom" (:paths ["a" "b"] :options (:limit 5 :pattern "A.*B")) t)
+                    ("Custom" (:options (:pattern "A.*B" :limit 6) :paths ["a" "b"]) nil)
+                    ("Custom" (:options (:pattern "A.*B" :limit 5) :paths ["b" "a"]) nil)
+                    ("Other" ,args nil)))
+      (pcase-let ((`(,name ,other-args ,repeated) case))
+        (with-temp-buffer
+          (gptel-agent--reset-tool-call-counts)
+          (let ((gptel-agent-max-tool-repetitions 2)
+                (gptel-agent-max-similar-tool-calls nil))
+            (should-not (gptel-agent--detect-repetition
+                         (list :name "Custom" :args args)))
+            (let ((result (gptel-agent--detect-repetition
+                           (list :name name :args other-args))))
+              (if repeated (should result) (should-not result)))))))))
+
+(ert-deftest gptel-agent-repetition-distinguishes-omitted-and-explicit-arguments ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 2)
+          (gptel-agent-max-similar-tool-calls 2))
+      (dolist (args '((:pattern "*.el")
+                      (:pattern "*.el" :depth nil)
+                      (:pattern "*.el" :depth 5)))
+        (should-not (gptel-agent--detect-repetition
+                     (list :name "Glob" :args args)))))))
 
 (ert-deftest gptel-agent-exact-repetition-forces-finalization ()
   (with-temp-buffer

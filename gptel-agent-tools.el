@@ -129,12 +129,13 @@ detection."
   :group 'gptel-agent)
 
 (defcustom gptel-agent-max-similar-tool-calls 4
-  "Max similar read/search calls allowed in the recent tool history.
+  "Max identical read/search calls allowed in the recent tool history.
 
-This catches non-consecutive stalls such as repeatedly reading overlapping
-sections of the same file or repeatedly searching for near-identical queries.
-Set to nil to disable similar-call detection."
-  :type '(choice (natnum :tag "Max similar calls")
+This catches non-consecutive calls with the same tool name and every argument
+unchanged.  Argument field order is ignored, but values are compared exactly.
+The option retains its historical name for compatibility; partial or fuzzy
+argument comparisons are no longer used.  Set to nil to disable this check."
+  :type '(choice (natnum :tag "Max identical read/search calls")
                  (const :tag "Disable" nil))
   :group 'gptel-agent)
 
@@ -153,7 +154,7 @@ to disable alternating-cycle detection."
   :group 'gptel-agent)
 
 (defcustom gptel-agent-max-loop-violations 2
-  "Number of detected similar/cyclic loops before forcing synthesis.
+  "Number of detected identical/cyclic loops before forcing synthesis.
 
 The first violation skips the redundant call and asks the model to change
 strategy.  At this threshold, the same sub-agent gets a tool-free turn to
@@ -310,13 +311,13 @@ undelivered result.  WAITERS and automatic delivery consume the same inbox."
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
   "Last tool call key tracked for repetition detection.
-The key is a cons cell (NAME . ARGS).")
+The key is produced by `gptel-agent--tool-signature'.")
 
 (defvar-local gptel-agent--tool-call-streak 0
   "Current streak of consecutive identical tool calls.")
 
 (defvar-local gptel-agent--tool-call-history nil
-  "Recent tool-call history for loop and similarity detection.
+  "Recent tool-call history for exact repetition and cycle detection.
 
 Each entry is a plist with at least :name, :args and :signature.")
 
@@ -330,125 +331,28 @@ Each entry is a plist with at least :name, :args and :signature.")
         gptel-agent--tool-call-history nil
         gptel-agent--tool-loop-violations 0))
 
-(defun gptel-agent--arg (args key)
-  "Return KEY from ARGS, accepting plist or alist shapes."
-  (or (plist-get args key)
-      (alist-get key args)
-      (alist-get (intern (substring (symbol-name key) 1))
-                 args nil nil #'equal)
-      (alist-get (substring (symbol-name key) 1) args nil nil #'equal)))
-
-(defun gptel-agent--normalize-text (text)
-  "Normalize TEXT for comparing similar tool-call arguments."
-  (when text
-    (let ((case-fold-search t)
-          (s (downcase (format "%s" text))))
-      (setq s (replace-regexp-in-string "[^[:alnum:]_./:-]+" " " s))
-      (string-trim (replace-regexp-in-string "[[:space:]]+" " " s)))))
-
-(defun gptel-agent--normalize-path (path)
-  "Normalize PATH for comparing tool-call arguments."
-  (when path
-    (abbreviate-file-name
-     (expand-file-name (substitute-in-file-name (format "%s" path))))))
-
-(defun gptel-agent--tokenize (text)
-  "Tokenize normalized TEXT for rough similarity checks."
-  (cl-remove-if
-   (lambda (token) (< (length token) 2))
-   (split-string (or (gptel-agent--normalize-text text) "") " " t)))
-
-(defun gptel-agent--similar-token-sets-p (a b)
-  "Return non-nil when strings A and B are obviously similar."
-  (let* ((a (gptel-agent--normalize-text a))
-         (b (gptel-agent--normalize-text b))
-         (a-tokens (gptel-agent--tokenize a))
-         (b-tokens (gptel-agent--tokenize b)))
-    (cond
-     ((or (string-empty-p (or a ""))
-          (string-empty-p (or b "")))
-      nil)
-     ((or (string= a b)
-          (string-search a b)
-          (string-search b a))
-      t)
-     ((or (null a-tokens) (null b-tokens))
-      nil)
-     (t
-      (let* ((intersection
-              (cl-count-if (lambda (token) (member token b-tokens)) a-tokens))
-             (shorter (min (length a-tokens) (length b-tokens))))
-        (and (> shorter 0)
-             (>= (/ (float intersection) shorter) 0.75)))))))
-
-(defun gptel-agent--ranges-overlap-or-near-p (start-a end-a start-b end-b)
-  "Return non-nil if two optional line ranges overlap or are very close."
+(defun gptel-agent--tool-argument-signature (value)
+  "Return VALUE with JSON object fields ordered for exact comparison.
+gptel decodes JSON objects as keyword plists and arrays as vectors.
+Preserve every field and value, including array order, without modifying VALUE."
   (cond
-   ((or (not start-a) (not end-a) (not start-b) (not end-b))
-    ;; Whole-file or partially specified reads against the same file are similar.
-    t)
-   (t
-    (let ((gap 20))
-      (and (<= start-a (+ end-b gap))
-           (<= start-b (+ end-a gap)))))))
+   ((consp value)
+    (sort (cl-loop for (key val) on value by #'cddr
+                   collect (cons key (gptel-agent--tool-argument-signature val)))
+          (lambda (a b) (string< (symbol-name (car a))
+                                (symbol-name (car b))))))
+   ((vectorp value)
+    (vconcat (mapcar #'gptel-agent--tool-argument-signature value)))
+   (t value)))
 
 (defun gptel-agent--tool-signature (name args)
-  "Return a stable signature for exact loop detection."
-  (cons name args))
+  "Return a signature containing NAME and every argument in ARGS.
+Only JSON object field order is ignored; argument values remain exact."
+  (cons name (gptel-agent--tool-argument-signature args)))
 
 (defun gptel-agent--search-tool-p (name)
-  "Return non-nil if NAME is a read/search style tool worth comparing loosely."
+  "Return non-nil if NAME is a read/search tool tracked across recent history."
   (member name '("Read" "Grep" "Glob" "WebSearch" "WebFetch")))
-
-(defun gptel-agent--similar-tool-call-p (current previous)
-  "Return non-nil if CURRENT and PREVIOUS are similar read/search calls."
-  (let* ((name (plist-get current :name))
-         (args (plist-get current :args))
-         (prev-name (plist-get previous :name))
-         (prev-args (plist-get previous :args)))
-    (and (equal name prev-name)
-         (gptel-agent--search-tool-p name)
-         (pcase name
-           ("Read"
-            (and (equal (gptel-agent--normalize-path
-                         (gptel-agent--arg args :file_path))
-                        (gptel-agent--normalize-path
-                         (gptel-agent--arg prev-args :file_path)))
-                 (gptel-agent--ranges-overlap-or-near-p
-                  (gptel-agent--arg args :start_line)
-                  (gptel-agent--arg args :end_line)
-                  (gptel-agent--arg prev-args :start_line)
-                  (gptel-agent--arg prev-args :end_line))))
-           ("Grep"
-            (and (equal (gptel-agent--normalize-path
-                         (gptel-agent--arg args :path))
-                        (gptel-agent--normalize-path
-                         (gptel-agent--arg prev-args :path)))
-                 (equal (gptel-agent--normalize-text
-                         (gptel-agent--arg args :glob))
-                        (gptel-agent--normalize-text
-                         (gptel-agent--arg prev-args :glob)))
-                 (gptel-agent--similar-token-sets-p
-                  (gptel-agent--arg args :regex)
-                  (gptel-agent--arg prev-args :regex))))
-           ("Glob"
-            (and (equal (gptel-agent--normalize-path
-                         (or (gptel-agent--arg args :path) "."))
-                        (gptel-agent--normalize-path
-                         (or (gptel-agent--arg prev-args :path) ".")))
-                 (gptel-agent--similar-token-sets-p
-                  (gptel-agent--arg args :pattern)
-                  (gptel-agent--arg prev-args :pattern))))
-           ("WebSearch"
-            (gptel-agent--similar-token-sets-p
-             (gptel-agent--arg args :query)
-             (gptel-agent--arg prev-args :query)))
-           ("WebFetch"
-            (equal (gptel-agent--normalize-text
-                    (gptel-agent--arg args :url))
-                   (gptel-agent--normalize-text
-                    (gptel-agent--arg prev-args :url))))
-           (_ nil)))))
 
 (defun gptel-agent--alternating-cycle-p (history)
   "Return non-nil if HISTORY starts with an exact alternating cycle."
@@ -466,12 +370,11 @@ Each entry is a plist with at least :name, :args and :signature.")
                     always (equal signature
                                   (if (cl-evenp idx) first second)))))))
 
-(defun gptel-agent--similar-call-count (entry history)
-  "Return number of calls similar to ENTRY in HISTORY, including ENTRY."
-  (1+ (cl-count-if
-       (lambda (previous)
-         (gptel-agent--similar-tool-call-p entry previous))
-       history)))
+(defun gptel-agent--repeated-call-count (entry history)
+  "Return number of calls identical to ENTRY in HISTORY, including ENTRY."
+  (1+ (cl-count (plist-get entry :signature) history
+                :key (lambda (previous) (plist-get previous :signature))
+                :test #'equal)))
 
 (defun gptel-agent--push-tool-call-history (entry)
   "Push ENTRY onto `gptel-agent--tool-call-history' and trim it."
@@ -528,17 +431,18 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
   "Apply repetition and budget checks to TOOL-CALL-INFO."
   (let* ((name (plist-get tool-call-info :name))
          (args (plist-get tool-call-info :args))
-         (key (cons name args))
+         (key (gptel-agent--tool-signature name args))
          (entry (list :name name
                       :args args
-                      :signature (gptel-agent--tool-signature name args)))
+                      :signature key))
          (count
           (if (equal key gptel-agent--last-tool-call-key)
               (1+ gptel-agent--tool-call-streak)
             1))
-         (similar-count
+         (repeat-count
           (and gptel-agent-max-similar-tool-calls
-               (gptel-agent--similar-call-count
+               (gptel-agent--search-tool-p name)
+               (gptel-agent--repeated-call-count
                 entry gptel-agent--tool-call-history)))
          (run gptel-agent--supervised-run)
          (web-tool-p (member name '("WebSearch" "WebFetch")))
@@ -569,16 +473,13 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
         "Error: Tool calls are alternating in a repeated A-B-A-B pattern. \
 This is not making progress. Change strategy, use different evidence, or stop \
 and report what you have so far."))
-      ((and similar-count
-            (>= similar-count gptel-agent-max-similar-tool-calls))
+      ((and repeat-count
+            (>= repeat-count gptel-agent-max-similar-tool-calls))
        (gptel-agent--loop-violation
-        (format "Error: You have made %d similar %s calls recently. \
-Repeated reads/searches with similar arguments are not making progress. \
-Use a different approach.  For WebSearch, construct and fetch a known URL when \
-the target is an exact identifier, change the query substantially, or increase \
-the result count once.  Otherwise stop and report the negative or inconclusive \
-outcome, the attempts made, and confidence."
-                similar-count name)))))
+        (format "Error: You have made %d %s calls with identical arguments recently. \
+Use the existing results, change the arguments to gather new evidence, or report \
+the negative or inconclusive outcome, the attempts made, and confidence."
+                repeat-count name)))))
     (unless result
       (setq gptel-agent--tool-loop-violations 0))
     result))

@@ -515,7 +515,12 @@ shows the prompt, model rounds, streamed output, tool arguments and results,
 retries, and terminal reason.  Failed, timed-out and cancelled runs keep this
 buffer by default; set
 =gptel-agent-keep-failed-run-buffers= to nil to clean them up immediately.
-Repeated similar/cyclic calls are skipped once so the model can change
+Repetition detection compares the tool name and all argument values exactly;
+JSON object field order is ignored.  Changing a depth, line range, query or
+other parameter therefore counts as a different call.  The existing
+=gptel-agent-max-similar-tool-calls= setting now limits identical read/search
+calls in recent history, including non-consecutive repeats.  Repeated calls
+and exact alternating cycles are skipped once so the model can change
 strategy.  At =gptel-agent-max-loop-violations= the same sub-agent enters a
 tool-free finalization turn: it keeps its complete tool transcript and system
 prompt, interprets the evidence it gathered, and returns the final answer
