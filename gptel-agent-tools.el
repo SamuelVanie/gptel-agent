@@ -2169,7 +2169,7 @@ The caller must have appended all tool results before entering this function."
       (when-let* ((ov (gptel-agent--run-overlay run)) ((overlay-buffer ov)))
         (overlay-put ov 'count (1+ (overlay-get ov 'count)))
         (gptel-agent--task-display
-         ov (overlay-get ov 'msg) text "\n" gptel-agent--hrule "\n")))))
+         ov (overlay-get ov 'msg) text "\n" gptel-agent--hrule)))))
 
 (defun gptel-agent--workers-done (gate)
   "Gate normal finalization until GATE's descendants and inbox are settled."
@@ -2523,7 +2523,7 @@ steers current work without creating a run or resetting supervision budgets."
        (format "%s\n"
                (truncate-string-to-width
                 (gptel--to-string result) 500 nil nil t)))
-     gptel-agent--hrule "\n")))
+     gptel-agent--hrule)))
 
 (defun gptel-agent--run-cancel-timer (run accessor setter)
   "Cancel RUN timer returned by ACCESSOR and clear it with SETTER."
@@ -3036,7 +3036,7 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                  (concat task-msg
                          (concat
                           (propertize "Running... " 'face 'warning) "\n"
-                          gptel-agent--hrule "\n"))))
+                          gptel-agent--hrule))))
            (gptel-agent--task-display ov new-info-msg))))
      info-ov count run)))
 
@@ -3062,7 +3062,7 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                                    (plist-get call :name)
                                    (map-values (plist-get call :args))))
                                 tool-use)
-                     "\n" gptel-agent--hrule "\n")))
+                     "\n" gptel-agent--hrule)))
       (overlay-put ov 'count (+ info-count (length tool-use)))
       (gptel-agent--task-display ov new-info-msg))))
 
@@ -3106,7 +3106,8 @@ button for its live diagnostic buffer."
                                    gptel-model)))
                       'face 'font-lock-comment-face))
          (msg (concat
-               "\n\n" gptel-agent--hrule
+               (unless (eq (char-after (car bounds)) 10) "\n")
+               "\n" gptel-agent--hrule
                (propertize (concat (capitalize agent-type) " Task: ")
                            'face 'font-lock-escape-face)
                (propertize (or description "(no description)") 'face 'font-lock-doc-face)
@@ -3125,7 +3126,7 @@ button for its live diagnostic buffer."
       (overlay-put ov 'line-prefix "")
       (gptel-agent--task-display
        ov msg (propertize "Waiting..." 'face 'warning) "\n"
-       gptel-agent--hrule "\n"))))
+       gptel-agent--hrule))))
 
 (defun gptel-agent--task-response-position (fsm)
   "Return FSM's response position, initializing normal chat output if needed."

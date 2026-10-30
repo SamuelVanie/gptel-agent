@@ -163,7 +163,7 @@
                 (goto-char anchor)
                 (should (search-forward "NEXT-TOOL-RESULT" nil t))))))))))
 
-(ert-deftest gptel-agent-workers-overlay-keeps-spacing-through-status-updates ()
+(ert-deftest gptel-agent-workers-overlay-keeps-styles-through-status-updates ()
   (let ((gptel-agent-workers-test--mode #'org-mode))
     (gptel-agent-workers-test--with-chat
       (gptel-agent-workers-test--tool fsm "WorkerTestTool" nil)
@@ -195,12 +195,13 @@
         (gptel-agent--run-update-terminal-overlay run "Done")
         (push (overlay-get ov 'after-string) displays)
         (dolist (display displays)
-          ;; Blank lines must reset the surrounding tool block's face and
-          ;; prefixes, including after every asynchronous status update.
-          (should (string-prefix-p "\n\n" display))
-          (should (string-suffix-p "\n\n" display))
+          ;; Reset the surrounding tool block's face and prefixes after
+          ;; every asynchronous status update, through the final rule.
           (should (eq (get-text-property 0 'face display) 'default))
-          (should (eq (get-text-property (1- (length display)) 'face display) 'default))
+          (let ((last-face (get-text-property (1- (length display)) 'face display)))
+            (should (memq 'default last-face))
+            (should (equal (car last-face)
+                           (get-text-property 0 'face gptel-agent--hrule))))
           (should-not (text-property-not-all 0 (length display) 'line-prefix "" display))
           (should-not (text-property-not-all 0 (length display) 'wrap-prefix "" display)))))))
 
