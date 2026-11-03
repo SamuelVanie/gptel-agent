@@ -1194,7 +1194,7 @@
                (lambda (_dir regexp &rest _args)
                  (setq filename-regexp regexp)
                  '("/skills/example/SKILL.md")))
-              ((symbol-function 'gptel-agent--cached-read-file)
+              ((symbol-function 'gptel-agent--cached-read-skill-file)
                (lambda (file full)
                  (setq cached-file file
                        cached-full full)

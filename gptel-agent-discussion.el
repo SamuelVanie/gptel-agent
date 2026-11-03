@@ -306,8 +306,12 @@
             (setf (gptel-tool-function tool)
                   (if (equal name "Discussion")
                       (let ((config (mapcar (lambda (symbol)
-                                              (cons symbol (and (boundp symbol)
-                                                                (symbol-value symbol))))
+                                              (cons symbol
+                                                    (if (and (eq symbol 'gptel-tools)
+                                                             (plist-member info :skill-base-tools))
+                                                        (plist-get info :skill-base-tools)
+                                                      (and (boundp symbol)
+                                                           (symbol-value symbol)))))
                                             gptel-agent--request-config-variables)))
                         (lambda (callback title prompt &optional preset directory)
                           (gptel-agent-discussion--dispatch-create

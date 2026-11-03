@@ -96,16 +96,23 @@ for gptel sub-agent definitions by `gptel-agent'."
   :type '(repeat directory)
   :group 'gptel-agent)
 
-(defcustom gptel-agent-skill-dirs '("~/.claude/skills/"
-                                    ".claude/skills/"
-                                    "~/.agents/skills" ;; codex
-                                    ".agents/skills"   ;; codex
-                                    "~/.opencode/skill/"
-                                    ".opencode/skill/"
-                                    "~/.gemini/skills/"
-                                    ".gemini/skills/"
-                                    "~/.copilot/skills/"
-                                    ".github/skills/")
+(defconst gptel-agent--bundled-skill-dir
+  (expand-file-name "skills/" (file-name-directory
+                              (or load-file-name (buffer-file-name))))
+  "Directory containing skills shipped with gptel-agent.")
+
+(defcustom gptel-agent-skill-dirs
+  (append '("~/.claude/skills/"
+            ".claude/skills/"
+            "~/.agents/skills" ;; codex
+            ".agents/skills"   ;; codex
+            "~/.opencode/skill/"
+            ".opencode/skill/"
+            "~/.gemini/skills/"
+            ".gemini/skills/"
+            "~/.copilot/skills/"
+            ".github/skills/")
+          (list gptel-agent--bundled-skill-dir))
 
   "Agent skill definition directories.
 
@@ -118,6 +125,8 @@ against the project root when searching for skills.
 Relative directory locations will be take precedence over absolute
 locations. If multiple skills share the same name, the one in the
 directory listed earlier takes precedence.
+Bundled skills are always searched as a fallback, including when this
+option is customized.  User and project skills can override them.
 
 See https://agentskills.io for more details on agentskills."
   :type '(repeat directory)
@@ -168,8 +177,8 @@ Alist mapping agent names to a plist of agent properties.")
   "Known skills alist.
 
 The key is the name.  The value is a cons (LOCATION . SKILL-PLIST).
-LOCATION is path to the skill's directory.  SKILL-PLIST is the header
-of the corresponding SKILL.md as a plist.")
+LOCATION is the path to the skill's directory.  SKILL-PLIST contains
+its discovery metadata (:description), without declarations or body.")
 
 (defvar gptel-agent--enabled-skills nil
   "List of currently enabled skill names.
@@ -241,6 +250,46 @@ or AGENT-FILE has changed since it was cached."
                                      nil nil #'equal)))
     (cdr (gptel-agent--cached-read-file agent-file t))))
 
+(defvar gptel-agent--skill-file-cache nil
+  "Data-only skill parses, separate from evaluated agent definitions.")
+
+(defun gptel-agent--cached-read-skill-file (file &optional full)
+  "Read FILE as skill data, including its body when FULL is non-nil.
+Only name and description are retained during discovery.  In particular,
+agent preset keys such as pre and post are never evaluated for skills."
+  (require 'yaml)
+  (let* ((file (expand-file-name file))
+         (mtime (gptel-agent--file-mtime file))
+         (entry (alist-get file gptel-agent--skill-file-cache nil nil #'equal))
+         (slot (if full :full :metadata)))
+    (unless (equal mtime (plist-get entry :mtime))
+      (setq entry (list :mtime mtime)))
+    (or (plist-get entry slot)
+        (let* ((header (gptel-agent--read-markdown-frontmatter file))
+               (data (and header (yaml-parse-string
+                                  header :object-type 'plist
+                                  :object-key-type 'keyword :sequence-type 'list)))
+               (name (or (plist-get data :name) (file-name-base file)))
+               (metadata (list :description (plist-get data :description)))
+               (parsed
+                (cons name
+                      (if (not full) metadata
+                        (with-temp-buffer
+                          (insert-file-contents file)
+                          (goto-char (point-min))
+                          (when header
+                            (forward-line 1)
+                            (re-search-forward "^---[ \t]*$")
+                            (forward-line 1))
+                          (append metadata
+                                  (when (plist-member data :allowed-tools)
+                                    (list :allowed-tools (plist-get data :allowed-tools)))
+                                  (list :system (buffer-substring-no-properties
+                                                 (point) (point-max)))))))))
+          (setq entry (plist-put entry slot parsed))
+          (setf (alist-get file gptel-agent--skill-file-cache nil nil #'equal) entry)
+          parsed))))
+
 ;;;###autoload
 (defun gptel-agent-read-file (agent-file &optional templates metadata-only)
   "Read a preset/agent from AGENT-FILE.
@@ -298,7 +347,7 @@ Returns an alist of (agent-name . file-path)."
             (dolist (skill-file (directory-files-recursively
                                  dir "SKILL\\.md$" nil nil t))
               (pcase-let ((`(,name . ,skill-plist)
-                           (gptel-agent--cached-read-file skill-file nil)))
+                           (gptel-agent--cached-read-skill-file skill-file nil)))
                 ;; validating skill definition
                 (if (plist-get skill-plist :description)
                     (setf (alist-get name gptel-agent--skills nil nil #'string-equal)
@@ -307,7 +356,9 @@ Returns an alist of (agent-name . file-path)."
                         name skill-file name))))))
         ;; To preserve precedence, the list should be reversed and resolved
         ;; relative names should be at the end.
-        (cl-loop for dir in gptel-agent-skill-dirs
+        (cl-loop for dir in (append (remove gptel-agent--bundled-skill-dir
+                                           gptel-agent-skill-dirs)
+                                   (list gptel-agent--bundled-skill-dir))
                  with project-root = (and-let* ((proj (project-current))
                                                 (root (project-root proj))
                                                 (_ (not (equal root default-directory))))

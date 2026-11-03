@@ -383,12 +383,45 @@ gptel uses the term "preset" for such configurations.  A preset can specify the 
 
 *** Managed discussions
 
-The default =gptel-agent= preset includes =Discussion= and =DiscussionControl=.
+The default =gptel-agent= preset discovers discussion management through the
+bundled =skills/managed-discussions/SKILL.md= skill. The package's =skills/=
+directory is a discovery fallback even when =gptel-agent-skill-dirs= is
+customized; user and project skills retain precedence. Calling =Skill= loads
+the workflow instructions and enables =Discussion= and =DiscussionControl=
+in the same turn. Custom presets can still list both tools explicitly.
+
 =Discussion= creates a separate, ordinary gptel buffer with a title and opening
-prompt. It inherits the creating request's model, backend, system prompt, tools
+prompt. It inherits the creating request's model, backend, system prompt, configured tools
 and confirmation settings; an optional existing =preset= can override them.
 It starts without the parent's transcript or attached context. An optional
-=directory= selects its working directory.
+=directory= selects its working directory. Skill activations and their
+pre-approvals belong to each conversation separately; a child loads its own
+skills. Approving discussion management does not approve child tool calls.
+
+**** Skill tool declarations
+
+=allowed-tools= follows the experimental [[https://agentskills.io/specification#allowed-tools-field][Agent Skills specification]]: a
+space-separated string of pre-approved tool names. gptel-agent supports exact,
+uniquely registered names only. Category grants, wildcards and scoped expressions
+such as =Bash(git:*)= are unsupported. If any declaration is invalid, missing or
+ambiguous, =Skill= returns the instructions with a diagnostic and adds none of
+that skill's tools or pre-approvals. Tools must already be registered with gptel;
+skills do not install Lisp implementations.
+
+gptel-agent also exposes those tools to the current request and its provider
+schema. This is host behavior, not a requirement of the standard. Activation
+persists in the conversation across turns, with fresh request-owned dispatchers;
+repeated loading is idempotent. In =gptel-confirm-tool-calls= auto mode the tools
+are pre-approved. Always-confirm mode and per-call confirmation/blocking hooks
+keep their normal precedence. Global settings and registered tools are unchanged.
+
+Discovery exposes only name and description. Skills without =allowed-tools=
+continue to load instructions only. Skill frontmatter is data, not evaluated
+agent configuration: agent-definition =pre= and =post= evaluation and hooks
+remain unchanged. Automatic unloading and persistence across Emacs restarts are
+not supported.
+
+**** Discussion lifecycle
 
 Discussions run independently and survive the parent's completed turn. Their
 completion, failure, question and approval events reach the parent at its next

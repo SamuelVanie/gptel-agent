@@ -52,6 +52,8 @@
 
 (declare-function org-escape-code-in-region "org-src")
 (declare-function gptel-agent--cached-read-file "gptel-agent")
+(declare-function gptel-agent--cached-read-skill-file "gptel-agent")
+(declare-function gptel-agent-discussion--localize "gptel-agent-discussion")
 (declare-function gptel-agent--agent-plist "gptel-agent")
 (declare-function gptel-agent--agent-enabled-p "gptel-agent")
 (declare-function gptel-agent--skills-system-message "gptel-agent")
@@ -62,6 +64,7 @@
 (defvar url-http-response-status)
 (defvar gptel-agent--agents)
 (defvar gptel-agent--skills)
+(defvar gptel-agent--skill-tool-base-desc)
 (defvar gptel-agent--enabled-skills)
 (defvar gptel-agent--enabled-agents)
 (defvar gptel-agent--saved-tool-results (make-hash-table :test #'equal)
@@ -1864,13 +1867,146 @@ Exactly one item should have status \"in_progress\"."
   t)
 
 ;;; Skill tool
-(defun gptel-agent--get-skill (skill &optional _args)
+(defvar-local gptel-agent--skill-tools nil
+  "Activated tool templates owned by this conversation, never dispatchers.
+These are not inherited by children or saved across Emacs restarts.")
+
+(defun gptel-agent--skill-copy-tool (tool)
+  "Copy TOOL and its schema without copying its function's lexical state."
+  (let ((copy (gptel--copy-tool tool)))
+    (setf (gptel-tool-args copy) (copy-tree (gptel-tool-args tool) t))
+    copy))
+
+(defun gptel-agent--skill-merge-tools (tools additions)
+  "Return TOOLS with ADDITIONS replacing matching names exactly once."
+  (append (cl-remove-if
+           (lambda (tool)
+             (cl-find (gptel-tool-name tool) additions
+                      :key #'gptel-tool-name :test #'equal))
+           tools)
+          additions))
+
+(defun gptel-agent--localize-skill-tool (fsm)
+  "Snapshot Skill discovery, registered tools and conversation grants for FSM.
+Run before the Agent and Discussion transforms, which bind dispatchers to
+the new request.  Keep ordinary conversation tools separate from grants so
+children inherit only explicitly configured tools and their permissions."
+  (let* ((info (gptel-fsm-info fsm))
+         (source (plist-get info :buffer))
+         (skills (copy-tree gptel-agent--skills t))
+         (enabled (copy-sequence gptel-agent--enabled-skills))
+         (registry (cl-loop for (_ . entries) in gptel--known-tools
+                            append (mapcar (lambda (entry)
+                                             (gptel-agent--skill-copy-tool (cdr entry)))
+                                           entries)))
+         (active (and (buffer-live-p source)
+                      (mapcar #'gptel-agent--skill-copy-tool
+                              (buffer-local-value 'gptel-agent--skill-tools source)))))
+    (setf (gptel-fsm-info fsm)
+          (plist-put info :skill-base-tools
+                     (mapcar #'gptel-agent--skill-copy-tool gptel-tools)))
+    (setf (gptel-fsm-info fsm)
+          (plist-put (gptel-fsm-info fsm) :skill-tools active))
+    (setq-local gptel-tools
+                (gptel-agent--skill-merge-tools
+                 (mapcar #'gptel-agent--skill-copy-tool gptel-tools) active))
+    (when-let* ((tool (cl-find "Skill" gptel-tools
+                               :key #'gptel-tool-name :test #'equal)))
+      (setf (gptel-tool-description tool)
+            (let ((gptel-agent--enabled-skills enabled))
+              (concat gptel-agent--skill-tool-base-desc "\n\n"
+                      (gptel-agent--skills-system-message skills)))
+            (plist-get (car (gptel-tool-args tool)) :enum)
+            (vconcat (or enabled (mapcar #'car skills)))
+            (gptel-tool-function tool)
+            (lambda (skill &optional args)
+              (let ((gptel-agent--skills skills))
+                (if (and enabled (not (member skill enabled)))
+                    (format "Error: skill %s is not enabled for this request." skill)
+                  (gptel-agent--get-skill skill args fsm registry))))))))
+
+(defun gptel-agent--skill-resolve-tools (declaration registry)
+  "Resolve exact names in DECLARATION against request snapshot REGISTRY.
+Signal an error for any invalid, missing or ambiguous name before granting
+anything.  Scoped expressions are deliberately unsupported."
+  (unless (stringp declaration)
+    (error "allowed-tools must be a space-separated string of exact tool names"))
+  (mapcar
+   (lambda (name)
+     (when (string-match-p "[][()*?]" name)
+       (error "Unsupported allowed-tools expression %S; use exact tool names" name))
+     (let ((matches (cl-remove name registry :key #'gptel-tool-name
+                               :test-not #'equal)))
+       (unless (= (length matches) 1)
+         (error "%s allowed-tools name %S"
+                (if matches "Ambiguous" "Unknown") name))
+       (let ((tool (gptel-agent--skill-copy-tool (car matches))))
+         ;; gptel's always-confirm and per-call hook decisions still win.
+         (setf (gptel-tool-confirm tool) nil)
+         tool)))
+   (delete-dups (split-string declaration "[ \t\r\n]+" t))))
+
+(defun gptel-agent--skill-activate (declaration fsm registry)
+  "Activate DECLARATION for FSM using REGISTRY, returning a diagnostic on error."
+  (condition-case err
+      (let* ((templates (gptel-agent--skill-resolve-tools declaration registry))
+             (info (and fsm (gptel-fsm-info fsm)))
+             (source (plist-get info :buffer)))
+        (when templates
+          (unless (and (buffer-live-p source)
+                       (eq (gptel-fsm-state fsm) 'TOOL))
+            (error "No active requesting conversation; load this skill through Skill"))
+          (let* ((existing (plist-get info :tools))
+                 (gptel-tools
+                  (cl-remove-if
+                   (lambda (tool) (cl-find (gptel-tool-name tool) existing
+                                           :key #'gptel-tool-name :test #'equal))
+                   (mapcar #'gptel-agent--skill-copy-tool templates))))
+            ;; Reuse the existing runtime binding paths for newly exposed tools.
+            ;; Already bound tools retain their request-owned closures and state.
+            (with-current-buffer source
+              (gptel-agent--localize-agent-tool fsm)
+              (when (fboundp 'gptel-agent-discussion--localize)
+                (gptel-agent-discussion--localize fsm)))
+            (let* ((added gptel-tools)
+                   (tools
+                    (gptel-agent--skill-merge-tools
+                     existing
+                     (mapcar
+                      (lambda (template)
+                        (let ((tool (gptel-agent--skill-copy-tool
+                                     (or (cl-find (gptel-tool-name template) existing
+                                                  :key #'gptel-tool-name :test #'equal)
+                                         (cl-find (gptel-tool-name template) added
+                                                  :key #'gptel-tool-name :test #'equal)))))
+                          (setf (gptel-tool-confirm tool) nil)
+                          tool))
+                      templates)))
+                   (schemas (gptel--parse-tools (plist-get info :backend) tools)))
+              ;; Publish only after resolution and serialization have succeeded.
+              (setq info (gptel-fsm-info fsm))
+              (setf (plist-get info :tools) tools
+                    (plist-get (plist-get info :data) :tools) schemas)
+              (setf (gptel-fsm-info fsm)
+                    (plist-put info :skill-tools
+                               (gptel-agent--skill-merge-tools
+                                (plist-get info :skill-tools) templates)))
+              (with-current-buffer source
+                (setq gptel-agent--skill-tools
+                      (gptel-agent--skill-merge-tools gptel-agent--skill-tools templates))))))
+        nil)
+    (error (format "allowed-tools activation failed: %s. No tools or pre-approvals were added."
+                   (error-message-string err)))))
+
+(defun gptel-agent--get-skill (skill &optional _args fsm registry)
   "Return the details of the SKILL.
 
 This loads the body of the corresponding SKILL.  When using this as a
 tool in gptel, make sure the known skills are added to the context
 window.  `gptel-agent--skills-system-message' can be used to generate
-the known skills as string ready to be included to the context."
+the known skills as string ready to be included to the context.
+FSM and REGISTRY are the calling request and its tool registry snapshot;
+they are supplied by the request-local Skill dispatcher for allowed-tools."
   (let ((skill-dir
          (car-safe
           (alist-get skill gptel-agent--skills nil nil #'string-equal))))
@@ -1883,15 +2019,18 @@ the known skills as string ready to be included to the context."
                  (cons (file-relative-name full-path skill-dir-expanded)
                        full-path))
                (directory-files-recursively skill-dir-expanded ".*")))
-             (body (plist-get
-                    (cdr (gptel-agent--cached-read-file
-                          (expand-file-name "SKILL.md" skill-dir) t))
-                    :system)))
+             (data (cdr (gptel-agent--cached-read-skill-file
+                         (expand-file-name "SKILL.md" skill-dir) t)))
+             (body (plist-get data :system))
+             (diagnostic (when (plist-member data :allowed-tools)
+                           (gptel-agent--skill-activate
+                            (plist-get data :allowed-tools) fsm registry))))
         (if body
             (let (start)
               (with-temp-buffer
                 (insert "## Skill: " skill
                         "\n- base dir: " skill-dir-expanded "\n")
+                (when diagnostic (insert "\n" diagnostic "\n\n"))
                 (setq start (point))
                 (insert body)
                 (pcase-dolist (`(,rel-path . ,full-path) skill-files)
@@ -2821,7 +2960,7 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
         ;; Retain only reusable request settings, never transport state,
         ;; pending tool calls or callbacks from this invocation.
         (let ((info (gptel-fsm-info fsm)) saved)
-          (dolist (key '(:backend :model :stream :tools :include-reasoning
+          (dolist (key '(:backend :model :stream :tools :skill-base-tools :include-reasoning
                         :transformer :data))
             (when (plist-member info key)
               (setq saved (plist-put saved key (plist-get info key)))))
@@ -3048,11 +3187,16 @@ button for its live diagnostic buffer."
       (funcall callback "" info t))
     (or (plist-get info :tracking-marker) (plist-get info :position))))
 
-(defun gptel-agent--copy-parent-request-config (parent-buffer child-buffer)
-  "Copy owned gptel request settings from PARENT-BUFFER to CHILD-BUFFER."
+(defun gptel-agent--copy-parent-request-config (parent-buffer child-buffer &optional fsm)
+  "Copy owned settings from PARENT-BUFFER to CHILD-BUFFER.
+When FSM is supplied, exclude its conversation-specific skill grants."
   (dolist (symbol gptel-agent--request-config-variables)
     (when (boundp symbol)
-      (let ((value (buffer-local-value symbol parent-buffer)))
+      (let* ((info (and fsm (gptel-fsm-info fsm)))
+             (value (if (and (eq symbol 'gptel-tools)
+                             (plist-member info :skill-base-tools))
+                        (plist-get info :skill-base-tools)
+                      (buffer-local-value symbol parent-buffer))))
         (with-current-buffer child-buffer
           (set (make-local-variable symbol)
                (if (consp value) (copy-tree value) value)))))))
@@ -3121,11 +3265,20 @@ The value must be nil (unlimited) or a non-negative integer."
                         (cons :callback callback)))
       (setq info (plist-put info (car entry) (cdr entry))))
     (setf (gptel-fsm-info fsm) info)
-    (setq-local gptel-tools (copy-sequence (plist-get info :tools))
+    (setq-local gptel-tools (copy-sequence
+                            (if (plist-member info :skill-base-tools)
+                                (plist-get info :skill-base-tools)
+                              (plist-get info :tools)))
                 gptel-use-tools (and gptel-tools t))
-    ;; Nested Agent dispatchers must own this new invocation's FSM.
+    ;; Every request-owned dispatcher must capture this new invocation's FSM.
+    (gptel-agent--localize-skill-tool fsm)
     (gptel-agent--localize-agent-tool fsm)
+    (when (fboundp 'gptel-agent-discussion--localize)
+      (gptel-agent-discussion--localize fsm))
     (plist-put info :tools gptel-tools)
+    (when gptel-tools
+      (setf (plist-get data :tools)
+            (gptel--parse-tools (plist-get info :backend) gptel-tools)))
     (gptel--fsm-transition fsm)))
 
 (defun gptel-agent--task (main-cb agent-type description prompt
@@ -3269,7 +3422,7 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
               (unless previous
                 (setq preset (gptel-agent--resolve-subagent-preset preset))
                 (gptel-agent--copy-parent-request-config
-                 parent-buffer child-buffer))
+                 parent-buffer child-buffer parent-fsm))
               (with-current-buffer child-buffer
                 (unless previous
                   (setq default-directory
@@ -4526,6 +4679,8 @@ none of the predefined options are suitable."
 
 (add-hook 'gptel-pre-tool-call-functions #'gptel-agent--detect-repetition)
 (add-hook 'gptel-post-response-functions #'gptel-agent--reset-tool-call-counts)
+(add-hook 'gptel-prompt-transform-functions
+          #'gptel-agent--localize-skill-tool t)
 (add-hook 'gptel-prompt-transform-functions
           #'gptel-agent--localize-agent-tool t)
 (advice-add 'gptel-abort :around #'gptel-agent--abort-with-owned-runs)
