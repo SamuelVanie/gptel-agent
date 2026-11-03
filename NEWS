@@ -7,8 +7,11 @@
 - ~Discussion~ creates independent, editable gptel conversations that survive
   their parent's turn. ~DiscussionControl~ monitors, steers, follows up, waits,
   answers questions, forwards approvals to the user, and closes discussions.
-  Completion and attention events wake idle parents or arrive at safe request
-  boundaries. Unsent drafts defer automatic sending. ~gptel-agent-discussions~
+  Replies and attention alerts stay in the child. The child uses
+  ~DiscussionReport~ to send a chosen answer or useful update; only explicit
+  reports wake idle parents or arrive at safe request boundaries. Parents can
+  request reports with ~send~ or inspect work with ~read~. Unsent drafts defer
+  automatic sending. ~gptel-agent-discussions~
   opens the conversation list; users can interact directly in each child chat.
 
 - ~Agent~ accepts ~background: true~ for immediate launch acknowledgements.

@@ -113,8 +113,13 @@
           (ert-info ((format "Chat: %S" chat)) (should (eq (gptel-agent-discussion--chat-state chat) 'running)))
           (should-not (buffer-local-value 'gptel-agent--skill-tools child))
           (should-not (gptel-agent-skills-test--tool child-fsm "Discussion"))
+          (should (gptel-agent-skills-test--tool child-fsm "DiscussionReport"))
+          (should (member "DiscussionReport" (gptel-agent-skills-test--wire-names child-fsm)))
           (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS"
                                       (gptel-agent-workers-test--data child-fsm)))
+          (gptel-agent-workers-test--tool child-fsm "DiscussionReport" '(:message "SKILL-CHILD-REPORT"))
+          (should (equal "SKILL-CHILD-REPORT"
+                         (plist-get (car (buffer-local-value 'gptel-agent-discussion--inbox parent)) :text)))
           (gptel-agent-workers-test--tool fsm "DiscussionControl" '(:action "list"))
           (should (string-match-p "From skill" (cdar requests)))
           ;; A subsequent parent turn binds a new FSM without changing the old one.
@@ -395,5 +400,4 @@
     (should (string-match-p "self-contained opening prompt" (cdar requests)))))
 
 (provide 'gptel-agent-skills-test)
-
 

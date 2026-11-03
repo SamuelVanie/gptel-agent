@@ -5,9 +5,10 @@
 ;;; Commentary:
 
 ;; Discussion creates an independent, editable gptel buffer.  Ownership belongs
-;; to a conversation buffer, not one request.  Its event inbox survives turns;
-;; only request boundaries may deliver it to a running model.  Native question
-;; and approval controls remain usable, with one-shot, request-scoped callbacks.
+;; to a conversation buffer, not one request.  Only explicit child reports are
+;; sent back to that owner.  Its inbox survives turns; only request boundaries
+;; may deliver it to a running model.  Native question and approval controls
+;; remain usable, with one-shot, request-scoped callbacks.
 
 ;;; Code:
 
@@ -15,7 +16,7 @@
 (require 'tabulated-list)
 
 (defcustom gptel-agent-discussion-report-limit 16000
-  "Maximum characters in an automatic discussion report or transcript page."
+  "Maximum characters in a discussion report or transcript page."
   :type 'natnum
   :group 'gptel-agent)
 
@@ -99,20 +100,23 @@
               (run-at-time 0 nil #'gptel-agent-discussion--flush buffer))))))
 
 (defun gptel-agent-discussion--emit (chat kind text &optional interaction)
-  "Queue CHAT's KIND event containing TEXT and optional INTERACTION."
+  "Update CHAT's owner UI for KIND, forwarding only explicit reports.
+TEXT and optional INTERACTION describe the event.  Other events stay local
+and can be inspected with DiscussionControl read without waking the owner."
   (when-let* ((owner (gptel-agent-discussion--chat-owner chat))
               ((buffer-live-p owner)))
     (with-current-buffer owner
-      (setq gptel-agent-discussion--inbox
-            (nconc gptel-agent-discussion--inbox
-                   (list (list :id (gptel-agent-discussion--id "event")
-                               :discussion-id (gptel-agent-discussion--chat-id chat)
-                               :status (gptel-agent-discussion--status chat)
-                               :kind kind :text text
-                               :request-id (and interaction
-                                                (gptel-agent-discussion--interaction-id
-                                                 interaction))))))
-      (gptel-agent-discussion--schedule owner)
+      (when (eq kind 'report)
+        (setq gptel-agent-discussion--inbox
+              (nconc gptel-agent-discussion--inbox
+                     (list (list :id (gptel-agent-discussion--id "event")
+                                 :discussion-id (gptel-agent-discussion--chat-id chat)
+                                 :status (gptel-agent-discussion--status chat)
+                                 :kind kind :text text
+                                 :request-id (and interaction
+                                                  (gptel-agent-discussion--interaction-id
+                                                   interaction))))))
+        (gptel-agent-discussion--schedule owner))
       (gptel-agent-discussion--refresh-list))
     (when (memq kind '(question approval review failed closed))
       (message "Discussion %s: %s — M-x gptel-agent-discussions"
@@ -131,7 +135,9 @@
   "Format inbox EVENTS, including steering messages."
   (mapconcat (lambda (event)
                (if (eq (plist-get event :kind) 'message)
-                   (concat "Message from the managing conversation:\n"
+                   (concat (if (eq (plist-get event :source) 'user)
+                               "Message from the user in this discussion:\n"
+                             "Message from the managing conversation:\n")
                            (plist-get event :text))
                  (gptel-agent-discussion--event-text event)))
              events "\n\n"))
@@ -216,9 +222,15 @@
                     (if (eq state 'DONE)
                         (or (gptel-agent--workers-answer (gptel-agent--workers-for fsm)) "")
                       (or (plist-get info :error) "Request cancelled.")))
-              (gptel-agent-discussion--emit
-               chat (pcase state ('DONE 'completed) ('ABRT 'cancelled) (_ 'failed))
-               (gptel--to-string (gptel-agent-discussion--chat-result chat))))
+              ;; Ordinary answers stay in the child, including answers to a
+              ;; direct user follow-up.  Only DiscussionReport forwards them.
+              (if (eq state 'DONE)
+                  (when (buffer-live-p (gptel-agent-discussion--chat-owner chat))
+                    (with-current-buffer (gptel-agent-discussion--chat-owner chat)
+                      (gptel-agent-discussion--refresh-list)))
+                (gptel-agent-discussion--emit
+                 chat (if (eq state 'ABRT) 'cancelled 'failed)
+                 (gptel--to-string (gptel-agent-discussion--chat-result chat)))))
             (gptel-agent-discussion--schedule buffer)))))))
 
 (defun gptel-agent-discussion--draft-p ()
@@ -268,6 +280,12 @@
                                 (member (gptel-tool-name tool)
                                         '("Discussion" "DiscussionControl")))
                               gptel-tools)))
+    ;; Never inherit another discussion's reporting closure.  Bind this
+    ;; capability only to a live managed child, even with a custom preset or
+    ;; when management tools were enabled through a parent-only skill grant.
+    (setq-local gptel-tools
+                (cl-remove "DiscussionReport" gptel-tools
+                           :key #'gptel-tool-name :test #'equal))
     (when (and (buffer-live-p buffer)
                (or enabled (buffer-local-value 'gptel-agent-discussion--self buffer)
                    (buffer-local-value 'gptel-agent-discussion--children buffer)
@@ -319,7 +337,14 @@
                     (lambda (callback action &optional id message request-id ids offset)
                       (gptel-agent-discussion--control
                        callback fsm action id message request-id ids offset))))
-            (setq-local gptel-tools (cons tool (remq base gptel-tools)))))))))
+            (setq-local gptel-tools (cons tool (remq base gptel-tools))))))
+      (when-let* ((chat (buffer-local-value 'gptel-agent-discussion--self buffer))
+                  ((buffer-live-p (gptel-agent-discussion--chat-owner chat)))
+                  ((not (eq (gptel-agent-discussion--chat-state chat) 'closed))))
+        (let ((tool (gptel--copy-tool (gptel-get-tool "DiscussionReport"))))
+          (setf (gptel-tool-function tool)
+                (lambda (message) (gptel-agent-discussion--report chat fsm message)))
+          (push tool gptel-tools))))))
 
 (defun gptel-agent-discussion--guard-send (original &optional arg)
   "Protect monitored buffers from concurrent `gptel-send' through ORIGINAL.
@@ -418,7 +443,7 @@ Prefix ARG still opens the normal gptel menu."
        chat 'question (gptel-agent-discussion--interaction-text interaction) interaction))))
 
 (defun gptel-agent-discussion--approval (chat fsm calls &optional source-fsm)
-  "Guard approval CALLS in CHAT's FSM and report them to its owner.
+  "Guard approval CALLS in CHAT's FSM for local or requested user approval.
 SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
   (let ((interaction
          (gptel-agent-discussion--make-interaction
@@ -532,7 +557,7 @@ SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
       (when interaction (gptel-agent-discussion--track-approval-ui interaction buffer)))))
 
 (defun gptel-agent-discussion--review (queue &optional closed)
-  "Report outstanding file review revisions in QUEUE, unless CLOSED."
+  "Track outstanding file review revisions in QUEUE locally, unless CLOSED."
   (let ((owner (gptel-agent-review--queue-owner queue)))
     (when (buffer-live-p owner)
       (with-current-buffer owner
@@ -628,7 +653,8 @@ DIRECTORY selects its working directory."
             (gptel-mode 1)
             (setq-local gptel-agent-discussion--self chat)
             (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
-            (insert (gptel-prompt-prefix-string) prompt)
+            (insert (gptel-prompt-prefix-string)
+                    "Message from the managing conversation:\n" prompt)
             (with-current-buffer owner
               (push chat gptel-agent-discussion--children))
             (let ((mark-active nil)) (gptel-send)))
@@ -657,19 +683,34 @@ CONFIG, TITLE, PROMPT, PRESET and DIRECTORY describe the new discussion."
                             (plist-get (gptel-fsm-info fsm) :buffer)
                             config title prompt preset directory)))
                  (concat (gptel-agent-discussion--status chat)
-                         "\nCompletion and attention events arrive automatically. The user can open this buffer or M-x gptel-agent-discussions.")))
+                         "\nReplies and attention alerts stay in the discussion. Only an explicit DiscussionReport notifies you. Use send to ask for a report, or read to inspect its work and pending interactions. The user can open this buffer or M-x gptel-agent-discussions.")))
            (error (concat "Error: " (error-message-string err))))))
     (funcall callback result)))
 
-(defun gptel-agent-discussion--send (chat message)
-  "Queue MESSAGE for CHAT's current request or a follow-up turn."
+(defun gptel-agent-discussion--report (chat fsm message)
+  "Send MESSAGE chosen by CHAT's live FSM to its managing conversation."
+  (condition-case err
+      (progn
+        (gptel-agent-discussion--nonempty message "message")
+        (unless (gptel-agent-discussion--live-p chat fsm)
+          (user-error "This discussion request has ended"))
+        (unless (buffer-live-p (gptel-agent-discussion--chat-owner chat))
+          (user-error "This discussion no longer has a managing conversation"))
+        (gptel-agent-discussion--emit chat 'report message)
+        "Report queued for the managing conversation. Ordinary replies remain in this discussion.")
+    (error (concat "Error: " (error-message-string err)))))
+
+(defun gptel-agent-discussion--send (chat message &optional source)
+  "Queue MESSAGE for CHAT's current request or a follow-up turn.
+SOURCE is `user' for direct user steering; otherwise it is the manager."
   (gptel-agent-discussion--nonempty message "message")
   (when (or (eq (gptel-agent-discussion--chat-state chat) 'closed)
             (not (buffer-live-p (gptel-agent-discussion--chat-buffer chat))))
     (user-error "This discussion is closed"))
   (with-current-buffer (gptel-agent-discussion--chat-buffer chat)
     (setq gptel-agent-discussion--inbox
-          (nconc gptel-agent-discussion--inbox (list (list :kind 'message :text message)))
+          (nconc gptel-agent-discussion--inbox
+                 (list (list :kind 'message :text message :source source)))
           gptel-agent-discussion--paused nil)
     (gptel-agent-discussion--schedule (current-buffer))
     (concat (gptel-agent-discussion--status chat)
@@ -681,6 +722,10 @@ CONFIG, TITLE, PROMPT, PRESET and DIRECTORY describe the new discussion."
   (unless (natnump offset) (user-error "offset must be a nonnegative character offset"))
   (concat
    (gptel-agent-discussion--status chat)
+   (when (memq (gptel-agent-discussion--chat-state chat) '(failed cancelled))
+     (concat "\nLast result:\n"
+             (gptel-agent-discussion--clip
+              (gptel--to-string (gptel-agent-discussion--chat-result chat)))))
    (when (gptel-agent-discussion--chat-review chat)
      (format "\nPending file reviews (path, revision): %S\nOpen this discussion's gptel-agent-review queue to review."
              (gptel-agent-discussion--chat-review chat)))
@@ -887,7 +932,7 @@ IDS selects a wait set and OFFSET selects a transcript page."
                   (and (derived-mode-p 'gptel-agent-discussions-mode)
                        (gptel-agent-discussion--selected)))))
     (unless chat (user-error "Open a discussion or select it with M-x gptel-agent-discussions"))
-    (message "%s" (gptel-agent-discussion--send chat message))))
+    (message "%s" (gptel-agent-discussion--send chat message 'user))))
 
 (defun gptel-agent-discussion-close ()
   "Close the selected managed discussion, keeping its transcript."
@@ -927,7 +972,7 @@ If a draft remains, send it explicitly with `gptel-send' instead."
 
 (gptel-make-tool
  :name "Discussion"
- :description "Create an independent, ordinary editable gptel conversation. It inherits request settings (optionally overridden by preset), starts with only your prompt, and can outlive this turn. Returns immediately with discussion_id and buffer name. Completion, questions and approvals are reported automatically. The user can interact directly in the buffer. Use DiscussionControl for follow-ups and monitoring. Use Agent for bounded subagent tasks."
+ :description "Create an independent, ordinary editable gptel conversation. It inherits request settings (optionally overridden by preset), starts with only your prompt, and can outlive this turn. Returns immediately with discussion_id and buffer name. Replies, questions, approvals, failures and review notices stay in the child; only an explicit DiscussionReport notifies you. Ask for a report in your prompt or with DiscussionControl send when you need an answer, or use read to inspect its work and pending interactions. The user can interact directly in the buffer. Use Agent for bounded subagent tasks."
  :function (lambda (callback &rest _) (funcall callback "Error: Discussion needs a request-local dispatcher."))
  :args '((:name "title" :type string :description "Short discussion title.")
          (:name "prompt" :type string :description "Self-contained opening message; parent transcript is not copied.")
@@ -936,8 +981,15 @@ If a draft remains, send it explicitly with `gptel-send' instead."
  :category "gptel-agent" :async t :include t :confirm t)
 
 (gptel-make-tool
+ :name "DiscussionReport"
+ :description "Send a concise message to this discussion's managing conversation. Ordinary replies are local and are NEVER forwarded automatically. Use this tool when the manager asks for an answer or progress report, or when a finding or blocker matters to its work. Choose whether reporting is useful; do not routinely forward direct user exchanges, acknowledgements, or every completed turn. A report may start a model request in the managing conversation. No discussion_id is needed: this reports only to your own manager."
+ :function (lambda (&rest _) "Error: DiscussionReport is available only in a live managed discussion.")
+ :args '((:name "message" :type string :description "The answer, useful update, or blocker to share with the managing conversation."))
+ :category "gptel-agent" :include t)
+
+(gptel-make-tool
  :name "DiscussionControl"
- :description "Manage only discussions created by this conversation. list/read inspect without consuming events; read pages the editable transcript with a zero-based character offset. send steers running work at a safe boundary or starts a follow-up when idle. wait consumes the next event for any selected IDs (60 second maximum). answer resolves a pending question using its request_id. request_approval displays the exact pending tool calls in THIS buffer for the USER to approve; it never grants approval itself. reject declines pending tool calls. close aborts the current turn and ends monitoring, preserving the ordinary chat buffer. User actions can resolve interactions first: stale IDs return errors. Unsent drafts defer automatic sending."
+ :description "Manage only discussions created by this conversation. list/read inspect without consuming reports; read pages the editable transcript with a zero-based character offset and shows pending questions, approvals, reviews and failures. send steers running work at a safe boundary or starts a follow-up when idle; ask the child to report back when you need an answer. Replies and attention alerts are not forwarded automatically. wait consumes the next explicit report for any selected IDs (60 second maximum), or shows already pending interactions; silent completion does not produce an event. answer resolves a pending question using its request_id. request_approval displays the exact pending tool calls in THIS buffer for the USER to approve; it never grants approval itself. reject declines pending tool calls. close aborts the current turn and ends monitoring, preserving the ordinary chat buffer. User actions can resolve interactions first: stale IDs return errors. Unsent drafts defer automatic sending."
  :function (lambda (callback &rest _) (funcall callback "Error: DiscussionControl needs a request-local dispatcher."))
  :args '((:name "action" :type string :enum ["list" "read" "send" "wait" "answer" "request_approval" "reject" "close"])
          (:name "discussion_id" :type string :optional t :description "Required except for list/wait.")
