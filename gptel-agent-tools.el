@@ -422,9 +422,12 @@ Only JSON object field order is ignored; argument values remain exact."
 TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
   ;; Polling a live job can produce new evidence with identical arguments.
   ;; Do not feed these reads into the repetition/cycle detector.
-  (unless (and (equal (plist-get tool-call-info :name) "Process")
-               (member (plist-get (plist-get tool-call-info :args) :action)
-                       '("list" "read")))
+  (unless (or (and (equal (plist-get tool-call-info :name) "Process")
+                   (member (plist-get (plist-get tool-call-info :args) :action)
+                           '("list" "read")))
+              (and (equal (plist-get tool-call-info :name) "DiscussionControl")
+                   (member (plist-get (plist-get tool-call-info :args) :action)
+                           '("list" "read" "wait"))))
     (gptel-agent--detect-repeated-call tool-call-info)))
 
 (defun gptel-agent--detect-repeated-call (tool-call-info)
@@ -3712,9 +3715,13 @@ Always appends a custom option allowing the user to provide their own response."
                 (recenter)))
             ov))))))
 
+(defvar gptel-agent-question-functions nil
+  "Functions called with overlay, questions and source buffer of a new Ask.")
+
 (defun gptel-agent--ask-multiple (callback questions)
   "Ask QUESTIONS in one navigable interaction, then call CALLBACK with results."
-  (let* ((qs (append questions nil))
+  (let* ((source-buffer (current-buffer))
+         (qs (append questions nil))
          (total (length qs)))
     (if (= total 0)
         (funcall callback "")
@@ -3740,7 +3747,8 @@ Always appends a custom option allowing the user to provide their own response."
           (overlay-put ov 'gptel-ask--answers (make-vector total nil))
           (overlay-put ov 'gptel-ask--selections (make-vector total 0))
           (overlay-put ov 'gptel-ask--custom-responses (make-vector total nil))
-          (gptel-agent--ask-goto-question ov 0))
+          (gptel-agent--ask-goto-question ov 0)
+          (run-hook-with-args 'gptel-agent-question-functions ov qs source-buffer))
         ;; Async tools must return nil while waiting for their callback.
         nil))))
 

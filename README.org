@@ -381,6 +381,71 @@ gptel uses the term "preset" for such configurations.  A preset can specify the 
 
 =gptel-agent= is implemented as a preset for gptel and can be modified/extended easily.
 
+*** Managed discussions
+
+The default =gptel-agent= preset includes =Discussion= and =DiscussionControl=.
+=Discussion= creates a separate, ordinary gptel buffer with a title and opening
+prompt. It inherits the creating request's model, backend, system prompt, tools
+and confirmation settings; an optional existing =preset= can override them.
+It starts without the parent's transcript or attached context. An optional
+=directory= selects its working directory.
+
+Discussions run independently and survive the parent's completed turn. Their
+completion, failure, question and approval events reach the parent at its next
+safe request boundary. When the parent is idle, an event starts a new ordinary
+gptel turn. Reports are also recorded in its visible transcript. The parent
+does not poll the model for progress. These automatic turns use the parent's
+configured model and incur normal API usage.
+
+| Tool / action | Purpose |
+|---------------+---------|
+| =Discussion= | Start a fresh chat; return its stable =discussion_id= immediately |
+| =DiscussionControl list= | List discussions owned by this conversation |
+| =read= | Read status, pending interactions and a page of the editable transcript |
+| =send= | Steer running work, or start a follow-up in the same chat |
+| =wait= | Receive the next event for any selected =discussion_ids=, up to 60 seconds |
+| =answer= | Answer a pending =AskUserQuestion= using its exact =request_id= |
+| =request_approval= | Show the child's actual tool calls in the parent for user approval |
+| =reject= | Decline pending tool calls without executing them |
+| =close= | Abort current work and end monitoring; keep the editable transcript |
+
+=read= does not consume event delivery. Its =offset= is a zero-based character
+offset; =next_offset= identifies the next page. Automatic reports and transcript
+pages are bounded by =gptel-agent-discussion-report-limit= (16000 characters by
+default). Ownership lasts across turns, but a different conversation cannot
+manage these IDs.
+
+Run =M-x gptel-agent-discussions= in the parent or a managed discussion to open
+the list. =RET= opens a chat, =s= sends a message, =c= closes monitoring, and =g=
+refreshes. In a child buffer, use =gptel-send= normally for a new turn. During an
+active turn, use =M-x gptel-agent-discussion-send= to queue steering; it is
+delivered after pending tools finish, or as a follow-up if the response finishes
+first. Concurrent requests in the same monitored buffer are prevented.
+
+The parent can answer structured questions itself. Tool approvals always use
+gptel's user confirmation controls: =request_approval= only displays the calls.
+You can approve or answer directly in either displayed interaction; stale
+callbacks cannot execute the same tool or answer twice. The =Cancel request=
+control acts on the child even when shown in the parent. Tool approvals and
+questions raised by a discussion's sub-agents are also reported. File review
+revisions produce separate attention events pointing to the child's existing
+review queue; they retain the configured applied/staged review behavior.
+
+Automatic sending waits when you have an unsent draft. Send that draft with
+=gptel-send= to include queued events, or discard it and run
+=M-x gptel-agent-discussion-resume=. Aborting or failing a parent request pauses
+automatic delivery without stopping its discussions. A new manual send or
+=gptel-agent-discussion-resume= re-enables delivery. Killing the parent detaches
+its discussions, which remain usable; killing a child closes it and notifies
+the parent. =close= retains the transcript and stops only that discussion's
+current request (including its ordinary Agent workers).
+
+Management IDs, ownership and event queues are retained for the current Emacs
+session; saving and reopening a transcript does not restore supervision.
+After updating, reload/rebuild the package and run =gptel-agent-update=, then
+reapply the =gptel-agent= preset. For custom presets, include both =Discussion=
+and =DiscussionControl= in their tool lists.
+
 *** Using sub-agents
 
 gptel-agent can delegate tasks to "sub-agents".  Sub-agents can be specified in
