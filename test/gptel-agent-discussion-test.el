@@ -36,7 +36,8 @@
                          gptel-use-curl t gptel-mode t gptel-use-tools t
                          gptel-agent-preset nil gptel-confirm-tool-calls nil
                          gptel-pre-tool-call-functions nil gptel-post-tool-call-functions nil
-                         gptel-prompt-transform-functions '(gptel-agent-discussion--localize)
+                         gptel-prompt-transform-functions '(gptel-agent--localize-ask-tool
+                                                            gptel-agent-discussion--localize)
                          gptel-tools
                          (list (gptel-get-tool "Discussion") (gptel-get-tool "DiscussionControl")
                                (gptel-get-tool "AskUserQuestion")
@@ -311,6 +312,8 @@
        (gptel-agent-workers-test--tool
         child-fsm "AskUserQuestion"
         '(:questions [(:question "Which color?" :choices [(:value "Blue") (:value "Red")])]))
+       (should-not (gptel-agent-discussion--chat-pending chat))
+       (gptel-agent-workers-test--tool child-fsm "AskUserQuestion" '(:action "wait"))
        (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
               (id (gptel-agent-discussion--interaction-id pending))
               (ov (car (gptel-agent-discussion--interaction-overlays pending)))

@@ -4,6 +4,12 @@
 
 ** New features and UI changes
 
+- ~AskUserQuestion~ now queues questions with ~action: "add"~ (the default)
+  and returns immediately. Repeated calls extend one live question buffer,
+  preserving saved answers. ~action: "wait"~ explicitly pauses the turn and
+  collects all answers or cancellation. Users can save answers while the agent
+  works and submit when it waits. ~gptel-agent-questions~ reopens the queue.
+
 - ~Discussion~ creates independent, editable gptel conversations that survive
   their parent's turn. ~DiscussionControl~ monitors, steers, follows up, waits,
   answers questions and closes discussions. Tool approvals stay in the child

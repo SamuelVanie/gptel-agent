@@ -2249,6 +2249,7 @@ The caller must have appended all tool results before entering this function."
 
 (defun gptel-agent--workers-close (gate)
   "Invalidate GATE's inbox, callbacks and scheduled wakeup."
+  (gptel-agent--ask-cleanup (gptel-agent--workers-fsm gate))
   (setf (gptel-agent--workers-closed gate) t
         (gptel-agent--workers-events gate) nil
         (gptel-agent--workers-steering gate) nil
@@ -3572,6 +3573,187 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
 
 ;;; Ask tools (user interaction)
 
+(cl-defstruct (gptel-agent--question-queue
+               (:constructor gptel-agent--make-question-queue))
+  fsm source owner buffer overlay callback result)
+
+(defvar-local gptel-agent--question-queues nil
+  "Question queues presented for this conversation and its workers.")
+
+(defvar-local gptel-agent--question-queue nil
+  "Queue displayed in this questions buffer.")
+
+(defun gptel-agent--ask-cleanup (fsm)
+  "Discard FSM's queue without invoking a possibly stale tool callback."
+  (when-let* ((queue (plist-get (gptel-fsm-info fsm) :agent-questions)))
+    (setf (plist-get (gptel-fsm-info fsm) :agent-questions) nil
+          (gptel-agent--question-queue-callback queue) nil)
+    (gptel-agent--ask-hide queue)
+    (when-let* ((owner (gptel-agent--question-queue-owner queue))
+                ((buffer-live-p owner)))
+      (with-current-buffer owner
+        (setq gptel-agent--question-queues
+              (delq queue gptel-agent--question-queues))))))
+
+(defun gptel-agent--ask-hide (queue)
+  "Remove QUEUE's display without treating cleanup as user cancellation."
+  (when-let* ((buffer (gptel-agent--question-queue-buffer queue))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (setq gptel-agent--question-queue nil)
+      (kill-buffer buffer))))
+
+(defun gptel-agent--ask-finish (queue result)
+  "Store RESULT once for QUEUE, delivering it only to an explicit waiter."
+  (let* ((fsm (gptel-agent--question-queue-fsm queue))
+         (source (gptel-agent--question-queue-source queue)))
+    (when (and (eq queue (plist-get (gptel-fsm-info fsm) :agent-questions))
+               (not (gptel-agent--question-queue-result queue))
+               (buffer-live-p source)
+               (not (memq (gptel-fsm-state fsm) '(DONE ABRT ERRS))))
+      (setf (gptel-agent--question-queue-result queue) result)
+      (if-let* ((callback (gptel-agent--question-queue-callback queue)))
+          (progn
+            ;; Clear ownership before the callback can start another tool.
+            (gptel-agent--ask-cleanup fsm)
+            (with-current-buffer source (funcall callback result)))
+        (gptel-agent--ask-hide queue)))))
+
+(defun gptel-agent--ask-buffer-killed ()
+  "Cancel a queue whose UI buffer the user killed."
+  (when-let* ((queue gptel-agent--question-queue))
+    (setq gptel-agent--question-queue nil)
+    (setf (gptel-agent--question-queue-buffer queue) nil)
+    (when-let* ((ov (gptel-agent--question-queue-overlay queue)))
+      ;; Use the wrapped callback, so discussion attention is resolved too.
+      (funcall (overlay-get ov 'gptel-ask--callback)
+               "User cancelled interaction."))))
+
+;;;###autoload
+(defun gptel-agent-questions ()
+  "Show this conversation's pending questions, including worker questions."
+  (interactive)
+  (let* ((queues (if gptel-agent--question-queue
+                     (list gptel-agent--question-queue)
+                   gptel-agent--question-queues))
+         (buffers (delq nil (mapcar #'gptel-agent--question-queue-buffer queues)))
+         (names (mapcar #'buffer-name (seq-filter #'buffer-live-p buffers))))
+    (unless names (user-error "No pending questions"))
+    (pop-to-buffer (if (cdr names)
+                       (completing-read "Questions: " names nil t)
+                     (car names)))))
+
+(defun gptel-agent--ask-normalize (questions)
+  "Copy QUESTIONS and append the free-text choice to each one."
+  (mapcar
+   (lambda (item)
+     (list :question (plist-get item :question)
+           :choices (append (append (plist-get item :choices) nil)
+                            (list (list :value "Custom"
+                                        :description "Provide your own custom response"
+                                        :recommended :json-false)))))
+   (append questions nil)))
+
+(defun gptel-agent--ask-dispatch (callback fsm questions action)
+  "Add QUESTIONS to FSM's queue or explicitly wait, according to ACTION.
+CALLBACK receives an acknowledgement for add, or the user's result for wait."
+  (let* ((source (plist-get (gptel-fsm-info fsm) :buffer))
+         (queue (plist-get (gptel-fsm-info fsm) :agent-questions))
+         (action (or action "add"))
+         result deferred created)
+    (cond
+     ((or (not (buffer-live-p source))
+          (memq (gptel-fsm-state fsm) '(DONE ABRT ERRS)))
+      (setq result "Error: This question request is no longer active."))
+     ((equal action "add")
+      (cond
+       ((and queue (gptel-agent--question-queue-callback queue))
+        (setq result "Error: Already waiting for answers; add questions before wait."))
+       ((and queue (gptel-agent--question-queue-result queue))
+        (setq result "User cancelled interaction. Call AskUserQuestion with action=wait to collect the result before adding more questions."))
+       ((not (and (sequencep questions) (> (length questions) 0)
+                  (seq-every-p
+                   (lambda (item)
+                     (and (stringp (plist-get item :question))
+                          (not (string-empty-p (string-trim (plist-get item :question))))
+                          (sequencep (plist-get item :choices))
+                          (seq-every-p (lambda (choice)
+                                         (stringp (plist-get choice :value)))
+                                       (plist-get item :choices))))
+                   questions)))
+        (setq result "Error: add requires nonempty questions with question text and optional choices containing value strings."))
+       (t
+        (unless queue
+          (let* ((owner (with-current-buffer source
+                          (gptel-agent--ask-presentation-buffer)))
+                 (buffer (generate-new-buffer
+                          (format "*Questions: %s*" (buffer-name source)))))
+            (setq queue (gptel-agent--make-question-queue
+                         :fsm fsm :source source :owner owner :buffer buffer)
+                  created t)
+            (setf (gptel-fsm-info fsm)
+                  (plist-put (gptel-fsm-info fsm) :agent-questions queue))
+            (with-current-buffer owner (push queue gptel-agent--question-queues))
+            (with-current-buffer buffer
+              (special-mode)
+              (setq-local gptel-agent--question-queue queue)
+              (add-hook 'kill-buffer-hook #'gptel-agent--ask-buffer-killed nil t)
+              (gptel-agent--ask-multiple
+               (lambda (answer) (gptel-agent--ask-finish queue answer))
+               questions queue))))
+        (let ((ov (gptel-agent--question-queue-overlay queue)))
+          (with-current-buffer (overlay-buffer ov)
+            (unless created
+              (overlay-put ov 'gptel-ask--questions
+                           (append (overlay-get ov 'gptel-ask--questions)
+                                   (gptel-agent--ask-normalize questions)))
+              (dolist (property '(gptel-ask--answers gptel-ask--selections
+                                  gptel-ask--custom-responses))
+                (overlay-put ov property
+                             (vconcat (overlay-get ov property)
+                                      (make-vector (length questions)
+                                                   (and (eq property 'gptel-ask--selections) 0)))))
+              (gptel-agent--ask-update-overlay ov)))
+          (display-buffer (overlay-buffer ov))
+          (setq result
+                (format "status: collecting\nquestions: %d\nQuestions queued; no answers returned yet. Continue independent work and add further questions with AskUserQuestion. When ready, call AskUserQuestion with action=wait and omit questions; wait for its result before dependent work or finishing."
+                        (length (overlay-get ov 'gptel-ask--questions))))))))
+     ((equal action "wait")
+      (cond
+       ((and questions (> (length questions) 0))
+        (setq result "Error: wait takes no questions; add them in a separate call first."))
+       ((not queue) (setq result "status: empty\nNo questions are queued."))
+       ((gptel-agent--question-queue-callback queue)
+        (setq result "Error: Already waiting for this question queue."))
+       ((gptel-agent--question-queue-result queue)
+        (setq result (gptel-agent--question-queue-result queue))
+        (gptel-agent--ask-cleanup fsm))
+       (t
+        (setf (gptel-agent--question-queue-callback queue) callback)
+        (setq deferred t)
+        (let ((ov (gptel-agent--question-queue-overlay queue)))
+          (with-current-buffer (overlay-buffer ov)
+            (gptel-agent--ask-update-overlay ov))
+          ;; Publish discussion attention only after the batch is complete.
+          (with-current-buffer (gptel-agent--question-queue-owner queue)
+            (run-hook-with-args 'gptel-agent-question-functions
+                                ov (overlay-get ov 'gptel-ask--questions) source))
+          (when (overlay-buffer ov) (display-buffer (overlay-buffer ov)))))))
+     (t (setq result "Error: action must be add or wait.")))
+    (unless deferred (funcall callback result))
+    nil))
+
+(defun gptel-agent--localize-ask-tool (fsm)
+  "Give AskUserQuestion a request-owned queue and lifecycle in FSM."
+  (when-let* ((base (cl-find "AskUserQuestion" gptel-tools
+                            :key #'gptel-tool-name :test #'equal)))
+    (gptel-agent--workers-install fsm)
+    (let ((tool (gptel--copy-tool base)))
+      (setf (gptel-tool-function tool)
+            (lambda (callback &optional questions action)
+              (gptel-agent--ask-dispatch callback fsm questions action)))
+      (setq-local gptel-tools (cons tool (remq base gptel-tools))))))
+
 (defun gptel-agent--ask-overlay-at-point ()
   "Return the ask overlay at point, if any."
   (seq-find (lambda (ov) (overlay-get ov 'gptel-ask))
@@ -3673,8 +3855,17 @@ interaction."
          (selection (overlay-get ov 'gptel-ask--selection))
          (question-index (overlay-get ov 'gptel-ask--index))
          (answers (overlay-get ov 'gptel-ask--answers))
-         (new-text (gptel-agent--ask-draw-ui
-                    question choices selection question-index answers))
+         (queue (overlay-get ov 'gptel-ask--queue))
+         (new-text
+          (concat
+           (gptel-agent--ask-draw-ui
+            question choices selection question-index answers)
+           (when queue
+             (propertize
+              (if (gptel-agent--question-queue-callback queue)
+                  "\n Agent is waiting. Submit saved answers with C-c C-c.\n"
+                "\n Agent is still collecting questions. Save answers now; submit when it waits.\n")
+              'font-lock-face 'font-lock-comment-face))))
          (inhibit-read-only t)
          (beg (overlay-start ov))
          (end (overlay-end ov)))
@@ -3761,8 +3952,9 @@ interaction."
     (let ((inhibit-read-only t)
           (beg (overlay-start ov))
           (end (overlay-end ov)))
-      (when (and beg end)
-        (delete-region beg end)))
+      (when (and beg end (overlay-buffer ov))
+        (with-current-buffer (overlay-buffer ov)
+          (delete-region beg end))))
     (delete-overlay ov)))
 
 (defun gptel-agent--ask-confirm-choice ()
@@ -3784,14 +3976,18 @@ interaction."
                     (read-string "Enter your custom response: "
                                  (aref custom-responses idx))
                   val)))
-          (when custom-p
-            (aset custom-responses idx answer))
-          (aset (overlay-get ov 'gptel-ask--selections) idx sel-idx)
-          (aset answers idx answer)
-          (if (< idx (1- (length answers)))
-              (gptel-agent--ask-goto-question ov (1+ idx))
-            (gptel-agent--ask-update-overlay ov)
-            (message "Answer saved; review with M-p/← or submit with C-c C-c")))
+          ;; More questions can arrive while the minibuffer is active.
+          ;; Fetch the current vectors, and ignore an expired interaction.
+          (when (overlay-buffer ov)
+            (with-current-buffer (overlay-buffer ov)
+              (when custom-p
+                (aset (overlay-get ov 'gptel-ask--custom-responses) idx answer))
+              (aset (overlay-get ov 'gptel-ask--selections) idx sel-idx)
+              (aset (overlay-get ov 'gptel-ask--answers) idx answer)
+              (if (< idx (1- (length (overlay-get ov 'gptel-ask--answers))))
+                  (gptel-agent--ask-goto-question ov (1+ idx))
+                (gptel-agent--ask-update-overlay ov)
+                (message "Answer saved; review with M-p/← or submit with C-c C-c")))))
       ;; Treat the appended custom option (always the last in CHOICES)
       ;; as the free-text sentinel, instead of relying on VAL being \"Custom\".
       (if (= sel-idx (1- (length choices)))
@@ -3810,10 +4006,15 @@ interaction."
               (questions (overlay-get ov 'gptel-ask--questions))
               (answers (overlay-get ov 'gptel-ask--answers))
               (callback (overlay-get ov 'gptel-ask--callback)))
-    (if-let* ((missing (cl-position nil answers)))
-        (progn
-          (gptel-agent--ask-goto-question ov missing)
-          (message "Answer question %d before submitting" (1+ missing)))
+    (cond
+     ((and-let* ((queue (overlay-get ov 'gptel-ask--queue)))
+        (not (gptel-agent--question-queue-callback queue)))
+      (message "Answers saved; the agent is still collecting questions"))
+     ((cl-position nil answers)
+      (let ((missing (cl-position nil answers)))
+        (gptel-agent--ask-goto-question ov missing)
+        (message "Answer question %d before submitting" (1+ missing))))
+     (t
       (let ((formatted-output
              (mapconcat
               (lambda (idx)
@@ -3823,15 +4024,15 @@ interaction."
               (number-sequence 0 (1- (length questions)))
               "\n\n")))
         (gptel-agent--ask-teardown ov)
-        (funcall callback formatted-output)))))
+        (funcall callback formatted-output))))))
 
 (defun gptel-agent--ask-cancel ()
   "Cancel ask interaction."
   (interactive)
   (when-let ((ov (gptel-agent--ask-overlay-at-point)))
-    (when-let ((cb (overlay-get ov 'gptel-ask--callback)))
-      (funcall cb "User cancelled interaction."))
-    (gptel-agent--ask-teardown ov)))
+    (let ((cb (overlay-get ov 'gptel-ask--callback)))
+      (gptel-agent--ask-teardown ov)
+      (when cb (funcall cb "User cancelled interaction.")))))
 
 (defun gptel-agent--ask-presentation-buffer ()
   "Return the buffer in which an Ask interaction should be displayed.
@@ -3885,39 +4086,33 @@ Always appends a custom option allowing the user to provide their own response."
             ov))))))
 
 (defvar gptel-agent-question-functions nil
-  "Functions called with overlay, questions and source buffer of a new Ask.")
+  "Functions called with overlay, questions and source when Ask waits.")
 
-(defun gptel-agent--ask-multiple (callback questions)
-  "Ask QUESTIONS in one navigable interaction, then call CALLBACK with results."
+(defun gptel-agent--ask-multiple (callback questions &optional queue)
+  "Display QUESTIONS and call CALLBACK with results.
+When QUEUE is non-nil, defer submission and attention hooks until it waits."
   (let* ((source-buffer (current-buffer))
          (qs (append questions nil))
          (total (length qs)))
     (if (= total 0)
         (funcall callback "")
-      (let* ((normalized
-              (mapcar
-               (lambda (item)
-                 (list
-                  :question (plist-get item :question)
-                  :choices
-                  (append
-                   (append (plist-get item :choices) nil)
-                   (list (list :value "Custom"
-                               :description "Provide your own custom response"
-                               :recommended :json-false)))))
-               qs))
+      (let* ((normalized (gptel-agent--ask-normalize qs))
              (first (car qs))
              (ov (gptel-agent--ask-question
                   callback
                   (plist-get first :question)
                   (append (plist-get first :choices) nil))))
         (with-current-buffer (overlay-buffer ov)
+          (when queue
+            (setf (gptel-agent--question-queue-overlay queue) ov)
+            (overlay-put ov 'gptel-ask--queue queue))
           (overlay-put ov 'gptel-ask--questions normalized)
           (overlay-put ov 'gptel-ask--answers (make-vector total nil))
           (overlay-put ov 'gptel-ask--selections (make-vector total 0))
           (overlay-put ov 'gptel-ask--custom-responses (make-vector total nil))
           (gptel-agent--ask-goto-question ov 0)
-          (run-hook-with-args 'gptel-agent-question-functions ov qs source-buffer))
+          (unless queue
+            (run-hook-with-args 'gptel-agent-question-functions ov qs source-buffer)))
         ;; Async tools must return nil while waiting for their callback.
         nil))))
 
@@ -4532,6 +4727,7 @@ IGNORE-SELECTION ignores the conversation's interactive selection."
 The clone captures FSM and a snapshot of the allowed agent registry.  Its
 schema and dispatcher therefore cannot change when another project updates
 the global registry while this request is in flight."
+  (gptel-agent--localize-ask-tool fsm)
   (when (or (gptel-agent--run-p (plist-get (gptel-fsm-info fsm) :context))
             (cl-find-if (lambda (tool) (member (gptel-tool-name tool)
                                                '("Agent" "AgentControl")))
@@ -4660,14 +4856,27 @@ automatically appended.")
 
 (gptel-make-tool
  :name "AskUserQuestion"
- :function #'gptel-agent--ask-multiple
- :description "Ask the user one or more questions in a navigable interaction.
+ :function (lambda (callback &rest _)
+             (funcall callback "Error: AskUserQuestion needs a request-local dispatcher."))
+ :description "Accumulate questions while working, then explicitly wait for answers.
+
+action=add (default) appends QUESTIONS to this request's live question queue
+and returns immediately with an acknowledgement, not answers. Call add again
+as new questions arise. Continue useful work that does not depend on the answers.
+
+When you have no more questions to add, call action=wait with questions omitted
+or empty. This pauses your turn until the user submits all answers or cancels.
+You MUST wait and read the result before dependent work or finishing your turn.
+Call wait separately after all add calls finish. A cancelled queue is collected
+by wait too. After wait returns, add starts a fresh queue if more input is needed.
 
 The user can revisit and change saved answers before submitting the complete
-response list.
+response list. New questions preserve existing answers. Submission becomes
+available when you call wait. Cancellation is not approval; do not assume answers.
 
-Each question in QUESTIONS should have `question' and `choices' keys.
-CHOICES must contain objects with a `value' key. An optional `description'
+Each question in QUESTIONS requires a `question' string. Optional CHOICES
+contain objects with a `value' key; omit choices for a free-text-only question.
+An optional `description'
 key provides additional context for each choice. An optional `recommended' key
 tells the user which choice is recommended in this context.
 
@@ -4675,7 +4884,7 @@ A \"Custom\" option is always automatically appended to each question's
 choices, allowing the user to provide their own free-text response if
 none of the predefined options are suitable."
  :args '(( :name "questions"
-           :type array
+           :type array :optional t
            :items (:type object
                    :properties (:question (:type string)
                                 :choices (:type array
@@ -4683,7 +4892,10 @@ none of the predefined options are suitable."
                                                   :properties (:value (:type string)
                                                                       :description (:type string)
                                                                       :recommended (:type boolean))
-                                                  :required ["value"]))))))
+                                                  :required ["value"])))
+                   :required ["question"]))
+         (:name "action" :type string :optional t :enum ["add" "wait"]
+          :description "add queues questions and returns immediately (default); wait pauses for the complete answers, with questions omitted or empty."))
  :category "gptel-agent"
  :async t
  :include t)

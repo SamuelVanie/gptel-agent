@@ -108,6 +108,37 @@ buffers and the minibuffer.
 Please note: gptel-agent uses significantly more tokens than the average
 gptel LLM interaction.
 
+*** Asking questions while working
+
+=AskUserQuestion= accumulates questions across tool calls. Its default
+=action: "add"= returns immediately, so the agent can continue independent
+work and add further questions. When the list is ready, it calls
+=action: "wait"= with =questions= omitted or empty. Only that call pauses
+the turn and returns the complete answers (or a cancellation).
+
+Questions appear in a separate =*Questions: …*= buffer that refreshes in
+place as the list grows. Existing answers, choices and custom text are
+preserved. The buffer does not take focus or mix its UI into the conversation.
+Use =M-x gptel-agent-questions= from the conversation to reopen it, including
+questions from its workers. Each request has its own queue.
+
+| Key | Action |
+|-----+--------|
+| =1-9=, =n/p=, =TAB= | Select a choice |
+| =RET= | Save the answer and move to the next question |
+| =M-p/M-n= or =←/→= | Revisit questions and revise answers |
+| =C-c C-c= | Submit all answers once the agent is waiting |
+| =C-c C-k= | Cancel the question batch |
+| =q= | Hide the buffer |
+
+You can save answers while the agent is working; submission becomes available
+when it calls =wait=. Every question also has a free-text Custom option.
+Cancelling or killing the questions buffer records a cancellation for =wait=;
+it never supplies default answers. Aborting, finishing or closing the owning
+request removes its queue and invalidates late answers. A subsequent batch
+starts fresh after =wait= returns. In managed discussions, the completed list
+becomes a pending interaction for =DiscussionControl answer= when =wait= starts.
+
 *** Reviewing file edits with Ediff
 
 Loading =gptel-agent= (or =gptel-agent-tools=) automatically enables Ediff
