@@ -165,7 +165,7 @@ interpret the evidence it gathered and return its final answer."
   :type 'natnum
   :group 'gptel-agent)
 
-(defcustom gptel-agent-max-web-tool-calls 12
+(defcustom gptel-agent-max-web-tool-calls 50
   "Maximum web tool calls allowed in one supervised sub-agent run.
 
 This counts calls to WebSearch and WebFetch, not asynchronous callbacks.

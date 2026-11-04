@@ -605,11 +605,12 @@ Each delegation snapshots its backend, model, streaming mode, system prompt,
 tools and request parameters.  Tasks are unlimited by default.  Add
 =task-timeout= and/or =max-request-rounds= to an agent's frontmatter or Org
 properties to bound that agent; =nil= or =false= explicitly means unlimited.
-The built-in researcher uses a 1200 second timeout and 30 model/tool rounds,
-while the executor and introspector are unlimited.  The global fallback options
-are =gptel-agent-task-timeout= and =gptel-agent-max-request-rounds=; an omitted
-per-agent value inherits its global fallback, and both fallbacks default to
-nil.  Transient transport retries remain bounded by
+The built-in researcher uses a 3600 second timeout and 100 model request rounds;
+the result explorer uses 1800 seconds and 60 rounds.  The executor and
+introspector are unlimited.  The global fallback options are
+=gptel-agent-task-timeout= and =gptel-agent-max-request-rounds=; an omitted
+per-agent value inherits its global fallback, and both fallbacks default to nil.
+Transient transport retries remain bounded by
 =gptel-agent-max-request-retries= and =gptel-agent-retry-delay=.  Authentication
 and malformed-request errors are not retried.
 
@@ -636,8 +637,8 @@ strategy.  At =gptel-agent-max-loop-violations= the same sub-agent enters a
 tool-free finalization turn: it keeps its complete tool transcript and system
 prompt, interprets the evidence it gathered, and returns the final answer
 itself.  Web-heavy sub-agents have a separate
-=gptel-agent-max-web-tool-calls= budget; exceeding it triggers the same
-synthesis turn instead of returning raw tool results to the parent.  Round
+=gptel-agent-max-web-tool-calls= budget, defaulting to 50 calls; exceeding it
+triggers the same synthesis turn instead of returning raw tool results to the parent.  Round
 limits reserve this finalization turn, then return an explicit inconclusive
 report only if the model still produces no usable answer.  Web searches default to
 =gptel-agent-web-search-default-count= results and are capped by

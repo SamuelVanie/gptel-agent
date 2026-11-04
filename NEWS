@@ -29,8 +29,9 @@
 - Sub-agent time and model-round budgets are now configurable per agent with
   the ~task-timeout~ and ~max-request-rounds~ Markdown frontmatter or Org
   property keys.  Omitted limits inherit the corresponding global fallback
-  options, which now default to nil; the built-in researcher retains a bounded
-  1200-second, 30-round budget.
+  options, which now default to nil.  The built-in researcher allows 3600
+  seconds and 100 rounds, and result-explorer allows 1800 seconds and 60 rounds.
+  The default web-tool budget is 50 calls per sub-agent run.
 
 - gptel-agent now works over TRAMP.  This means it can run processes on
   remote servers, grep and edit files and so on without the need to

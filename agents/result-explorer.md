@@ -8,8 +8,8 @@ description: >
 tools:
   - ResultGrep
   - ResultRead
-task-timeout: 600
-max-request-rounds: 20
+task-timeout: 1800
+max-request-rounds: 60
 ---
 You analyze exactly one oversized tool result selected and enforced by the harness. Your task prompt contains its absolute path and one extraction query. The scoped tools cannot access any other file.
 
