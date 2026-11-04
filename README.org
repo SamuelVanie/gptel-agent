@@ -398,6 +398,26 @@ It starts without the parent's transcript or attached context. An optional
 pre-approvals belong to each conversation separately; a child loads its own
 skills. Approving discussion management does not approve child tool calls.
 
+Omitting =preset= (or passing an empty string) copies the current request's
+settings, including local changes; it does not reapply the parent's saved
+preset. An explicit preset is applied on top: settings it specifies override
+inherited values, while unspecified settings remain inherited. Preset parents,
+composition forms, and =:pre=/=:post= hooks are honored.
+
+The =Discussion= tool advertises the names and descriptions of all presets
+registered with =gptel-make-preset=, including user-defined presets outside
+gptel-agent. This selection is independent of the =Agent= tool's sub-agent
+allowlist. For example, after loading =managed-discussions=, a =gptel-plan=
+conversation can hand off implementation with:
+
+#+begin_src json
+{"title": "Implement the feature", "prompt": "Implement this self-contained plan: ...", "preset": "gptel-agent"}
+#+end_src
+
+The child uses =gptel-agent='s system prompt and tools; the parent remains a
+planning conversation. Pass your own registered preset name in the same way.
+Unknown names return an error without creating a discussion.
+
 **** Skill tool declarations
 
 =allowed-tools= follows the experimental [[https://agentskills.io/specification#allowed-tools-field][Agent Skills specification]]: a

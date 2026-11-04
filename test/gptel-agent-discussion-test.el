@@ -1,6 +1,7 @@
 ;;; gptel-agent-discussion-test.el --- Managed chat lifecycle -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'gptel-agent-tools-test)
 (require 'gptel-agent-workers-test)
 (require 'gptel-agent-discussion)
 
@@ -560,15 +561,103 @@
        (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls other))
        (should (= 2 executions))))))
 
+(ert-deftest gptel-agent-discussion-default-inherits-current-request-settings ()
+  (let ((gptel-system-prompt "CURRENT-REQUEST-SYSTEM")
+        (gptel-temperature 0.4)
+        (gptel--known-presets nil))
+    (gptel-make-preset 'discussion-parent :system "SAVED-PRESET-SYSTEM")
+    (gptel-agent-discussion-test--with-chat
+     ;; A saved preset and later buffer edits must not replace the settings
+     ;; captured by the request that actually calls Discussion.
+     (with-current-buffer parent
+       (setq-local gptel--preset 'discussion-parent
+                   gptel-system-prompt "LATER-BUFFER-SYSTEM"))
+     (dolist (preset '(nil ""))
+       (gptel-agent-workers-test--tool
+        fsm "Discussion" (append '(:title "Inherited" :prompt "Fresh")
+                                 (and preset (list :preset preset))))
+       (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+       (let ((child (gptel-agent-discussion--chat-buffer chat)))
+         (should (equal (buffer-local-value 'gptel-system-prompt child)
+                        "CURRENT-REQUEST-SYSTEM"))
+         (should (= (buffer-local-value 'gptel-temperature child) 0.4))
+         (should (eq (buffer-local-value 'gptel-backend child)
+                     (buffer-local-value 'gptel-backend parent)))
+         (should (eq (buffer-local-value 'gptel-model child) 'test))
+         (should (cl-find "DiscussionMutation" (buffer-local-value 'gptel-tools child)
+                          :key #'gptel-tool-name :test #'equal)))))))
+
+(ert-deftest gptel-agent-discussion-advertises-all-presets-per-request ()
+  (let ((gptel--known-presets nil)
+        (base-args (copy-tree (gptel-tool-args (gptel-get-tool "Discussion")))))
+    (gptel-make-preset 'personal-coder :description "My implementation settings")
+    (gptel-make-preset 'gptel-agent :description "Implementation agent")
+    (gptel-agent-discussion-test--with-chat
+     (let* ((tool (cl-find "Discussion" (plist-get (gptel-fsm-info fsm) :tools)
+                          :key #'gptel-tool-name :test #'equal))
+            (argument (cl-find "preset" (gptel-tool-args tool)
+                               :key (lambda (arg) (plist-get arg :name)) :test #'equal))
+            (description (plist-get argument :description)))
+       (should (plist-get argument :optional))
+       (should (string-match-p "personal-coder: My implementation settings" description))
+       (should (string-match-p "gptel-agent: Implementation agent" description))
+       (should (equal base-args (gptel-tool-args (gptel-get-tool "Discussion"))))
+       (gptel-make-preset 'later-preset :description "Added after the request began")
+       (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+       (let* ((child-fsm (gptel-agent-discussion--chat-fsm chat))
+              (child-tool (cl-find "Discussion" (plist-get (gptel-fsm-info child-fsm) :tools)
+                                   :key #'gptel-tool-name :test #'equal))
+              (child-argument (cl-find "preset" (gptel-tool-args child-tool)
+                                       :key (lambda (arg) (plist-get arg :name)) :test #'equal)))
+         (should (string-match-p "later-preset: Added after the request began"
+                                 (plist-get child-argument :description)))
+         (should (= 1 (gptel-agent-workers-test--count
+                       "Available gptel presets" (plist-get child-argument :description)))))
+       (should-not (string-match-p "later-preset" (plist-get argument :description)))
+       (should (equal base-args (gptel-tool-args (gptel-get-tool "Discussion"))))))))
+
+(ert-deftest gptel-agent-discussion-planner-can-select-implementation-preset ()
+  (gptel-agent-test--with-main-presets
+    (gptel-agent-discussion-test--with-chat
+     (gptel-agent-workers-test--answer fsm "Ready to plan")
+     (with-current-buffer parent
+       (gptel--apply-preset 'gptel-plan
+                            (lambda (symbol value) (set (make-local-variable symbol) value)))
+       (push (gptel-get-tool "Discussion") gptel-tools)
+       (setq-local gptel-prompt-transform-functions
+                   '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize))
+       (goto-char (point-max)) (insert "Hand this plan to an implementer") (gptel-send)
+       (setq fsm gptel-agent-discussion--fsm))
+     (gptel-agent-workers-test--tool
+      fsm "Discussion" '(:title "Implement" :prompt "Self-contained plan" :preset "gptel-agent"))
+     (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+     (let* ((child (gptel-agent-discussion--chat-buffer chat))
+            (child-fsm (gptel-agent-discussion--chat-fsm chat))
+            (child-tools (plist-get (gptel-fsm-info child-fsm) :tools))
+            (agent (cl-find "Agent" child-tools :key #'gptel-tool-name :test #'equal)))
+       (should (equal (buffer-local-value 'gptel-agent--current-agent child) "gptel-agent"))
+       (should (equal (buffer-local-value 'gptel-system-prompt child)
+                      (plist-get (gptel-get-preset 'gptel-agent) :system)))
+       (should (cl-find "Write" child-tools :key #'gptel-tool-name :test #'equal))
+       (should (member "executor" (append (plist-get (car (gptel-tool-args agent)) :enum) nil)))
+       (should (equal (buffer-local-value 'gptel-agent--current-agent parent) "gptel-plan"))
+       (should-not (cl-find "Write" (plist-get (gptel-fsm-info fsm) :tools)
+                            :key #'gptel-tool-name :test #'equal))))))
+
 (ert-deftest gptel-agent-discussion-preset-isolation-and-failed-creation ()
   (gptel-agent-discussion-test--with-chat
    (let ((gptel--known-presets (copy-tree gptel--known-presets)))
-     (gptel-make-preset 'discussion-test-preset :system "ISOLATED-SYSTEM" :tools '("AskUserQuestion"))
+     (gptel-make-preset 'discussion-test-base :system "ISOLATED" :temperature 0.2)
+     (gptel-make-preset 'discussion-test-preset
+       :parents 'discussion-test-base :system '(:append "-SYSTEM") :tools '("AskUserQuestion"))
      (gptel-agent-workers-test--tool
       fsm "Discussion" '(:title "Custom" :prompt "Fresh" :preset "discussion-test-preset"))
      (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
      (let ((child (gptel-agent-discussion--chat-buffer chat)))
        (should (equal (buffer-local-value 'gptel-system-prompt child) "ISOLATED-SYSTEM"))
+       (should (= (buffer-local-value 'gptel-temperature child) 0.2))
+       (should (eq (buffer-local-value 'gptel-model child)
+                   (buffer-local-value 'gptel-model parent)))
        (should-not (equal (buffer-local-value 'gptel-system-prompt parent) "ISOLATED-SYSTEM"))
        (should-not (buffer-local-value 'gptel-context child))
        (let ((child-fsm (gptel-agent-discussion--chat-fsm chat)))

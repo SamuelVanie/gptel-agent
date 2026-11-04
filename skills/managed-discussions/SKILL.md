@@ -14,8 +14,16 @@ can also interact with. Use `Agent` for a bounded worker whose findings belong
 in the current task. Discussions run independently and can outlive your turn.
 
 Create a discussion with a clear title and self-contained opening prompt.
-It starts without your transcript or attached context. Use an existing `preset`
-or a working `directory` when the conversation needs different settings.
+It starts without your transcript or attached context. Omit `preset` (or pass
+an empty string) to inherit your current request settings, including local
+changes. To use different settings, choose a name from the `Discussion` tool's
+available gptel presets. These include all registered user-defined presets,
+not just gptel-agent's presets or the `Agent` tool's allowed sub-agents.
+The chosen preset overrides only the settings it specifies; other settings
+remain inherited. For example, a planning conversation can create an
+implementation discussion with `preset: "gptel-agent"` and the complete plan
+in `prompt`. Your own preset remains unchanged. Use `directory` to select a
+different working directory when needed.
 
 Use `DiscussionControl` to list or read owned discussions, send a follow-up or
 steering message, or close a discussion while retaining its transcript. Do useful

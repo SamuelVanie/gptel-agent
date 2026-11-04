@@ -321,6 +321,27 @@ and can be inspected with DiscussionControl read without waking the owner."
       (dolist (name '("Discussion" "DiscussionControl"))
         (when-let* ((base (cl-find name gptel-tools :key #'gptel-tool-name :test #'equal)))
           (let ((tool (gptel--copy-tool base)))
+            (when (equal name "Discussion")
+              ;; Advertise every registered gptel preset, independently of the
+              ;; Agent tool's restricted sub-agent registry.  Start from the
+              ;; registered schema so repeated localization cannot append the
+              ;; catalog again or mutate another request's tool.
+              (let* ((args (copy-tree (gptel-tool-args (gptel-get-tool name))))
+                     (preset (cl-find "preset" args
+                                      :key (lambda (arg) (plist-get arg :name))
+                                      :test #'equal)))
+                (setf (plist-get preset :description)
+                      (concat
+                       (plist-get preset :description)
+                       "\nAvailable gptel presets (name: description):\n"
+                       (if gptel--known-presets
+                           (mapconcat
+                            (lambda (entry)
+                              (format "- %s: %s" (car entry)
+                                      (or (plist-get (cdr entry) :description) "")))
+                            gptel--known-presets "\n")
+                         "None registered; omit preset to inherit."))
+                      (gptel-tool-args tool) args)))
             (setf (gptel-tool-function tool)
                   (if (equal name "Discussion")
                       (let ((config (mapcar (lambda (symbol)
@@ -606,7 +627,8 @@ SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
 
 (defun gptel-agent-discussion--create (owner config title prompt preset directory)
   "Create an independent chat for OWNER using CONFIG, TITLE and PROMPT.
-Optional PRESET overrides inherited settings.
+Omitted or empty PRESET keeps inherited request settings.  Otherwise any
+registered gptel PRESET overrides the settings it specifies.
 DIRECTORY selects its working directory."
   (gptel-agent-discussion--nonempty title "title")
   (gptel-agent-discussion--nonempty prompt "prompt")
@@ -976,7 +998,7 @@ If a draft remains, send it explicitly with `gptel-send' instead."
  :function (lambda (callback &rest _) (funcall callback "Error: Discussion needs a request-local dispatcher."))
  :args '((:name "title" :type string :description "Short discussion title.")
          (:name "prompt" :type string :description "Self-contained opening message; parent transcript is not copied.")
-         (:name "preset" :type string :optional t :description "Optional existing gptel preset name.")
+         (:name "preset" :type string :optional t :description "Omit or leave empty to inherit this request's current settings. Otherwise apply any registered gptel preset by name, including user-defined presets outside gptel-agent. Its specified settings override inherited values; unspecified settings remain inherited. For example, a planning conversation can use gptel-agent for an implementation discussion.")
          (:name "directory" :type string :optional t :description "Optional existing working directory; defaults to this conversation's directory."))
  :category "gptel-agent" :async t :include t :confirm t)
 
