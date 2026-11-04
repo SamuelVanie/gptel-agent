@@ -108,6 +108,91 @@ buffers and the minibuffer.
 Please note: gptel-agent uses significantly more tokens than the average
 gptel LLM interaction.
 
+*** Scoped project instructions
+
+Agent sessions automatically discover plain-text =AGENTS.md= files. Discovery
+starts at the conversation's project root and follows the directory chain to
+its working directory. Without an Emacs project, the working directory is the
+boundary. File context and =Read=, =Glob=, =Grep=, =Edit=, =Insert=, =Write= and =Mkdir= targets
+discover deeper chains as needed; the project is never scanned recursively.
+
+For example, work on =frontend/view.ts= receives the root =AGENTS.md= followed
+by =frontend/AGENTS.md=. Work on =backend/server.ts= receives the root and
+backend instructions instead. A request targeting both receives both scoped
+chains, with common ancestors included once. More specific instructions take
+precedence over conflicting parent rules; explicit user instructions take
+precedence over project rules.
+
+Each conversation owns its discovered contents and request snapshots. New
+workers and managed discussions independently discover their own instructions;
+they do not inherit the parent's loaded contents. Continuing a worker retains
+its private registry. Instruction blocks are rebuilt before every outgoing
+call, including retries and tool continuations, without changing the configured
+system prompt, preset or conversation text. Compaction keeps the private registry
+and subsequent requests rebuild from it. Closing the conversation discards its
+registry; reopened conversations rediscover their instructions.
+
+Managed =Read= calls for =AGENTS.md= return a short acknowledgement, even when
+a line range was requested. The contents travel through the replaceable
+instruction block instead of accumulating in tool-result history. Use
+=M-x gptel-agent-describe-project-instructions= to inspect the full local
+contents, discovery boundary, discovered sources and latest delivered block.
+Explicit quotations, attached task data and arbitrary command output remain
+ordinary conversation data.
+
+Before a file mutation, the harness checks all applicable saved instruction
+versions against the ones supplied to the model. A missing or changed scope
+defers the operation before staging or writing. The next call receives updated
+instructions and asks the model to reconsider and propose a fresh operation.
+Old arguments are never replayed automatically. Batches discover every target
+before any edit is staged, including multi-file patches. Saved changes,
+additions and deletions are refreshed at new turns and checked before mutations.
+Delayed tool approvals are checked again when executed.
+
+Use =M-x gptel-agent-toggle-project-instructions= to toggle just the current
+conversation. A positive prefix enables it; zero or a negative prefix disables
+it. Changes take effect at the next outgoing call. Other conversations and
+already submitted snapshots are unaffected.
+
+#+begin_src emacs-lisp
+;; Disable by default in agent sessions without a local override.
+(setq-default gptel-agent-use-project-instructions nil)
+
+;; Enable only this conversation, including an ordinary gptel buffer.
+(setq-local gptel-agent-use-project-instructions t)
+
+;; Disable only this conversation.
+(setq-local gptel-agent-use-project-instructions nil)
+#+end_src
+
+Ordinary gptel requests opt in locally. Restricted =result-explorer= workers
+never perform project-instruction discovery, even when their parent enables it.
+New workers and discussions inherit the effective boolean preference only.
+
+The first implementation supports local files within the conversation's fixed
+discovery boundary. File/directory symlinks inside that boundary resolve to their
+canonical target scopes. Escaping symlinks, remote targets, and targets outside
+the boundary report an error before managed file operations; start a separate
+conversation in that project or disable this feature locally to work there.
+=AGENTS.md= itself must be a regular, non-symlinked file. Unreadable instructions
+and files exceeding =gptel-agent-project-instructions-max-bytes= (128 KiB by
+default) produce visible diagnostics and block mutations in their scopes;
+stale or truncated contents are not silently used.
+
+The per-call payload adapter covers OpenAI Chat Completions and compatible
+=:messages= backends, OpenAI Responses, Anthropic, Gemini, and Ollama. It preserves
+ordinary messages and tool-call/result pairs. Provider-side conversation handles
+or =previous_response_id=, and Gemini =cachedContent=, are rejected when adding
+or removing managed instructions:
+requests must carry their full context so old blocks cannot remain implicitly
+active. Models without system-message support are also rejected when a managed
+block is needed.
+
+This feature controls the instruction text supplied to the model, not semantic
+compliance with that text. It cannot infer every effect of arbitrary =Bash= or
+=Eval= code, erase previous reasoning, or enforce natural-language rules.
+Prefer the file tools for work requiring deterministic scope checks.
+
 *** Asking questions while working
 
 =AskUserQuestion= accumulates questions across tool calls. Its default

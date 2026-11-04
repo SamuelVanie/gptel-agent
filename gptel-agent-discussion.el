@@ -289,7 +289,10 @@ and can be inspected with DiscussionControl read without waking the owner."
       (setf (gptel-fsm-info fsm)
             (plist-put info :discussion-config
                        (mapcar (lambda (symbol)
-                                 (cons symbol (and (boundp symbol) (symbol-value symbol))))
+                                 (cons symbol
+                                       (if (eq symbol 'gptel-agent-use-project-instructions)
+                                           (gptel-agent-instructions--configuration fsm)
+                                         (and (boundp symbol) (symbol-value symbol)))))
                                gptel-agent--request-config-variables))))
     ;; Never inherit another discussion's reporting closure.  Bind this
     ;; capability only to a live managed child, even with a custom preset or

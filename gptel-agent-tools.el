@@ -48,6 +48,7 @@
 (require 'url-http)
 (require 'cl-lib)
 (require 'gptel-agent-edit)
+(require 'gptel-agent-instructions)
 (require 'gptel-agent-process)
 
 (declare-function org-escape-code-in-region "org-src")
@@ -2118,6 +2119,7 @@ file/query pair registered when an oversized tool result was persisted."
 
 (defconst gptel-agent--request-config-variables
   '(gptel-backend gptel-model gptel-stream gptel-system-prompt
+    gptel-agent-use-project-instructions
     gptel-tools gptel-use-tools gptel-use-context gptel-context
     gptel--request-params gptel-temperature gptel-max-tokens
     gptel-include-reasoning gptel-cache gptel-use-curl
@@ -2919,7 +2921,9 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
             (setq data (plist-put data key
                                  (plist-get (plist-get saved :data) key)))
           (cl-remf data key)))
-      (setf (plist-get saved :data) data
+      (setf (plist-get saved :data)
+            (gptel-agent-instructions--restore
+             data (plist-get info :agent-instructions-rendering))
             (gptel-agent--session-resumable session) t))))
 
 (defun gptel-agent--handle-task-done (fsm)
@@ -3210,10 +3214,14 @@ When FSM is supplied, exclude its conversation-specific skill grants."
   (dolist (symbol gptel-agent--request-config-variables)
     (when (boundp symbol)
       (let* ((info (and fsm (gptel-fsm-info fsm)))
-             (value (if (and (eq symbol 'gptel-tools)
+             (value (cond
+                     ((eq symbol 'gptel-agent-use-project-instructions)
+                      (with-current-buffer parent-buffer
+                        (gptel-agent-instructions--configuration fsm)))
+                     ((and (eq symbol 'gptel-tools)
                              (plist-member info :skill-base-tools))
-                        (plist-get info :skill-base-tools)
-                      (buffer-local-value symbol parent-buffer))))
+                      (plist-get info :skill-base-tools))
+                     (t (buffer-local-value symbol parent-buffer)))))
         (with-current-buffer child-buffer
           (set (make-local-variable symbol)
                (if (consp value) (copy-tree value) value)))))))

@@ -4,6 +4,13 @@
 
 ** New features and UI changes
 
+- Agent conversations now discover scoped ~AGENTS.md~ instructions, with private
+  per-conversation registries and replaceable per-call instruction blocks.
+  File mutations defer when their scope or instruction versions require a new
+  model decision. ~gptel-agent-toggle-project-instructions~ controls the local
+  preference; ~gptel-agent-describe-project-instructions~ shows discovered and
+  delivered instructions. Ordinary gptel buffers can opt in locally.
+
 - ~AskUserQuestion~ now queues questions with ~action: "add"~ (the default)
   and returns immediately. Repeated calls extend one live question buffer,
   preserving saved answers. ~action: "wait"~ explicitly pauses the turn and

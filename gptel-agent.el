@@ -926,7 +926,8 @@ confirmation before proceeding."
                     (concat (gptel--parse-directive gptel-agent-compact-prompt t)
                             "\n\nAdditional instructions:\n\n" extra)
                   gptel-agent-compact-prompt)
-                :transforms (list 'gptel--transform-add-context)
+                :transforms (list 'gptel-agent-instructions--skip
+                                  'gptel--transform-add-context)
                 :context (when (use-region-p)
                            (pcase-let ((`(,from . ,to) (car (region-bounds))))
                              (list (set-marker (make-marker) from)

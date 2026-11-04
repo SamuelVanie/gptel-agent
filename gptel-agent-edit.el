@@ -398,6 +398,37 @@ Nil (including JSON null) and an empty array select a single edit."
     (error "operations must be an array; omit it or use operations=[] for a single edit"))
   (> (length operations) 0))
 
+(defun gptel-agent-edit-targets (name args)
+  "Return every target of file tool NAME with ARGS, without staging edits.
+Reuse the batch and diff path validators used by `gptel-agent-edit-prepare'."
+  (let ((path (plist-get args :path)))
+    (unless (stringp path) (error "Required argument `path' must be a string"))
+    (cond
+     ((equal name "Write")
+      (list (expand-file-name (plist-get args :filename) path)))
+     ((and (equal name "Edit")
+           (gptel-agent-edit--batch-p (plist-get args :operations)))
+      (let ((root (file-name-as-directory (file-truename path))))
+        (delete-dups
+         (cl-mapcan
+          (lambda (op)
+            (let ((target (gptel-agent-edit--batch-path (plist-get op :path) root)))
+              (if (equal (plist-get op :operation) "patch")
+                  (gptel-agent-edit-targets
+                   "Edit" (list :path target :new_str (plist-get op :new_str) :diff t))
+                (list target))))
+          (append (plist-get args :operations) nil)))))
+     ((and (equal name "Edit") (file-directory-p path)
+           (stringp (plist-get args :new_str))
+           (or (eq (plist-get args :diff) t)
+               (and (member (plist-get args :old_str) '(nil :json-false ""))
+                    (string-match-p "^--- [^\n]+\n\\+\\+\\+ [^\n]+\n@@ "
+                                    (plist-get args :new_str)))))
+      (mapcar (lambda (section)
+                (gptel-agent-edit--target (nth 0 section) (nth 1 section) path))
+              (gptel-agent-edit--sections (plist-get args :new_str))))
+     (t (list (expand-file-name path))))))
+
 (defun gptel-agent-edit-prepare (name args)
   "Return file change plists for tool NAME and argument plist ARGS.
 Each has :path, :before and :after.  Nil content means a missing file;
