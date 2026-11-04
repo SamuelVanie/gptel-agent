@@ -110,11 +110,14 @@ gptel LLM interaction.
 
 *** Scoped project instructions
 
-Agent sessions automatically discover plain-text =AGENTS.md= files. Discovery
-starts at the conversation's project root and follows the directory chain to
-its working directory. Without an Emacs project, the working directory is the
-boundary. File context and =Read=, =Glob=, =Grep=, =Edit=, =Insert=, =Write= and =Mkdir= targets
-discover deeper chains as needed; the project is never scanned recursively.
+All gptel conversations automatically discover plain-text =AGENTS.md= files
+while =gptel-agent-use-project-instructions= is non-nil, regardless of preset
+or agent identity. The first outgoing request includes these instructions even
+with =Read= or all tools disabled. Discovery starts at the conversation's
+project root and follows the directory chain to its working directory. Without
+an Emacs project, the working directory is the boundary. File context and
+=Read=, =Glob=, =Grep=, =Edit=, =Insert=, =Write= and =Mkdir= targets discover deeper
+chains as needed; the project is never scanned recursively.
 
 For example, work on =frontend/view.ts= receives the root =AGENTS.md= followed
 by =frontend/AGENTS.md=. Work on =backend/server.ts= receives the root and
@@ -152,21 +155,22 @@ Delayed tool approvals are checked again when executed.
 Use =M-x gptel-agent-toggle-project-instructions= to toggle just the current
 conversation. A positive prefix enables it; zero or a negative prefix disables
 it. Changes take effect at the next outgoing call. Other conversations and
-already submitted snapshots are unaffected.
+already submitted snapshots are unaffected. The global variable supplies the
+default for every conversation; buffer-local values override that default.
 
 #+begin_src emacs-lisp
-;; Disable by default in agent sessions without a local override.
+;; Disable globally for conversations without a local override.
 (setq-default gptel-agent-use-project-instructions nil)
 
-;; Enable only this conversation, including an ordinary gptel buffer.
+;; Enable only this conversation, overriding the global default.
 (setq-local gptel-agent-use-project-instructions t)
 
 ;; Disable only this conversation.
 (setq-local gptel-agent-use-project-instructions nil)
 #+end_src
 
-Ordinary gptel requests opt in locally. Restricted =result-explorer= workers
-never perform project-instruction discovery, even when their parent enables it.
+Internal workers restricted to a single result file do not perform project
+instruction discovery, even when their parent enables it.
 New workers and discussions inherit the effective boolean preference only.
 
 The first implementation supports local files within the conversation's fixed

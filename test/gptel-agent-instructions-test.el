@@ -83,6 +83,70 @@
       (should (equal (buffer-local-value 'gptel-system-prompt parent) "BASE-PROMPT"))
       (should (equal (buffer-local-value 'gptel-agent-instructions--boundary parent) root)))))
 
+(ert-deftest gptel-agent-instructions-all-presets-without-tools ()
+  (let ((gptel--known-presets (copy-tree gptel--known-presets))
+        (gptel-agent-use-project-instructions t)
+        (gptel-agent-instructions-test--backend
+         (gptel-make-openai-responses "preset-instructions" :key "unused" :models '(test))))
+    (gptel-make-preset 'ordinary-instruction-test :system "PRESET-BASE")
+    (gptel-make-preset 'agent-instruction-test :system "PRESET-BASE" :agent--current-agent "ask")
+    (dolist (preset '(nil ordinary-instruction-test agent-instruction-test))
+      (let ((gptel--preset preset))
+        (dolist (local-preset '(nil t))
+          (gptel-agent-instructions-test--with-project
+            (with-current-buffer parent
+              (kill-local-variable 'gptel-agent-use-project-instructions)
+              (when local-preset (setq-local gptel--preset preset))
+              (setq-local gptel-agent--current-agent nil)
+              (setq gptel-tools nil gptel-use-tools nil gptel-system-prompt "PRESET-BASE"))
+            (setq fsm (gptel-agent-instructions-test--request parent))
+            (should (= 1 (length requests)))
+            (should-not (plist-get (car requests) :tools))
+            (should (string-match-p "ROOT-INSTRUCTION" (plist-get (car requests) :instructions)))
+            (should (cdr (assq 'gptel-agent-use-project-instructions
+                               (plist-get (gptel-fsm-info fsm) :discussion-config))))
+            (should (equal (buffer-local-value 'gptel-system-prompt parent) "PRESET-BASE"))
+            (should-not (buffer-local-value 'gptel-agent--current-agent parent))))))))
+
+(ert-deftest gptel-agent-instructions-global-and-local-preferences ()
+  (let ((gptel--preset nil))
+    (dolist (global '(nil t))
+      (dolist (local '(inherit enable disable))
+        (let ((gptel-agent-use-project-instructions global))
+          (gptel-agent-instructions-test--with-project
+            (with-current-buffer parent
+              (pcase local
+                ('inherit (kill-local-variable 'gptel-agent-use-project-instructions))
+                ('enable (setq-local gptel-agent-use-project-instructions t))
+                ('disable (setq-local gptel-agent-use-project-instructions nil))))
+            (setq fsm (gptel-agent-instructions-test--request parent))
+            (should (eq (and (plist-get (gptel-fsm-info fsm) :agent-instructions-sent) t)
+                        (if (eq local 'inherit) global (eq local 'enable))))))))))
+
+(ert-deftest gptel-agent-instructions-global-changes-and-local-toggle ()
+  (let ((gptel--preset nil)
+        (gptel-agent-use-project-instructions t))
+    (gptel-agent-instructions-test--with-project
+      (with-current-buffer parent
+        (kill-local-variable 'gptel-agent-use-project-instructions))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (should (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+      ;; Existing conversations without local overrides follow global changes.
+      (setq gptel-agent-use-project-instructions nil)
+      (gptel--handle-wait fsm)
+      (should-not (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+      (should-not (string-match-p "ROOT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+      ;; Toggle without a prefix uses the effective preference of this buffer.
+      (with-current-buffer parent (gptel-agent-toggle-project-instructions))
+      (gptel--handle-wait fsm)
+      (should (string-match-p "ROOT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+      (with-current-buffer parent (gptel-agent-toggle-project-instructions))
+      (setq gptel-agent-use-project-instructions t)
+      (gptel--handle-wait fsm)
+      (should-not (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+      (should-not (string-match-p "ROOT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+      (with-temp-buffer (should (gptel-agent-instructions--configuration))))))
+
 (ert-deftest gptel-agent-instructions-read-scope-replacement-all-providers ()
   (dolist (backend (list (gptel-make-openai "i-openai" :key "unused" :models '(test))
                          (gptel-make-openai-responses "i-responses" :key "unused" :models '(test))
@@ -211,7 +275,7 @@
 (ert-deftest gptel-agent-instructions-controls-context-and-base-prompts ()
   (gptel-agent-instructions-test--with-project
     (with-current-buffer parent
-      (kill-local-variable 'gptel-agent-use-project-instructions))
+      (setq-local gptel-agent-use-project-instructions nil))
     (setq fsm (gptel-agent-instructions-test--request parent))
     (should-not (buffer-local-value 'gptel-agent-instructions--registry parent))
     (with-current-buffer parent (gptel-agent-toggle-project-instructions 1))
@@ -302,6 +366,16 @@
       (setq fsm (gptel-agent-instructions-test--request parent)))
     (should-not (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
     (should-not (buffer-local-value 'gptel-agent-instructions--registry parent))))
+
+(ert-deftest gptel-agent-instructions-agent-name-does-not-disable-discovery ()
+  (let ((gptel--known-presets (copy-tree gptel--known-presets))
+        (gptel--preset 'instruction-test))
+    (gptel-make-preset 'instruction-test :agent--current-agent "result-explorer")
+    (gptel-agent-instructions-test--with-project
+      (with-current-buffer parent
+        (setq-local gptel-agent--current-agent "result-explorer"))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (should (string-match-p "ROOT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm))))))
 
 (ert-deftest gptel-agent-instructions-compaction-keeps-private-state ()
   (gptel-agent-instructions-test--with-project

@@ -20,14 +20,14 @@
 (require 'gptel)
 (require 'gptel-agent-edit)
 
-(defvar gptel-agent--current-agent)
 (defvar gptel-agent--result-file-scope)
 
 (defcustom gptel-agent-use-project-instructions t
-  "Discover scoped AGENTS.md instructions in agent conversations by default.
-Ordinary gptel buffers opt in with a buffer-local non-nil value.  A local
-nil value disables discovery in either kind of conversation.  Changes take
-effect at the next outgoing call; already submitted calls retain their snapshot."
+  "Whether gptel conversations discover scoped AGENTS.md instructions.
+This applies regardless of the selected preset or available tools.  The
+global value supplies the default for all conversations; a buffer-local
+value overrides it for that conversation.  Changes take effect at the next
+outgoing call; already submitted calls retain their snapshot."
   :type 'boolean :group 'gptel-agent)
 
 (defcustom gptel-agent-project-instructions-max-bytes (* 128 1024)
@@ -50,8 +50,8 @@ Records contain :path, :scope, :text, :version, and optionally :error.")
   "Return FSM's info with stable places for instruction metadata.
 `plist-put' may prepend a new property, so always save the resulting head."
   (let ((info (gptel-fsm-info fsm)))
-    (dolist (key '(:agent-instructions-agent :agent-instructions-context
-                                             :agent-instructions-started :agent-instructions-targets
+    (dolist (key '(:agent-instructions-context
+                  :agent-instructions-started :agent-instructions-targets
                   :agent-instructions-sent :agent-instructions-rendering
                   :agent-instructions-wrapped :agent-instructions-tool-batch))
       (unless (plist-member info key) (setq info (plist-put info key nil))))
@@ -59,30 +59,22 @@ Records contain :path, :scope, :text, :version, and optionally :error.")
 
 (defun gptel-agent-instructions--configuration (&optional fsm)
   "Return the effective instruction preference for FSM or the current buffer."
-  (let ((owner (and fsm (plist-get (gptel-fsm-info fsm) :buffer)))
-        (agent (or (bound-and-true-p gptel-agent--current-agent)
-                   (and fsm (plist-get (gptel-fsm-info fsm) :agent-instructions-agent)))))
+  (let ((owner (and fsm (plist-get (gptel-fsm-info fsm) :buffer))))
     (with-current-buffer (or owner (current-buffer))
-      (and gptel-agent-use-project-instructions
-           (or (local-variable-p 'gptel-agent-use-project-instructions)
-               agent (bound-and-true-p gptel-agent--current-agent))
-           t))))
+      (and gptel-agent-use-project-instructions t))))
 
 (defun gptel-agent-instructions--enabled-p (fsm)
   "Whether FSM should manage instructions in its owning conversation."
   (and (not (plist-get (gptel-fsm-info fsm) :agent-instructions-skip))
        (not (bound-and-true-p gptel-agent--result-file-scope))
-       (not (equal (bound-and-true-p gptel-agent--current-agent) "result-explorer"))
        (gptel-agent-instructions--configuration fsm)))
 
 (defun gptel-agent-instructions--transform (fsm)
-  "Capture request identity and explicit file context for FSM.
+  "Capture explicit file context for FSM.
 Do not change the base system prompt, including function/list prompts."
   (let ((info (gptel-agent-instructions--info fsm)))
     (with-current-buffer (if (bufferp (plist-get info :data))
                              (plist-get info :data) (current-buffer))
-      (when (bound-and-true-p gptel-agent--current-agent)
-        (setf (plist-get info :agent-instructions-agent) gptel-agent--current-agent))
       (when gptel-use-context
         (setf (plist-get info :agent-instructions-context)
               (delq nil
