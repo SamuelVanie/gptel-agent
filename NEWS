@@ -6,7 +6,8 @@
 
 - ~Discussion~ creates independent, editable gptel conversations that survive
   their parent's turn. ~DiscussionControl~ monitors, steers, follows up, waits,
-  answers questions, forwards approvals to the user, and closes discussions.
+  answers questions and closes discussions. Tool approvals stay in the child
+  buffer for the user to approve or reject; an echo-area notice identifies it.
   Replies and attention alerts stay in the child. The child uses
   ~DiscussionReport~ to send a chosen answer or useful update; only explicit
   reports wake idle parents or arrive at safe request boundaries. Parents can
@@ -80,6 +81,11 @@
   compaction might change in the future.
 
 ** Notable bug fixes
+
+- Discussion approval cleanup now supports gptel versions without the private
+  overlay cleanup helper, preventing failed approvals from stranding executor
+  tools. Worker ~TodoWrite~ calls use their own request and diagnostic buffer;
+  completing a chat's todo list also clears its active-task header immediately.
 
 - ~WebFetch~ now handles textual responses according to their content
   type instead of sending JSON, source files and plain text through the

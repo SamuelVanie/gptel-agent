@@ -135,6 +135,42 @@
       (setq start (match-end 0) count (1+ count)))
     count))
 
+(ert-deftest gptel-agent-workers-todos-stay-in-worker-and-allow-completion ()
+  (dolist (background '(blocking t))
+    (gptel-agent-workers-test--with-chat
+      (with-current-buffer parent
+        (setq-local gptel-agent-preset '(:tools ("TodoWrite"))))
+      (let* ((run (gptel-agent-workers-test--launch fsm "executor" nil background))
+             (worker (gptel-agent--run-child-buffer run))
+             (worker-fsm (gptel-agent--run-fsm run)))
+        ;; Workers do not use gptel-send's buffer-local FSM.  Their request's
+        ;; position marker belongs to the parent, not the diagnostic buffer.
+        (should-not (buffer-local-value 'gptel--fsm-last worker))
+        (with-current-buffer parent (setq-local gptel-agent--todos 'parent-todos))
+        (dolist (status '("in_progress" "completed"))
+          (gptel-agent-workers-test--tool
+           worker-fsm "TodoWrite"
+           `(:todos [(:content "Verify change" :activeForm "Verifying change" :status ,status)]))
+          (should (eq (gptel-fsm-state worker-fsm) 'WAIT))
+          (should-not (string-match-p "wrong-type-argument\\|args-out-of-range"
+                                      (gptel-agent-workers-test--data worker-fsm)))
+          (with-current-buffer worker
+            (should (equal (plist-get (aref gptel-agent--todos 0) :status) status))
+            (let ((ov (cl-find-if (lambda (ov) (overlay-get ov 'gptel-agent--todos))
+                                   (overlays-in (point-min) (point-max)))))
+              (should ov)
+              (should (string-match-p (if (equal status "completed") "✓" "●")
+                                       (overlay-get ov 'after-string)))))
+          (should (eq (buffer-local-value 'gptel-agent--todos parent) 'parent-todos)))
+        (gptel-agent-workers-test--answer worker-fsm "EXECUTOR-FINISHED")
+        (should (eq (gptel-agent--run-state run) 'completed))
+        (gptel-agent-workers-test--wake fsm)
+        (gptel-agent-workers-test--answer fsm "Parent finished")
+        (when (eq (gptel-fsm-state fsm) 'AGWT)
+          (gptel-agent-workers-test--wake fsm)
+          (gptel-agent-workers-test--answer fsm "Worker result received"))
+        (should (eq (gptel-fsm-state fsm) 'DONE))))))
+
 (ert-deftest gptel-agent-workers-first-agent-overlay-follows-response-prefix ()
   (dolist (stream '(nil t))
     (dolist (prefix '("ASSISTANT> " "ASSISTANT>\n"))

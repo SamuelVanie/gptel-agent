@@ -469,8 +469,6 @@ normal API usage. Reports go only to the child's immediate managing conversation
 | =send= | Steer running work, or start a follow-up in the same chat |
 | =wait= | Receive an explicit report for selected =discussion_ids=, up to 60 seconds; also shows already pending interactions |
 | =answer= | Answer a pending =AskUserQuestion= using its exact =request_id= |
-| =request_approval= | Show the child's actual tool calls in the parent for user approval |
-| =reject= | Decline pending tool calls without executing them |
 | =close= | Abort current work and end monitoring; keep the editable transcript |
 
 =read= does not consume report delivery. Its =offset= is a zero-based character
@@ -487,12 +485,14 @@ active turn, use =M-x gptel-agent-discussion-send= to queue steering; it is
 delivered after pending tools finish, or as a follow-up if the response finishes
 first. Concurrent requests in the same monitored buffer are prevented.
 
-The parent can answer structured questions itself. Tool approvals always use
-gptel's user confirmation controls: =request_approval= only displays the calls.
-You can approve or answer directly in either displayed interaction; stale
-callbacks cannot execute the same tool or answer twice. The =Cancel request=
-control acts on the child even when shown in the parent. Tool approvals and
-questions raised by a discussion's sub-agents remain accessible in the child.
+The parent can answer structured questions itself. Tool approvals stay in the
+child discussion buffer, where the user can approve or reject them with gptel's
+confirmation controls. An echo-area notice identifies the buffer waiting for
+approval; no approval panel is copied into the managing conversation, and it
+cannot reject the child's tool calls. Stale callbacks cannot execute the same
+tool or answer twice. Tool approvals and questions raised by a discussion's
+sub-agents remain accessible in that discussion's buffer; =Cancel request=
+stops the particular request awaiting approval.
 =read= exposes pending interactions, failures and outstanding file reviews when
 the parent asks for them. File reviews retain the configured applied/staged
 review behavior and the child's existing review queue.

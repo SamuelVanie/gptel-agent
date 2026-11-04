@@ -1800,14 +1800,21 @@ CASE-SENSITIVE defaults to nil.  MAX-RESULTS defaults to 50 and is capped at
 
 TODOS is a list of plists with keys :content, :activeForm, and :status.
 Completed items are displayed with strikethrough and shadow face.
-Exactly one item should have status \"in_progress\"."
+At most one item should have status \"in_progress\".  Worker task lists are
+displayed in their own diagnostic buffer, independently of the parent chat."
   (setq gptel-agent--todos todos)
   ;; Update overlay
-  (let* ((info (gptel-fsm-info gptel--fsm-last))
+  (let* ((run gptel-agent--supervised-run)
+         (info (gptel-fsm-info (if run (gptel-agent--run-fsm run) gptel--fsm-last)))
+         ;; A worker has no gptel-send FSM in its buffer, and its request's
+         ;; :position points into the parent for approval UI.  Anchor its list
+         ;; to its own diagnostic heading instead of using that foreign marker.
+         (where-to (if run
+                       (save-excursion (goto-char (point-min)) (line-end-position))
+                     (plist-get info :position)))
          (where-from
-          (previous-single-property-change
-           (plist-get info :position) 'gptel nil (point-min)))
-         (where-to (plist-get info :position)))
+          (if run (point-min)
+            (previous-single-property-change where-to 'gptel nil (point-min)))))
     (unless (= where-from where-to)
       (pcase-let ((`(,_ . ,todo-ov)
                    (get-char-property-and-overlay where-from 'gptel-agent--todos)))
@@ -1857,13 +1864,15 @@ Exactly one item should have status \"in_progress\"."
                  formatted-todos "\n"
                  gptel-agent--hrule)))
           (overlay-put todo-ov 'after-string todo-display)
-          (when (and gptel-mode gptel-use-header-line in-progress header-line-format)
+          (when (and gptel-mode gptel-use-header-line header-line-format)
             (setf (nth 2 header-line-format)
-                  (concat (propertize
-                           " " 'display
-                           `(space :align-to (- right ,(+ 5 (length in-progress)))))
-                          (propertize (concat "Task: " in-progress)
-                                      'face 'font-lock-escape-face))))))))
+                  (if in-progress
+                      (concat (propertize
+                               " " 'display
+                               `(space :align-to (- right ,(+ 5 (length in-progress)))))
+                              (propertize (concat "Task: " in-progress)
+                                          'face 'font-lock-escape-face))
+                    gptel--header-line-info)))))))
   t)
 
 ;;; Skill tool

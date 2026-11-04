@@ -334,13 +334,21 @@
          (should-not (gptel-agent-discussion--chat-pending chat))
          (should-not (buffer-local-value 'gptel-agent-discussion--inbox parent)))))))
 
-(ert-deftest gptel-agent-discussion-approval-forwarding-never-auto-executes ()
+(ert-deftest gptel-agent-discussion-approvals-stay-in-child-with-echo-notice ()
   (gptel-agent-discussion-test--with-chat
    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
    (let* ((child (gptel-agent-discussion--chat-buffer chat))
-          (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+          (child-fsm (gptel-agent-discussion--chat-fsm chat))
+          (parent-text (gptel-agent-discussion-test--buffer-text parent)) notices)
      (with-current-buffer child (setq-local gptel-confirm-tool-calls 'auto))
-     (gptel-agent-workers-test--tool child-fsm "DiscussionMutation" nil)
+     (cl-letf (((symbol-function 'message)
+                (lambda (format-string &rest args)
+                  (push (apply #'format-message format-string args) notices))))
+       (gptel-agent-workers-test--tool child-fsm "DiscussionMutation" nil))
+     (should (cl-some (lambda (notice)
+                       (string-match-p
+                        (regexp-quote (concat "Tool approval waiting in " (buffer-name child))) notice))
+                     notices))
      (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
             (id (gptel-agent-discussion--interaction-id pending))
             (calls (gptel-agent-discussion--interaction-calls pending)))
@@ -350,13 +358,23 @@
          (should (= count (length requests))))
        (should-not (buffer-local-value 'gptel-agent-discussion--inbox parent))
        (should (= 1 (length (gptel-agent-discussion--interaction-overlays pending))))
-       (should (string-match-p "displayed" (gptel-agent-discussion-test--control
-                                            fsm "request_approval" chat nil id)))
+       (dolist (action '("request_approval" "reject"))
+         (should-not (member action (append (plist-get (car (gptel-tool-args
+                                                            (gptel-get-tool "DiscussionControl"))) :enum) nil)))
+         ;; Old request schemas must not move or resolve this approval either.
+         (should (string-prefix-p "Error: Approve or reject tool calls in discussion buffer"
+                                  (gptel-agent-discussion-test--control fsm action chat nil id))))
        (should (= 0 executions))
-       (should (= 2 (length (gptel-agent-discussion--interaction-overlays pending))))
+       (should (gptel-agent-discussion--pending pending))
+       (should (= 1 (length (gptel-agent-discussion--interaction-overlays pending))))
+       (should (equal parent-text (gptel-agent-discussion-test--buffer-text parent)))
+       (with-current-buffer parent
+         (should-not (cl-some (lambda (ov) (overlay-get ov 'gptel-tool))
+                              (overlays-in (point-min) (point-max)))))
        (let ((overlays (copy-sequence (gptel-agent-discussion--interaction-overlays pending))))
-         ;; Native user acceptance.  A stale copy of the other UI cannot run it again.
-         (with-current-buffer parent (gptel--accept-tool-calls calls (car overlays)))
+         (should (eq (overlay-buffer (car overlays)) child))
+         ;; Native user acceptance.  Stale callbacks cannot run the tool again.
+         (with-current-buffer child (gptel--accept-tool-calls calls (car overlays)))
          (should (= 1 executions))
          (gptel--accept-tool-calls calls)
          (should (= 1 executions))
@@ -364,7 +382,7 @@
        (should (string-prefix-p "Error:" (gptel-agent-discussion-test--control
                                           fsm "request_approval" chat nil id)))))))
 
-(ert-deftest gptel-agent-discussion-rejection-close-and-late-callbacks ()
+(ert-deftest gptel-agent-discussion-close-invalidates-approvals-and-late-callbacks ()
   (gptel-agent-discussion-test--with-chat
    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
    (let* ((child (gptel-agent-discussion--chat-buffer chat))
@@ -373,10 +391,13 @@
      (gptel-agent-workers-test--tool child-fsm "DiscussionMutation" nil)
      (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
             (calls (gptel-agent-discussion--interaction-calls pending)))
-       (gptel-agent-discussion-test--control
-        fsm "reject" chat "Unneeded" (gptel-agent-discussion--interaction-id pending))
+       (gptel-agent-discussion-test--control fsm "close" chat)
        (gptel--accept-tool-calls calls)
-       (should (= 0 executions)))
+       (should (= 0 executions))
+       (should-not (gptel-agent-discussion--chat-pending chat))))
+   (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+   (let ((child (gptel-agent-discussion--chat-buffer chat))
+         (child-fsm (gptel-agent-discussion--chat-fsm chat)))
      (gptel-agent-workers-test--tool child-fsm "DiscussionDeferred" nil)
      (gptel-agent-discussion-test--control fsm "close" chat)
      (let ((count (length requests)))
@@ -472,14 +493,14 @@
                           nil (nth 2 call))))
        ;; The inspector swaps even unchanged names back to the original tool
        ;; object. Simulate that boundary without relying on inspector UI text.
-       (with-current-buffer parent (gptel--accept-tool-calls (list edited)))
+       (with-current-buffer child (gptel--accept-tool-calls (list edited)))
        (should (= executions 1))
        (gptel--accept-tool-calls (list edited))
        (gptel--accept-tool-calls (list call))
        (should (= executions 1))
         (should-not (gptel-agent-discussion--chat-pending chat))))))
 
-(ert-deftest gptel-agent-discussion-forwarded-cancel-stops-child-not-parent ()
+(ert-deftest gptel-agent-discussion-native-cancel-stops-child-not-parent ()
   (gptel-agent-discussion-test--with-chat
    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
    (let* ((child (gptel-agent-discussion--chat-buffer chat))
@@ -488,10 +509,9 @@
      (gptel-agent-workers-test--tool child-fsm "DiscussionMutation" nil)
      (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
             (calls (gptel-agent-discussion--interaction-calls pending)))
-       (gptel-agent-discussion-test--control
-        fsm "request_approval" chat nil (gptel-agent-discussion--interaction-id pending))
-       (let ((ov (cl-find parent (gptel-agent-discussion--interaction-overlays pending) :key #'overlay-buffer)))
-         (with-current-buffer parent (gptel--reject-tool-calls calls ov)))
+       (let ((ov (car (gptel-agent-discussion--interaction-overlays pending))))
+         (should (eq (overlay-buffer ov) child))
+         (with-current-buffer child (gptel--reject-tool-calls calls ov)))
        (should (eq (gptel-fsm-state child-fsm) 'ABRT))
        (should (gptel-agent-discussion--active-p fsm))
        (should-not (gptel-agent-discussion--chat-pending chat))
@@ -548,17 +568,20 @@
          (setq-local gptel-confirm-tool-calls 'auto))
        (gptel-agent-workers-test--tool (gptel-agent-discussion--chat-fsm item) "DiscussionMutation" nil)
        (let ((interaction (car (gptel-agent-discussion--chat-pending item))))
-         (push interaction pending)
-         (gptel-agent-discussion-test--control
-          fsm "request_approval" item nil (gptel-agent-discussion--interaction-id interaction))))
+         (push interaction pending)))
      (let* ((first (car pending))
             (other (cadr pending))
-            (ov (cl-find parent (gptel-agent-discussion--interaction-overlays first) :key #'overlay-buffer)))
-       (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls first) ov)
+            (ov (car (gptel-agent-discussion--interaction-overlays first))))
+       (with-current-buffer (overlay-buffer ov)
+         (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls first) ov))
        (should (= 1 executions))
        (should (gptel-agent-discussion--pending other))
-       (should (cl-find parent (gptel-agent-discussion--interaction-overlays other) :key #'overlay-buffer))
-       (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls other))
+       (let ((other-ov (car (gptel-agent-discussion--interaction-overlays other))))
+         (should (eq (overlay-buffer other-ov)
+                     (gptel-agent-discussion--chat-buffer
+                      (gptel-agent-discussion--interaction-chat other))))
+         (with-current-buffer (overlay-buffer other-ov)
+           (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls other) other-ov)))
        (should (= 2 executions))))))
 
 (ert-deftest gptel-agent-discussion-default-inherits-current-request-settings ()
@@ -671,6 +694,93 @@
      (should (= count (length (buffer-local-value 'gptel-agent-discussion--children parent))))
      (should (string-match-p "Cannot find gptel preset" (gptel-agent-workers-test--data fsm))))))
 
+(ert-deftest gptel-agent-discussion-cleanup-without-gptel-helper ()
+  (with-temp-buffer
+    (insert "Keep this transcript\nApproval prompt\n")
+    (let* ((start (save-excursion (goto-char (point-min)) (forward-line) (point)))
+           (prompt (make-overlay start (point-max)))
+           (ov (make-overlay start start))
+           (interaction (gptel-agent-discussion--make-interaction :overlays (list ov)))
+           (cleanups 0))
+      (overlay-put ov 'prompt (list prompt))
+      (overlay-put ov 'previews (list (list (lambda () (cl-incf cleanups)))))
+      (setq buffer-read-only t)
+      (cl-letf (((symbol-function 'gptel--cleanup-tool-call-overlay) nil))
+        (gptel-agent-discussion--cleanup-ui interaction)
+        (gptel-agent-discussion--cleanup-ui interaction))
+      (should (= cleanups 1))
+      (should-not (overlay-buffer ov))
+      (should-not (gptel-agent-discussion--interaction-overlays interaction))
+      (should (equal (buffer-string) "Keep this transcript\n")))))
+
+(ert-deftest gptel-agent-discussion-executor-approval-stays-local-and-settles ()
+  (dolist (background '(nil t))
+    (dolist (decision '(approve cancel))
+      (gptel-agent-test--with-main-presets
+        (gptel-agent-discussion-test--with-chat
+         (gptel-make-preset 'discussion-test-executor
+           :parents 'gptel-agent
+           :prompt-transform-functions
+           '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize))
+         (gptel-agent-workers-test--tool
+          fsm "Discussion" '(:title "Executor work" :prompt "Implement" :preset "discussion-test-executor"))
+         (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+         (let* ((child (gptel-agent-discussion--chat-buffer chat))
+                (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+           (with-current-buffer child (setq-local gptel-confirm-tool-calls nil))
+           (gptel-agent-workers-test--tool
+            child-fsm "Agent" `(:subagent_type "executor" :description "Implement"
+                                              :prompt "Bounded task" :background ,background))
+           (let* ((run (car (hash-table-values gptel-agent--runs)))
+                  (worker-fsm (gptel-agent--run-fsm run))
+                  (worker (gptel-agent--run-child-buffer run)))
+             (when background
+               (gptel-agent-workers-test--answer child-fsm "Waiting for executor")
+               (should (eq (gptel-fsm-state child-fsm) 'AGWT)))
+             (gptel-agent-workers-test--tool
+              worker-fsm "TodoWrite"
+              '(:todos [(:content "Implement" :activeForm "Implementing" :status "in_progress")]))
+             ;; An asynchronous tool must complete or cancel from the child
+             ;; discussion's UI without leaving its worker gate waiting.
+             (push (gptel-get-tool "DiscussionDeferred")
+                   (plist-get (gptel-fsm-info worker-fsm) :tools))
+             (with-current-buffer worker (setq-local gptel-confirm-tool-calls t))
+             (gptel-agent-workers-test--tool worker-fsm "DiscussionDeferred" nil)
+             (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
+                    (calls (gptel-agent-discussion--interaction-calls pending))
+                    (overlays (gptel-agent-discussion--interaction-overlays pending)))
+               (should (eq (gptel-agent-discussion--interaction-source-fsm pending) worker-fsm))
+               (should (= (length overlays) 1))
+               (should (eq (overlay-buffer (car overlays)) child))
+               (with-current-buffer parent
+                 (should-not (cl-some (lambda (ov) (overlay-get ov 'gptel-tool))
+                                      (overlays-in (point-min) (point-max)))))
+               (with-current-buffer child
+                 (if (eq decision 'approve)
+                     (gptel--accept-tool-calls calls (car overlays))
+                   (gptel--reject-tool-calls calls (car overlays))))
+               (should-not (gptel-agent-discussion--chat-pending chat))
+               (if (eq decision 'approve)
+                   (progn
+                     (should (functionp tool-callback))
+                     (funcall tool-callback "APPROVED-OPERATION-FINISHED")
+                     (should (eq (gptel-fsm-state worker-fsm) 'WAIT))
+                     (with-current-buffer worker (setq-local gptel-confirm-tool-calls nil))
+                     (gptel-agent-workers-test--tool
+                      worker-fsm "TodoWrite"
+                      '(:todos [(:content "Implement" :activeForm "Implementing" :status "completed")]))
+                     (gptel-agent-workers-test--answer worker-fsm "EXECUTOR-FINISHED")
+                     (should (eq (gptel-agent--run-state run) 'completed)))
+                 (should-not tool-callback)
+                 (should (eq (gptel-agent--run-state run) 'cancelled))))
+             (gptel-agent-workers-test--wake child-fsm)
+             (should (eq (gptel-fsm-state child-fsm) 'WAIT))
+             (should (string-match-p (if (eq decision 'approve) "EXECUTOR-FINISHED" "aborted")
+                                     (gptel-agent-workers-test--data child-fsm)))
+             (gptel-agent-workers-test--answer child-fsm "Implementation complete")
+             (should (eq (gptel-agent-discussion--chat-state chat) 'idle))
+             (should-not (gptel-agent--workers-active (gptel-agent--workers-for child-fsm))))))))))
+
 (ert-deftest gptel-agent-discussion-descendant-approval-runs-in-worker-buffer ()
   (gptel-agent-discussion-test--with-chat
    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
@@ -692,9 +802,10 @@
            (let ((pending (car (gptel-agent-discussion--chat-pending chat))))
              (should pending)
              (should (eq worker-fsm (gptel-agent-discussion--interaction-source-fsm pending)))
-             (gptel-agent-discussion-test--control
-              fsm "request_approval" chat nil (gptel-agent-discussion--interaction-id pending))
-             (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls pending))
+             (let ((ov (car (gptel-agent-discussion--interaction-overlays pending))))
+               (should (eq (overlay-buffer ov) child))
+               (with-current-buffer child
+                 (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls pending) ov)))
              (should (= executions 1))
              (should (gptel-agent-discussion--live-p chat child-fsm))))
        (kill-buffer worker)))))

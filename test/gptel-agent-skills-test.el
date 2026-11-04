@@ -278,7 +278,7 @@
         (should (= executions 0))
         (should (eq (gptel-fsm-state child-fsm) 'TOOL))
         (should (car (gptel-agent-discussion--chat-pending chat)))
-        ;; The parent's pre-approved manager still forwards a real approval.
+        ;; Pre-approving the manager must not let it move a child's approval.
         (let ((pending (car (gptel-agent-discussion--chat-pending chat))))
           (gptel-agent-workers-test--tool
            fsm "DiscussionControl"
@@ -288,8 +288,12 @@
         (should (= executions 0))
         (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
                (overlays (gptel-agent-discussion--interaction-overlays pending)))
-          (should (= 2 (length overlays)))
-          (with-current-buffer parent
+          (should (= 1 (length overlays)))
+          (should (eq (overlay-buffer (car overlays))
+                      (gptel-agent-discussion--chat-buffer chat)))
+          (should (string-match-p "Approve or reject tool calls in discussion buffer"
+                                  (gptel-agent-workers-test--data fsm)))
+          (with-current-buffer (gptel-agent-discussion--chat-buffer chat)
             (gptel--accept-tool-calls
              (gptel-agent-discussion--interaction-calls pending) (car overlays))))
         (should (= executions 1))))))
@@ -375,7 +379,9 @@
         (should (equal (cadr skill)
                        (expand-file-name "managed-discussions/" gptel-agent--bundled-skill-dir)))
         (should (equal (plist-get data :allowed-tools) "Discussion DiscussionControl"))
-        (should (string-match-p "request_approval" (plist-get data :system)))
+        (should (string-match-p "Tool approvals stay in the child discussion buffer"
+                                (plist-get data :system)))
+        (should-not (string-match-p "request_approval" (plist-get data :system)))
         (should-not (plist-member (cddr skill) :allowed-tools))
         (should-not (plist-member (cddr skill) :system)))
       (setq gptel-agent-skill-dirs (list root))
@@ -400,4 +406,3 @@
     (should (string-match-p "self-contained opening prompt" (cdar requests)))))
 
 (provide 'gptel-agent-skills-test)
-

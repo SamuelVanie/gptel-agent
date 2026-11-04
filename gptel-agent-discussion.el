@@ -119,8 +119,11 @@ and can be inspected with DiscussionControl read without waking the owner."
         (gptel-agent-discussion--schedule owner))
       (gptel-agent-discussion--refresh-list))
     (when (memq kind '(question approval review failed closed))
-      (message "Discussion %s: %s — M-x gptel-agent-discussions"
-               (gptel-agent-discussion--chat-title chat) kind))))
+      (if (eq kind 'approval)
+          (message "Tool approval waiting in %s — approve or reject in that discussion buffer"
+                   (buffer-name (gptel-agent-discussion--chat-buffer chat)))
+        (message "Discussion %s: %s — M-x gptel-agent-discussions"
+                 (gptel-agent-discussion--chat-title chat) kind)))))
 
 (defun gptel-agent-discussion--take (&optional ids)
   "Consume this buffer's first inbox event selected by discussion IDS."
@@ -407,7 +410,18 @@ Prefix ARG still opens the normal gptel menu."
       (with-current-buffer (overlay-buffer ov)
         (if (overlay-get ov 'gptel-ask)
             (gptel-agent--ask-teardown ov)
-          (gptel--cleanup-tool-call-overlay ov)))))
+          (if (fboundp 'gptel--cleanup-tool-call-overlay)
+              (gptel--cleanup-tool-call-overlay ov)
+            ;; Older gptel versions inline this cleanup in their accept/reject
+            ;; commands.  Calling those commands would execute or cancel tools;
+            ;; here we only remove an interaction's stale UI.
+            (dolist (handle (overlay-get ov 'previews))
+              (when (car handle) (apply handle)))
+            (dolist (prompt (overlay-get ov 'prompt))
+              (when (overlay-buffer prompt)
+                (let ((inhibit-read-only t))
+                  (delete-region (overlay-start prompt) (overlay-end prompt)))))
+            (delete-overlay ov))))))
   (setf (gptel-agent-discussion--interaction-overlays interaction) nil))
 
 (defun gptel-agent-discussion--resolve (interaction state)
@@ -464,13 +478,13 @@ Prefix ARG still opens the normal gptel menu."
        chat 'question (gptel-agent-discussion--interaction-text interaction) interaction))))
 
 (defun gptel-agent-discussion--approval (chat fsm calls &optional source-fsm)
-  "Guard approval CALLS in CHAT's FSM for local or requested user approval.
+  "Guard approval CALLS in CHAT's FSM for user approval in CHAT's buffer.
 SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
   (let ((interaction
          (gptel-agent-discussion--make-interaction
           :id (gptel-agent-discussion--id "approval") :chat chat :fsm fsm
           :kind 'approval :source-fsm source-fsm
-          :text (concat "User approval required. Use request_approval to show these calls in the parent, or approve in the discussion buffer.\n"
+          :text (concat "User approval required. The user must approve or reject these calls in this discussion's buffer. The managing conversation cannot resolve tool approvals.\n"
                         (mapconcat (lambda (call)
                                      (format "%s %S" (gptel-tool-name (car call)) (cadr call)))
                                    calls "\n")))))
@@ -558,8 +572,8 @@ SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
           (when source
             (gptel-agent-discussion--emit chat 'approval-rejected
                                          "The user cancelled a sub-agent's tool approval."))
-          ;; A forwarded panel belongs to the child, not the conversation in
-          ;; which the user clicked Cancel.  Abort also invalidates late tools.
+          ;; Worker approvals live in their discussion's buffer, but Cancel
+          ;; must abort the worker's request.  Also invalidate late tool results.
           (gptel-abort (plist-get (gptel-fsm-info fsm) :buffer)))))))
 
 (defun gptel-agent-discussion--descendant-approval (original calls info &rest args)
@@ -778,24 +792,6 @@ SOURCE is `user' for direct user steering; otherwise it is the manager."
       (user-error "No pending %s with request_id %S; it may already be resolved" kind id))
     interaction))
 
-(defun gptel-agent-discussion--request-approval (interaction fsm)
-  "Show INTERACTION's actual calls to the user in the owner of FSM.
-This never executes a tool; only the native confirmation controls can do so."
-  (let* ((info (copy-sequence
-                (gptel-fsm-info (or (gptel-agent-discussion--interaction-source-fsm interaction)
-                                    (gptel-agent-discussion--interaction-fsm interaction)))))
-         (buffer (plist-get (gptel-fsm-info fsm) :buffer)))
-    (with-current-buffer buffer
-      (if (cl-some (lambda (ov) (eq (overlay-buffer ov) buffer))
-                   (gptel-agent-discussion--interaction-overlays interaction))
-          "Approval is already displayed in this conversation; awaiting the user."
-        (setf (plist-get info :position) (copy-marker (point-max))
-              (plist-get info :tracking-marker) nil)
-        (gptel--display-tool-calls
-         (gptel-agent-discussion--interaction-calls interaction) info)
-        (gptel-agent-discussion--track-approval-ui interaction buffer)
-        "The actual tool calls are displayed here for user approval. The user may approve in either conversation; each call executes at most once."))))
-
 (defun gptel-agent-discussion--close (chat)
   "Stop monitoring CHAT, abort its current turn, and retain its editable buffer."
   (unless (eq (gptel-agent-discussion--chat-state chat) 'closed)
@@ -876,16 +872,11 @@ IDS selects a wait set and OFFSET selects a transcript page."
                                     (gptel-agent-discussion--find-interaction chat request-id 'question))
                                    message)
                           "Question answered.")
-                         ("request_approval"
-                          (gptel-agent-discussion--request-approval
-                           (gptel-agent-discussion--find-interaction chat request-id 'approval) fsm))
-                         ("reject"
-                          (let ((interaction (gptel-agent-discussion--find-interaction chat request-id 'approval)))
-                            (gptel-agent-discussion--resolve interaction 'rejected)
-                            (dolist (call (gptel-agent-discussion--interaction-calls interaction))
-                              (funcall (nth 2 call)
-                                       (concat "Tool call declined by managing conversation. " (or message "")))))
-                          "Tool calls rejected without execution.")
+                         ;; Old request schemas may still contain these actions.
+                         ;; Neither may resolve or relocate a child's approval.
+                         ((or "request_approval" "reject")
+                          (user-error "Approve or reject tool calls in discussion buffer %s"
+                                      (buffer-name (gptel-agent-discussion--chat-buffer chat))))
                          (_ (user-error "Unknown DiscussionControl action %S" action)))))))))
       (error (setq result (concat "Error: " (error-message-string err)) deferred nil)))
     (unless deferred (funcall callback result))))
@@ -1011,12 +1002,12 @@ If a draft remains, send it explicitly with `gptel-send' instead."
 
 (gptel-make-tool
  :name "DiscussionControl"
- :description "Manage only discussions created by this conversation. list/read inspect without consuming reports; read pages the editable transcript with a zero-based character offset and shows pending questions, approvals, reviews and failures. send steers running work at a safe boundary or starts a follow-up when idle; ask the child to report back when you need an answer. Replies and attention alerts are not forwarded automatically. wait consumes the next explicit report for any selected IDs (60 second maximum), or shows already pending interactions; silent completion does not produce an event. answer resolves a pending question using its request_id. request_approval displays the exact pending tool calls in THIS buffer for the USER to approve; it never grants approval itself. reject declines pending tool calls. close aborts the current turn and ends monitoring, preserving the ordinary chat buffer. User actions can resolve interactions first: stale IDs return errors. Unsent drafts defer automatic sending."
+ :description "Manage only discussions created by this conversation. list/read inspect without consuming reports; read pages the editable transcript with a zero-based character offset and shows pending questions, approvals, reviews and failures. send steers running work at a safe boundary or starts a follow-up when idle; ask the child to report back when you need an answer. Replies and attention alerts are not forwarded automatically. wait consumes the next explicit report for any selected IDs (60 second maximum), or shows already pending interactions; silent completion does not produce an event. answer resolves a pending question using its request_id. Tool approvals stay in the child discussion: only the user can approve or reject them there, and an echo-area notice identifies the buffer. close aborts the current turn and ends monitoring, preserving the ordinary chat buffer. User actions can resolve interactions first: stale IDs return errors. Unsent drafts defer automatic sending."
  :function (lambda (callback &rest _) (funcall callback "Error: DiscussionControl needs a request-local dispatcher."))
- :args '((:name "action" :type string :enum ["list" "read" "send" "wait" "answer" "request_approval" "reject" "close"])
+ :args '((:name "action" :type string :enum ["list" "read" "send" "wait" "answer" "close"])
          (:name "discussion_id" :type string :optional t :description "Required except for list/wait.")
-         (:name "message" :type string :optional t :description "Message for send, answer (include every question's answer), or optional rejection reason.")
-         (:name "request_id" :type string :optional t :description "Exact pending question/approval ID for answer, request_approval or reject.")
+         (:name "message" :type string :optional t :description "Message for send or answer (include every question's answer).")
+         (:name "request_id" :type string :optional t :description "Exact pending question ID for answer.")
          (:name "discussion_ids" :type array :items (:type string) :optional t :description "Optional wait selection; defaults to all owned discussions.")
          (:name "offset" :type integer :optional t :description "Zero-based transcript character offset for read; defaults to 0."))
  :category "gptel-agent" :async t :include t)

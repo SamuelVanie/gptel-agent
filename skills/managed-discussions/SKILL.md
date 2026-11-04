@@ -45,8 +45,9 @@ completed turn. Your ordinary answers remain in your own discussion. Only an
 explicit report can wake the managing conversation.
 
 For a pending question, answer with its `request_id` when the answer is known,
-or ask the user. For a tool approval, use `request_approval` to present the actual
-calls to the user, or `reject` when they should not proceed. Do not infer
-approval from silence. Permission to manage a discussion does not approve its
-tool calls. The user may respond or intervene
-directly in the child buffer; refresh its state if a request is stale.
+or ask the user. Tool approvals stay in the child discussion buffer, where only
+the user can approve or reject them. An echo-area notice identifies the buffer
+waiting for approval. Do not copy approval controls into the managing
+conversation or try to resolve them through `DiscussionControl`. Do not infer
+approval from silence. The user may respond or intervene directly in the child
+buffer; refresh its state if a request is stale.

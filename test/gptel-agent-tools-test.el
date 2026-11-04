@@ -8,6 +8,19 @@
 (defvar url-http-content-type)
 (defvar url-http-response-status)
 
+(ert-deftest gptel-agent-todos-clear-header-when-completed ()
+  (with-temp-buffer
+    (insert "User task\n")
+    (setq-local gptel-mode t gptel-use-header-line t
+                header-line-format (list nil nil gptel--header-line-info)
+                gptel--fsm-last (gptel-make-fsm :info (list :position (point-marker))))
+    (gptel-agent--write-todo
+     [(:content "Verify" :activeForm "Verifying" :status "in_progress")])
+    (should (string-match-p "Task: Verifying" (nth 2 header-line-format)))
+    (gptel-agent--write-todo
+     [(:content "Verify" :activeForm "Verifying" :status "completed")])
+    (should (equal (nth 2 header-line-format) gptel--header-line-info))))
+
 (defun gptel-agent-test--agent-prompt (name)
   "Return the built-in agent prompt named NAME."
   (with-temp-buffer
