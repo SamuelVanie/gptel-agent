@@ -2186,10 +2186,16 @@ The caller must have appended all tool results before entering this function."
          (info (gptel-fsm-info fsm))
          (events (copy-sequence (gptel-agent--workers-events gate)))
          (steering (copy-sequence (gptel-agent--workers-steering gate)))
+         (answers (plist-get info :agent-question-result))
          (texts (append (mapcar #'gptel-agent--worker-report events)
                         (mapcar (lambda (text)
                                   (concat "Parent steering for the current task:\n" text))
-                                steering))))
+                                steering)
+                        (when answers
+                          (list (concat
+                                 "AskUserQuestion result (collected by the harness before turn completion):\n"
+                                 answers
+                                 "\n\nContinue the current task using this result. Cancellation supplies no answers or approval."))))))
     (when texts
       (gptel--inject-prompt
        (plist-get info :backend) (plist-get info :data)
@@ -2200,7 +2206,9 @@ The caller must have appended all tool results before entering this function."
       (setf (gptel-agent--workers-events gate)
             (cl-set-difference (gptel-agent--workers-events gate) events :test #'eq)
             (gptel-agent--workers-steering gate)
-            (nthcdr (length steering) (gptel-agent--workers-steering gate)))
+            (nthcdr (length steering) (gptel-agent--workers-steering gate))
+            (plist-get info :agent-question-result) nil)
+      (when answers (gptel-agent--ask-insert-result gate answers))
       t)))
 
 (defun gptel-agent--workers-save-answer (gate)
@@ -2219,40 +2227,46 @@ The caller must have appended all tool results before entering this function."
                          (list (cons 'response (gptel-agent--workers-answer gate))))))
     (setf (gptel-agent--workers-answer gate) nil)))
 
-(defun gptel-agent--workers-status (gate text)
-  "Display TEXT for GATE and its owning worker overlay."
+(defun gptel-agent--workers-status (gate text &optional state)
+  "Display TEXT for GATE and its owning worker overlay.
+Set the owning worker's STATE, defaulting to `waiting-for-agents'."
   (let* ((info (gptel-fsm-info (gptel-agent--workers-fsm gate)))
          (run (plist-get info :context)))
     (with-current-buffer (plist-get info :buffer)
       (gptel--update-status (concat " " text) 'font-lock-escape-face))
     (when (gptel-agent--run-p run)
-      (setf (gptel-agent--run-state run) 'waiting-for-agents)
+      (setf (gptel-agent--run-state run) (or state 'waiting-for-agents))
       (when-let* ((ov (gptel-agent--run-overlay run)) ((overlay-buffer ov)))
         (overlay-put ov 'count (1+ (overlay-get ov 'count)))
         (gptel-agent--task-display
          ov (overlay-get ov 'msg) text "\n" gptel-agent--hrule)))))
 
 (defun gptel-agent--workers-done (gate)
-  "Gate normal finalization until GATE's descendants and inbox are settled."
+  "Gate finalization until GATE's questions, descendants and inbox are settled."
   (let ((fsm (gptel-agent--workers-fsm gate)))
-    (if (or (gptel-agent--workers-active gate)
-            (gptel-agent--workers-events gate)
-            (gptel-agent--workers-steering gate))
-        (progn
-          (gptel-agent--workers-save-answer gate)
-          (setf (gptel-agent--workers-interim gate) t
-                (gptel-fsm-state fsm) 'AGWT)
-          (gptel-agent--workers-status gate "Waiting for agents")
-          (gptel-agent--workers-schedule gate))
+    (cond
+     ((gptel-agent--ask-before-done gate))
+     ((or (gptel-agent--workers-active gate)
+          (gptel-agent--workers-events gate)
+          (gptel-agent--workers-steering gate)
+          (plist-get (gptel-fsm-info fsm) :agent-question-result))
+      (gptel-agent--workers-save-answer gate)
+      (setf (gptel-agent--workers-interim gate) t
+            (gptel-fsm-state fsm) 'AGWT)
+      (gptel-agent--workers-status gate "Waiting for agents")
+      (gptel-agent--workers-schedule gate))
+     (t
       (setf (gptel-fsm-state fsm) 'DONE)
       (gptel-agent--workers-close gate)
       (mapc (lambda (handler) (funcall handler fsm))
-            (alist-get 'DONE (gptel-agent--workers-handlers gate))))))
+            (alist-get 'DONE (gptel-agent--workers-handlers gate)))))))
 
 (defun gptel-agent--workers-close (gate)
   "Invalidate GATE's inbox, callbacks and scheduled wakeup."
   (gptel-agent--ask-cleanup (gptel-agent--workers-fsm gate))
   (setf (gptel-agent--workers-closed gate) t
+        (plist-get (gptel-fsm-info (gptel-agent--workers-fsm gate))
+                   :agent-question-result) nil
         (gptel-agent--workers-events gate) nil
         (gptel-agent--workers-steering gate) nil
         (gptel-agent--workers-waiters gate) nil)
@@ -2396,9 +2410,12 @@ The caller must have appended all tool results before entering this function."
                            (if run (gptel-agent--worker-report run)
                              "status: no_eligible_work\nNo undelivered outcome or active selected worker."))))))
           (when (and (not (gptel-agent--workers-closed gate))
-                     (eq (gptel-fsm-state fsm) 'AGWT)
-                     (or (gptel-agent--workers-events gate)
-                         (gptel-agent--workers-steering gate)))
+                     (or (and (eq (gptel-fsm-state fsm) 'AGWT)
+                              (or (gptel-agent--workers-events gate)
+                                  (gptel-agent--workers-steering gate)
+                                  (plist-get (gptel-fsm-info fsm) :agent-question-result)))
+                         (and (eq (gptel-fsm-state fsm) 'AGQA)
+                              (plist-get (gptel-fsm-info fsm) :agent-question-result))))
             (gptel--fsm-transition fsm 'WAIT)))))))
 
 (defun gptel-agent--workers-enqueue (run)
@@ -3590,6 +3607,50 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
 
 (defvar-local gptel-agent--question-queue nil
   "Queue displayed in this questions buffer.")
+
+(defun gptel-agent--ask-insert-result (gate result)
+  "Retain an automatically collected RESULT in GATE's editable transcript.
+Custom request callbacks own their own history, including worker sessions
+which retain the request payload.  Only use the standard insertion callbacks."
+  (let ((callback (gptel-agent--workers-callback gate))
+        (info (gptel-fsm-info (gptel-agent--workers-fsm gate))))
+    (when (memq callback '(gptel--insert-response gptel-curl--stream-insert-response))
+      (when (eq (plist-get info :reasoning-block) 'in)
+        (funcall callback '(reasoning . t) info))
+      (let ((text (concat "\n\nAskUserQuestion result:\n" result "\n\n")))
+        (funcall callback text info 'raw)
+        (when-let* ((end (plist-get info :tracking-marker)))
+          ;; RAW insertion can inherit the previous response's sticky role.
+          ;; These are user answers, not model output, on subsequent sends too.
+          (with-current-buffer (marker-buffer end)
+            (remove-text-properties (- end (length text)) end '(gptel nil))))))))
+
+(defun gptel-agent--ask-before-done (gate)
+  "Keep GATE open when a model finishes with an uncollected question queue.
+Return non-nil when finalization is blocked.  If the model omitted wait,
+collect the answers using the existing UI and resume at a safe boundary.
+Deliver the result as harness context, without fabricating a model tool call."
+  (let* ((fsm (gptel-agent--workers-fsm gate))
+         (info (gptel-fsm-info fsm))
+         (queue (plist-get info :agent-questions)))
+    (when queue
+      (gptel-agent--workers-save-answer gate)
+      (setf (gptel-agent--workers-interim gate) t
+            ;; An existing explicit wait still owns its real tool callback.
+            (gptel-fsm-state fsm)
+            (if (cl-some (lambda (call) (not (plist-get call :result)))
+                         (plist-get info :tool-use))
+                'TOOL
+              'AGQA))
+      (gptel-agent--workers-status gate "Waiting for answers" 'waiting-for-question)
+      (unless (gptel-agent--question-queue-callback queue)
+        (gptel-agent--ask-dispatch
+         (lambda (result)
+           (unless (gptel-agent--workers-closed gate)
+             (setf (plist-get (gptel-fsm-info fsm) :agent-question-result) result)
+             (gptel-agent--workers-schedule gate)))
+         fsm nil "wait"))
+      t)))
 
 (defun gptel-agent--ask-cleanup (fsm)
   "Discard FSM's queue without invoking a possibly stale tool callback."

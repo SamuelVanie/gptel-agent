@@ -337,6 +337,36 @@
          (should-not (gptel-agent-discussion--chat-pending chat))
          (should-not (buffer-local-value 'gptel-agent-discussion--inbox parent)))))))
 
+(ert-deftest gptel-agent-discussion-early-final-keeps-question-answerable ()
+  (gptel-agent-discussion-test--with-chat
+   (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+   (let ((child-fsm (gptel-agent-discussion--chat-fsm chat)))
+     (gptel-agent-workers-test--tool
+      child-fsm "AskUserQuestion"
+      '(:questions [(:question "Which color?" :choices [(:value "Blue")])]))
+     (gptel-agent-workers-test--answer child-fsm "Premature answer")
+     (should (eq (gptel-fsm-state child-fsm) 'AGQA))
+     (should (eq (gptel-agent-discussion--chat-state chat) 'waiting-for-question))
+     (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
+            (id (gptel-agent-discussion--interaction-id pending))
+            (count (length requests)))
+       (should (equal "Question answered."
+                      (gptel-agent-discussion-test--control
+                       fsm "answer" chat "Blue from parent" id)))
+       (should-not (gptel-agent-discussion--chat-pending chat))
+       (gptel-agent-workers-test--wake child-fsm)
+       (should (= (1+ count) (length requests)))
+       (should (eq (gptel-fsm-state child-fsm) 'WAIT))
+       (should (string-match-p "Blue from parent"
+                               (gptel-agent-workers-test--data child-fsm)))
+       (with-current-buffer (gptel-agent-discussion--chat-buffer chat)
+         (save-excursion
+           (goto-char (point-min))
+           (search-forward "Blue from parent")
+           (should-not (get-text-property (1- (point)) 'gptel))))
+       (should (string-prefix-p "Error:" (gptel-agent-discussion-test--control
+                                         fsm "answer" chat "Stale" id)))))))
+
 (ert-deftest gptel-agent-discussion-approvals-stay-in-child-with-echo-notice ()
   (gptel-agent-discussion-test--with-chat
    (setq chat (gptel-agent-discussion-test--spawn fsm parent))

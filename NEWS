@@ -17,6 +17,9 @@
   preserving saved answers. ~action: "wait"~ explicitly pauses the turn and
   collects all answers or cancellation. Users can save answers while the agent
   works and submit when it waits. ~gptel-agent-questions~ reopens the queue.
+  If the model tries to finish with an uncollected batch, the runtime keeps the
+  turn open and waits automatically, then resumes with the submitted answers
+  or cancellation. Pending questions are no longer discarded on early completion.
 
 - ~Discussion~ creates independent, editable gptel conversations that survive
   their parent's turn. ~DiscussionControl~ monitors, steers, follows up, waits,

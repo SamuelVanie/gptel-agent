@@ -202,8 +202,11 @@ Prefer the file tools for work requiring deterministic scope checks.
 =AskUserQuestion= accumulates questions across tool calls. Its default
 =action: "add"= returns immediately, so the agent can continue independent
 work and add further questions. When the list is ready, it calls
-=action: "wait"= with =questions= omitted or empty. Only that call pauses
-the turn and returns the complete answers (or a cancellation).
+=action: "wait"= with =questions= omitted or empty. That call pauses the
+turn and returns the complete answers (or a cancellation). If the model tries
+to finish with an uncollected question batch, the runtime automatically waits
+for it instead. The turn stays open, submission becomes available, and the
+same request resumes with the answers or cancellation before it can finish.
 
 Questions appear in a separate =*Questions: …*= buffer that refreshes in
 place as the list grows. Existing answers, choices and custom text are
@@ -221,12 +224,15 @@ questions from its workers. Each request has its own queue.
 | =q= | Hide the buffer |
 
 You can save answers while the agent is working; submission becomes available
-when it calls =wait=. Every question also has a free-text Custom option.
+when it calls =wait= or the runtime catches an early completion. Every question
+also has a free-text Custom option.
 Cancelling or killing the questions buffer records a cancellation for =wait=;
-it never supplies default answers. Aborting, finishing or closing the owning
+it never supplies default answers. An early completion also delivers any
+uncollected cancellation to the model. Aborting, failing or closing the owning
 request removes its queue and invalidates late answers. A subsequent batch
-starts fresh after =wait= returns. In managed discussions, the completed list
-becomes a pending interaction for =DiscussionControl answer= when =wait= starts.
+starts fresh after its result is collected. In managed discussions, the
+completed list becomes a pending interaction for =DiscussionControl answer=
+when an explicit or automatic wait starts.
 
 *** Reviewing file edits with Ediff
 
