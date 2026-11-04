@@ -1878,7 +1878,7 @@ displayed in their own diagnostic buffer, independently of the parent chat."
 ;;; Skill tool
 (defvar-local gptel-agent--skill-tools nil
   "Activated tool templates owned by this conversation, never dispatchers.
-These are not inherited by children or saved across Emacs restarts.")
+Pre-approvals are not inherited by children or saved across Emacs restarts.")
 
 (defun gptel-agent--skill-copy-tool (tool)
   "Copy TOOL and its schema without copying its function's lexical state."
@@ -1898,8 +1898,8 @@ These are not inherited by children or saved across Emacs restarts.")
 (defun gptel-agent--localize-skill-tool (fsm)
   "Snapshot Skill discovery, registered tools and conversation grants for FSM.
 Run before the Agent and Discussion transforms, which bind dispatchers to
-the new request.  Keep ordinary conversation tools separate from grants so
-children inherit only explicitly configured tools and their permissions."
+the new request.  Keep ordinary conversation tools and registry defaults
+separate from grants so discussions can inherit tools without pre-approvals."
   (let* ((info (gptel-fsm-info fsm))
          (source (plist-get info :buffer))
          (skills (copy-tree gptel-agent--skills t))
@@ -1916,6 +1916,8 @@ children inherit only explicitly configured tools and their permissions."
                      (mapcar #'gptel-agent--skill-copy-tool gptel-tools)))
     (setf (gptel-fsm-info fsm)
           (plist-put (gptel-fsm-info fsm) :skill-tools active))
+    (setf (gptel-fsm-info fsm)
+          (plist-put (gptel-fsm-info fsm) :skill-registry registry))
     (setq-local gptel-tools
                 (gptel-agent--skill-merge-tools
                  (mapcar #'gptel-agent--skill-copy-tool gptel-tools) active))
@@ -1966,21 +1968,26 @@ anything.  Scoped expressions are deliberately unsupported."
                        (eq (gptel-fsm-state fsm) 'TOOL))
             (error "No active requesting conversation; load this skill through Skill"))
           (let* ((existing (plist-get info :tools))
-                 (gptel-tools
-                  (cl-remove-if
-                   (lambda (tool) (cl-find (gptel-tool-name tool) existing
-                                           :key #'gptel-tool-name :test #'equal))
-                   (mapcar #'gptel-agent--skill-copy-tool templates))))
-            ;; Reuse the existing runtime binding paths for newly exposed tools.
-            ;; Already bound tools retain their request-owned closures and state.
-            (with-current-buffer source
-              (gptel-agent--localize-agent-tool fsm)
-              (when (fboundp 'gptel-agent-discussion--localize)
-                (gptel-agent-discussion--localize fsm)))
-            (let* ((added gptel-tools)
-                   (tools
+                 ;; Localizers use setq-local.  A dynamic binding in SOURCE
+                 ;; cannot protect globally configured tools from becoming a
+                 ;; buffer-local list containing only the newly activated tools.
+                 (added
+                  (with-temp-buffer
+                    (gptel-agent--copy-parent-request-config source (current-buffer) fsm)
+                    (setq-local gptel-tools
+                                (cl-remove-if
+                                 (lambda (tool)
+                                   (cl-find (gptel-tool-name tool) existing
+                                            :key #'gptel-tool-name :test #'equal))
+                                 (mapcar #'gptel-agent--skill-copy-tool templates)))
+                    ;; Already bound tools retain their closures and state.
+                    (gptel-agent--localize-agent-tool fsm)
+                    (when (fboundp 'gptel-agent-discussion--localize)
+                      (gptel-agent-discussion--localize fsm))
+                    gptel-tools)))
+            (let* ((tools
                     (gptel-agent--skill-merge-tools
-                     existing
+                     (gptel-agent--skill-merge-tools added existing)
                      (mapcar
                       (lambda (template)
                         (let ((tool (gptel-agent--skill-copy-tool

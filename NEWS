@@ -82,6 +82,11 @@
 
 ** Notable bug fixes
 
+- Loading a skill preserves globally configured conversation tools across
+  turns. Discussions inherit the parent's full active tool list, including
+  tools activated by skills, without inheriting skill pre-approvals. An explicit
+  preset can override the child's tools; ~DiscussionReport~ remains available.
+
 - Discussion approval cleanup now supports gptel versions without the private
   overlay cleanup helper, preventing failed approvals from stranding executor
   tools. Worker ~TodoWrite~ calls use their own request and diagnostic buffer;

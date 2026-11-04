@@ -89,6 +89,96 @@
               (plist-get (or (plist-get tool :function) tool) :name))
             (append tools nil))))
 
+(ert-deftest gptel-agent-skills-activation-preserves-configured-tools ()
+  (dolist (local '(nil t))
+    (let ((gptel-agent-skills-test--extra-tools '("Read" "Agent")))
+      (gptel-agent-skills-test--with-chat "allowed-tools: Discussion DiscussionControl\n"
+        ;; Users can configure tools globally as well as buffer-locally.
+        (let ((gptel-tools (buffer-local-value 'gptel-tools parent)))
+          (unless local
+            (with-current-buffer parent (kill-local-variable 'gptel-tools)))
+          (gptel-agent-skills-test--load fsm)
+          (dolist (name '("Skill" "Read" "Agent"))
+            (should (member name (mapcar #'gptel-tool-name
+                                        (buffer-local-value 'gptel-tools parent)))))
+          (dolist (name '("Skill" "Read" "Agent" "AgentControl"
+                          "Discussion" "DiscussionControl"))
+            (should (member name (gptel-agent-skills-test--wire-names fsm))))
+          (gptel-agent-workers-test--answer fsm "Ready")
+          (with-current-buffer parent
+            (goto-char (point-max)) (insert "Continue") (gptel-send)
+            (setq fsm (caar requests)))
+          (dolist (name '("Skill" "Read" "Agent" "AgentControl"
+                          "Discussion" "DiscussionControl"))
+            (should (member name (gptel-agent-skills-test--wire-names fsm)))))))))
+
+(ert-deftest gptel-agent-skills-discussion-inherits-current-tools ()
+  (let ((gptel-agent-skills-test--extra-tools '("Read")))
+    (gptel-agent-skills-test--with-chat "allowed-tools: Discussion DiscussionControl\n"
+      (gptel-agent-skills-test--load fsm)
+      ;; Activate another tool after Discussion's dispatcher has been bound.
+      (with-temp-file file
+        (insert "---\nname: test-skill\ndescription: Test capability\n"
+                "allowed-tools: SkillMutation\n---\nMore tools\n"))
+      (gptel-agent-skills-test--load fsm)
+      (dolist (preset '(nil ""))
+        (gptel-agent-workers-test--tool
+         fsm "Discussion" (append '(:title "Inherited tools" :prompt "Independent")
+                                  (and preset (list :preset preset))))
+        (let* ((chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+               (child (gptel-agent-discussion--chat-buffer chat))
+               (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+          (dolist (name '("Skill" "Read" "Discussion" "DiscussionControl"
+                          "SkillMutation" "DiscussionReport"))
+            (should (member name (gptel-agent-skills-test--wire-names child-fsm))))
+          (should (gptel-tool-confirm (gptel-agent-skills-test--tool child-fsm "SkillMutation")))
+          (should-not (buffer-local-value 'gptel-agent--skill-tools child))
+          (gptel-agent-workers-test--answer child-fsm "Ready")
+          (with-current-buffer child
+            (goto-char (point-max)) (insert "Continue") (gptel-send))
+          (setq child-fsm (gptel-agent-discussion--chat-fsm chat))
+          (dolist (name '("Skill" "Read" "Discussion" "DiscussionControl"
+                          "SkillMutation" "DiscussionReport"))
+            (should (member name (gptel-agent-skills-test--wire-names child-fsm)))))))))
+
+(ert-deftest gptel-agent-skills-discussion-preset-tools-and-reporting ()
+  (let ((gptel-agent-skills-test--extra-tools '("Read"))
+        (gptel--known-presets nil))
+    (gptel-make-preset 'skill-child-tools :tools '("Write" "AskUserQuestion"))
+    (gptel-agent-skills-test--with-chat "allowed-tools: Discussion DiscussionControl\n"
+      (gptel-agent-skills-test--load fsm)
+      (gptel-agent-workers-test--tool
+       fsm "Discussion" '(:title "Preset tools" :prompt "Independent" :preset "skill-child-tools"))
+      (let* ((chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+             (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+        (should (equal (sort (gptel-agent-skills-test--wire-names child-fsm) #'string<)
+                       '("AskUserQuestion" "DiscussionReport" "Write")))
+        (gptel-agent-workers-test--tool child-fsm "DiscussionReport" '(:message "PRESET-REPORT"))
+        (should (equal "PRESET-REPORT"
+                       (plist-get (car (buffer-local-value 'gptel-agent-discussion--inbox parent)) :text))))
+      (should (equal (sort (gptel-agent-skills-test--wire-names fsm) #'string<)
+                     '("Discussion" "DiscussionControl" "Read" "Skill"))))))
+
+(ert-deftest gptel-agent-skills-discussion-retains-request-settings ()
+  (let ((gptel-system-prompt "REQUEST-SYSTEM"))
+    (gptel-agent-skills-test--with-chat "allowed-tools: Discussion DiscussionControl\n"
+      (with-current-buffer parent
+        (setq-local gptel-system-prompt "LATER-BUFFER-SYSTEM"))
+      (gptel-agent-skills-test--load fsm)
+      (gptel-agent-workers-test--tool
+       fsm "Discussion" '(:title "Request settings" :prompt "Independent"))
+      (let* ((chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+             (child (gptel-agent-discussion--chat-buffer chat)))
+        (should (equal (buffer-local-value 'gptel-system-prompt child) "REQUEST-SYSTEM"))))))
+
+(ert-deftest gptel-agent-skills-activation-includes-companion-tools ()
+  (gptel-agent-skills-test--with-chat "allowed-tools: Agent\n"
+    (gptel-agent-skills-test--load fsm)
+    (dolist (name '("Skill" "Agent" "AgentControl"))
+      (should (member name (gptel-agent-skills-test--wire-names fsm))))
+    (gptel-agent-workers-test--tool fsm "AgentControl" '(:action "list"))
+    (should-not (string-match-p "Unknown tool\\|not available" (gptel-agent-workers-test--data fsm)))))
+
 (ert-deftest gptel-agent-skills-same-turn-all-providers ()
   (dolist (backend (list (gptel-make-openai "s-oai" :key "unused" :models '(test))
                          (gptel-make-openai-responses "s-responses" :key "unused" :models '(test))
@@ -112,7 +202,8 @@
           (should chat)
           (ert-info ((format "Chat: %S" chat)) (should (eq (gptel-agent-discussion--chat-state chat) 'running)))
           (should-not (buffer-local-value 'gptel-agent--skill-tools child))
-          (should-not (gptel-agent-skills-test--tool child-fsm "Discussion"))
+          (dolist (name '("Skill" "Discussion" "DiscussionControl"))
+            (should (member name (gptel-agent-skills-test--wire-names child-fsm))))
           (should (gptel-agent-skills-test--tool child-fsm "DiscussionReport"))
           (should (member "DiscussionReport" (gptel-agent-skills-test--wire-names child-fsm)))
           (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS"

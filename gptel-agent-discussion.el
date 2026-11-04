@@ -283,6 +283,14 @@ and can be inspected with DiscussionControl read without waking the owner."
                                 (member (gptel-tool-name tool)
                                         '("Discussion" "DiscussionControl")))
                               gptel-tools)))
+    ;; Snapshot settings even before Discussion is enabled: a later Skill call
+    ;; runs outside the prompt buffer, where request-specific presets applied.
+    (unless (plist-member info :discussion-config)
+      (setf (gptel-fsm-info fsm)
+            (plist-put info :discussion-config
+                       (mapcar (lambda (symbol)
+                                 (cons symbol (and (boundp symbol) (symbol-value symbol))))
+                               gptel-agent--request-config-variables))))
     ;; Never inherit another discussion's reporting closure.  Bind this
     ;; capability only to a live managed child, even with a custom preset or
     ;; when management tools were enabled through a parent-only skill grant.
@@ -347,14 +355,7 @@ and can be inspected with DiscussionControl read without waking the owner."
                       (gptel-tool-args tool) args)))
             (setf (gptel-tool-function tool)
                   (if (equal name "Discussion")
-                      (let ((config (mapcar (lambda (symbol)
-                                              (cons symbol
-                                                    (if (and (eq symbol 'gptel-tools)
-                                                             (plist-member info :skill-base-tools))
-                                                        (plist-get info :skill-base-tools)
-                                                      (and (boundp symbol)
-                                                           (symbol-value symbol)))))
-                                            gptel-agent--request-config-variables)))
+                      (let ((config (plist-get info :discussion-config)))
                         (lambda (callback title prompt &optional preset directory)
                           (gptel-agent-discussion--dispatch-create
                            callback fsm config title prompt preset directory)))
@@ -706,6 +707,23 @@ DIRECTORY selects its working directory."
          (gptel-agent-discussion--emit chat 'failed (error-message-string err))))
       chat)))
 
+(defun gptel-agent-discussion--inherited-tools (fsm)
+  "Copy FSM's current tools for a child, without its skill pre-approvals."
+  (let ((info (gptel-fsm-info fsm)))
+    (mapcar
+     (lambda (tool)
+       (let* ((name (gptel-tool-name tool))
+              (base (or (cl-find name (plist-get info :skill-base-tools)
+                                 :key #'gptel-tool-name :test #'equal)
+                        (cl-find name (plist-get info :skill-registry)
+                                 :key #'gptel-tool-name :test #'equal)))
+              (copy (gptel-agent--skill-copy-tool tool)))
+         (when (and base (cl-find name (plist-get info :skill-tools)
+                                      :key #'gptel-tool-name :test #'equal))
+           (setf (gptel-tool-confirm copy) (gptel-tool-confirm base)))
+         copy))
+     (plist-get info :tools))))
+
 (defun gptel-agent-discussion--dispatch-create
     (callback fsm config title prompt preset directory)
   "Create a chat from live owner FSM, then return its identity to CALLBACK.
@@ -715,6 +733,12 @@ CONFIG, TITLE, PROMPT, PRESET and DIRECTORY describe the new discussion."
              (progn
                (unless (gptel-agent-discussion--active-p fsm)
                  (user-error "The owning request has ended"))
+               ;; Tools can be activated after the dispatcher was bound.  Use
+               ;; the live request's complete list; an explicit child preset
+               ;; can override it, and localization adds its reporting tool.
+               (setq config (copy-alist config))
+               (setf (alist-get 'gptel-tools config)
+                     (gptel-agent-discussion--inherited-tools fsm))
                (let ((chat (gptel-agent-discussion--create
                             (plist-get (gptel-fsm-info fsm) :buffer)
                             config title prompt preset directory)))

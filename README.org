@@ -387,22 +387,27 @@ The default =gptel-agent= preset discovers discussion management through the
 bundled =skills/managed-discussions/SKILL.md= skill. The package's =skills/=
 directory is a discovery fallback even when =gptel-agent-skill-dirs= is
 customized; user and project skills retain precedence. Calling =Skill= loads
-the workflow instructions and enables =Discussion= and =DiscussionControl=
-in the same turn. Custom presets can still list both tools explicitly.
+the workflow instructions and adds =Discussion= and =DiscussionControl=
+to the current tools in the same turn. Existing tools remain available on later
+turns. Custom presets can still list both tools explicitly.
 
 =Discussion= creates a separate, ordinary gptel buffer with a title and opening
-prompt. It inherits the creating request's model, backend, system prompt, configured tools
-and confirmation settings; an optional existing =preset= can override them.
+prompt. It inherits the creating request's model, backend, system prompt, active
+tools (including tools activated by skills) and confirmation settings; an
+optional existing =preset= can override them.
 It starts without the parent's transcript or attached context. An optional
-=directory= selects its working directory. Skill activations and their
-pre-approvals belong to each conversation separately; a child loads its own
-skills. Approving discussion management does not approve child tool calls.
+=directory= selects its working directory. Skill instructions and pre-approvals
+belong to each conversation separately; inherited tools use their original
+confirmation settings. A child loads skills for their instructions and its own
+pre-approvals. Approving discussion management does not approve child tool calls.
 
 Omitting =preset= (or passing an empty string) copies the current request's
 settings, including local changes; it does not reapply the parent's saved
 preset. An explicit preset is applied on top: settings it specifies override
-inherited values, while unspecified settings remain inherited. Preset parents,
-composition forms, and =:pre=/=:post= hooks are honored.
+inherited values, while unspecified settings remain inherited. A preset's tool
+list replaces the inherited tools, and the child also receives =DiscussionReport=
+to communicate with its parent. Preset parents, composition forms, and
+=:pre=/=:post= hooks are honored.
 
 The =Discussion= tool advertises the names and descriptions of all presets
 registered with =gptel-make-preset=, including user-defined presets outside
