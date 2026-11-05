@@ -428,7 +428,7 @@ TOOL-CALL-INFO is a plist with :name, :args, :buffer, :backend, :model."
   ;; Do not feed these reads into the repetition/cycle detector.
   (unless (or (and (equal (plist-get tool-call-info :name) "Process")
                    (member (plist-get (plist-get tool-call-info :args) :action)
-                           '("list" "read")))
+                           '("list" "read" "wait")))
               (and (equal (plist-get tool-call-info :name) "DiscussionControl")
                    (member (plist-get (plist-get tool-call-info :args) :action)
                            '("list" "read" "wait"))))
@@ -674,7 +674,7 @@ When BACKGROUND is t, return a session-owned job ID immediately."
              (job (process-get process 'gptel-agent-job)))
         (funcall callback
                  (concat (gptel-agent--process-summary job)
-                         "Use Process to read output, send input, interrupt or kill this job.\n"))
+                         "Use Process wait (until=exit) for completion, or read with view=tail for recent output.\n"))
         process)
     (let* ((source (current-buffer))
            (output-buffer (generate-new-buffer " *gptel-agent-bash*"))
@@ -4123,9 +4123,13 @@ Use the provided file tools instead: `Read`, `Write`, `Edit`, \
 - Chain dependent commands with && (or ; if failures are OK)
 - Use absolute paths instead of cd when possible
 - For parallel commands, make multiple `Bash` calls in one message
-- For servers, watchers or long jobs, set background=true. This returns a \
-session-owned process_id immediately; use `Process` to read output, send input, \
-interrupt or kill it while running other commands. Do not append & or use nohup; \
+- Prefer foreground Bash (background=false, the default) for tests, builds and \
+commands whose result you need before proceeding. It waits for completion.
+- For servers, watchers or jobs you can work alongside, set background=true. \
+This returns a session-owned process_id immediately. Do other useful work, then \
+use `Process` wait with until=exit when you need completion; use read with \
+view=tail to inspect recent output. Process can also send input, interrupt or \
+kill the job. Do not append & or use nohup; \
 keep the command in the foreground of its managed shell.
 - Run tests, check your work or otherwise close the loop to verify changes you make.
 - File-tool results say whether proposals are already on disk. When applied, run \
@@ -4163,39 +4167,57 @@ Example: 'ls -la | head -20' or 'grep -i error app.log | tail -50'")
 
 (gptel-make-tool
  :name "Process"
- :function #'gptel-agent--manage-process
+ :function #'gptel-agent--process-tool
  :description "Manage background Bash jobs belonging to this conversation.
 Sub-agents share their originating conversation's jobs. IDs from other chats \
 are rejected. Jobs survive turns and sub-agent completion; killing the \
 conversation buffer kills its jobs and releases their output.
 
 Actions: list shows running and completed jobs with commands and status; read \
-returns available stdout+stderr without waiting; send writes input verbatim \
+returns available stdout+stderr without waiting; wait waits until exit or its \
+deadline and returns status plus output; send writes input verbatim \
 (include a newline when needed); interrupt sends SIGINT to the process group; \
 kill sends SIGKILL to the process group; remove forgets a completed job and \
 its retained output. Use interrupt for a graceful stop, then kill if needed.
 
-read consumes new output by default. Supply an absolute character offset to \
-replay retained output without advancing the unread cursor. next_offset and \
-output_end indicate remaining output. Old output is discarded beyond the \
-configured retention limit and reads report missing ranges. Poll when useful \
-while doing other work; a running process with no output is not finished.
+read defaults to view=unread, consuming new output unless an absolute character \
+offset is supplied for replay. Use view=tail to jump directly to the latest \
+output without changing the shared unread cursor; tail cannot be combined with \
+offset. retained_start, output_start, next_offset and output_end describe \
+available ranges. Old output is discarded beyond the retention limit; tail \
+reads distinguish discarded output from omitted but retained output.
+
+Prefer wait with until=exit over repeated reads when you need a job to finish. \
+It returns immediately if already finished, otherwise on exit or timeout_ms \
+(default 30000, maximum 60000). Progress output does not end the wait. \
+wait_reason is exit or timeout (removed if another caller removes the job); \
+timeout leaves the job running. Wait defaults \
+to view=tail (or unread if offset is supplied). Use timeout_ms=0 for an immediate \
+snapshot. Servers and watchers may never exit; use read to inspect their output. \
+A running process with no output is not finished.
 These are pipes, not an interactive terminal. Do not daemonize jobs or use \
 shell job control: detached children cannot be managed as part of the group."
  :args '((:name "action" :type string
-          :enum ["list" "read" "send" "interrupt" "kill" "remove"]
+          :enum ["list" "read" "wait" "send" "interrupt" "kill" "remove"]
           :description "Operation to perform on this session's background jobs.")
          (:name "process_id" :type string :optional t
           :description "ID returned by Bash or Process list. Required except for list; never an OS PID.")
          (:name "input" :type string :optional t
           :description "For send: exact input to write, including any required newline.")
          (:name "offset" :type integer :optional t :minimum 0
-          :description "For read: absolute character offset for replay. Omit to consume unread output.")
+          :description "For read/wait: absolute character offset for replay without moving the cursor. Cannot be combined with view=tail.")
          (:name "max_chars" :type integer :optional t :minimum 1 :maximum 20000
-          :description "For read: maximum output characters (default 12000, maximum 20000)."))
+          :description "For read/wait: maximum output characters (default 12000, maximum 20000).")
+         (:name "view" :type string :optional t :enum ["unread" "tail"]
+          :description "unread reads forward, consuming output unless offset is set. tail returns the latest output without moving the cursor. Default: unread for read; tail for wait unless offset is set.")
+         (:name "until" :type string :optional t :enum ["exit"]
+          :description "For wait: wait for process termination (default exit), not merely new output.")
+         (:name "timeout_ms" :type integer :optional t :minimum 0 :maximum 60000
+          :description "For wait: maximum milliseconds to wait (default 30000). Zero returns immediately. Timeout does not stop the job."))
  :category "gptel-agent"
  :confirm (lambda (action &rest _) (equal action "send"))
- :include t)
+ :include t
+ :async t)
 
 (gptel-make-tool
  :name "Eval"
@@ -4680,6 +4702,18 @@ The clone captures FSM and a snapshot of the allowed agent registry.  Its
 schema and dispatcher therefore cannot change when another project updates
 the global registry while this request is in flight."
   (gptel-agent--localize-ask-tool fsm)
+  (when-let* ((base-tool (cl-find "Process" gptel-tools
+                                :key #'gptel-tool-name :test #'equal)))
+    (let ((tool (gptel--copy-tool base-tool)))
+      (setf (gptel-tool-function tool)
+            (lambda (callback action &optional process-id input offset max-chars
+                              view until timeout-ms)
+              (gptel-agent--process-tool
+               callback action process-id input offset max-chars view until timeout-ms fsm)))
+      (setq-local gptel-tools
+                  (mapcar (lambda (candidate)
+                            (if (eq candidate base-tool) tool candidate))
+                          gptel-tools))))
   (when (or (gptel-agent--run-p (plist-get (gptel-fsm-info fsm) :context))
             (cl-find-if (lambda (tool) (member (gptel-tool-name tool)
                                                '("Agent" "AgentControl")))

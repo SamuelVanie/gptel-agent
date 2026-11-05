@@ -461,8 +461,10 @@ hiding or killing only the review list does not discard proposals.
 
 *** Background commands
 
-=Bash= normally waits for a command to finish. Set =background= to =true=
-for servers, watchers or long builds. It immediately returns a =process_id=,
+=Bash= normally waits for a command to finish. Prefer this foreground mode
+for tests, builds and commands whose result is needed before proceeding.
+Set =background= to =true= for servers, watchers or jobs the agent can work
+alongside. It immediately returns a =process_id=,
 leaving the agent free to run other commands and inspect output later:
 
 #+begin_src json
@@ -474,6 +476,8 @@ The =Process= tool manages these jobs using the returned ID:
 #+begin_src json
 {"action":"list"}
 {"action":"read","process_id":"bash-1"}
+{"action":"read","process_id":"bash-1","view":"tail","max_chars":8000}
+{"action":"wait","process_id":"bash-1","until":"exit","timeout_ms":30000}
 {"action":"send","process_id":"bash-1","input":"yes\n"}
 {"action":"interrupt","process_id":"bash-1"}
 {"action":"kill","process_id":"bash-1"}
@@ -486,6 +490,24 @@ consuming unread output by default. Optional =offset= replays from an absolute
 character position without changing the unread cursor; =max_chars= limits a
 read to 1–20000 characters (default 12000). Results include =next_offset= and
 =output_end=. The unread cursor is shared by the chat and its sub-agents.
+Set =view= to =tail= to read the latest characters directly without changing
+that cursor. Tail cannot be combined with =offset=. Results also include
+=retained_start= and =output_start= and distinguish discarded output from
+earlier retained output omitted by the tail view. Use an explicit =offset=
+to inspect that earlier output if needed.
+
+=wait= with =until=exit= (the default and only supported condition) waits
+asynchronously for termination or a deadline, keeping Emacs responsive.
+Progress output does not end the wait. =timeout_ms= defaults to 30000 and
+accepts 0–60000; zero returns an immediate snapshot. Results include
+=wait_reason= (=exit= or =timeout=), process status, exit code or signal when
+finished, and output. Timeout does not stop the job. Wait defaults to
+=view=tail=, or =unread= when =offset= is supplied; =max_chars= and explicit
+=view= work as for read. Use wait instead of repeated reads when completion
+is needed. Servers and watchers may never exit, so use read to inspect them.
+Removing a completed job resolves any pending waits with =wait_reason=removed=.
+Cancelling a request or killing its calling buffer cancels its waits without
+stopping jobs owned by a surviving conversation.
 
 Each job retains the most recent =gptel-agent-process-output-limit= characters
 (default 200000). Older output is discarded and a read reports any missing

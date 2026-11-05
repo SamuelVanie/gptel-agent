@@ -11,6 +11,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'gptel)
 
 (defvar gptel-agent--supervised-run)
 (declare-function gptel-agent--run-parent-buffer "gptel-agent-tools")
@@ -29,7 +30,12 @@ The value is captured when the job starts."
 (put 'gptel-agent--processes 'permanent-local t)
 
 (cl-defstruct (gptel-agent--job (:constructor gptel-agent--make-job))
-  id process buffer command directory started-at limit (base 0) (cursor 0))
+  id process buffer command directory started-at limit (base 0) (cursor 0)
+  waiters)
+
+(cl-defstruct (gptel-agent--process-waiter
+               (:constructor gptel-agent--make-process-waiter))
+  job source callback offset max-chars view timer fsm cleanup)
 
 (defun gptel-agent--process-owner ()
   "Return the live top-level conversation owning the current tool call."
@@ -71,8 +77,11 @@ The value is captured when the job starts."
             (gptel-agent--job-directory job)
             (gptel-agent--job-started-at job))))
 
-(defun gptel-agent--process-dispose (job)
-  "Kill JOB's live process group and release its output buffer."
+(defun gptel-agent--process-dispose (job &optional notify)
+  "Kill JOB's live process group and release its output buffer.
+Cancel pending waits, or resolve them before removal when NOTIFY is non-nil."
+  (dolist (waiter (copy-sequence (gptel-agent--job-waiters job)))
+    (gptel-agent--process-finish-wait waiter (and notify "removed")))
   (let ((process (gptel-agent--job-process job)))
     (when (processp process)
       ;; Unlike signalling a raw PID, this targets the subprocess group,
@@ -118,8 +127,7 @@ Use `gptel-agent--manage-process' to read output or control the job."
                  :command (list "bash" "-c" command)
                  :connection-type 'pipe :file-handler t :noquery t
                  :filter (apply-partially #'gptel-agent--process-filter job)
-                 ;; Do not mix sentinel messages into command output.
-                 :sentinel #'ignore))
+                 :sentinel (apply-partially #'gptel-agent--process-sentinel job)))
           (unless (processp process)
             (error "This directory does not support asynchronous processes"))
           (setf (gptel-agent--job-process job) process)
@@ -132,44 +140,161 @@ Use `gptel-agent--manage-process' to read output or control the job."
        (gptel-agent--process-dispose job)
        (signal (car err) (cdr err))))))
 
-(defun gptel-agent--process-read (job offset max-chars)
-  "Read JOB output from OFFSET, returning at most MAX-CHARS characters.
-Nil OFFSET consumes unread output.  Explicit offsets allow replay without
-changing the shared unread cursor.  Offsets count decoded characters."
+(defun gptel-agent--process-validate-read (job offset max-chars view)
+  "Validate JOB's OFFSET, MAX-CHARS and VIEW without consuming output.
+Return the effective character limit."
   (unless (or (null offset) (and (integerp offset) (>= offset 0)))
     (error "offset must be a nonnegative integer"))
+  (unless (member view '(nil "unread" "tail"))
+    (error "view must be unread or tail"))
+  (when (and offset (equal view "tail"))
+    (error "offset cannot be combined with view=tail"))
   (setq max-chars (or max-chars 12000))
   (unless (and (integerp max-chars) (> max-chars 0) (<= max-chars 20000))
     (error "max_chars must be between 1 and 20000"))
   (unless (buffer-live-p (gptel-agent--job-buffer job))
     (error "Output buffer is no longer available for %s"
            (gptel-agent--job-id job)))
+  (when offset
+    (let ((total (+ (gptel-agent--job-base job)
+                    (buffer-size (gptel-agent--job-buffer job)))))
+      (when (> offset total)
+        (error "offset exceeds available output (%d characters)" total))))
+  max-chars)
+
+(defun gptel-agent--process-read (job offset max-chars &optional view)
+  "Read JOB output from OFFSET, returning at most MAX-CHARS characters.
+VIEW defaults to unread: nil OFFSET consumes unread output, while an explicit
+offset replays without changing the shared cursor.  VIEW tail returns the
+latest characters without moving that cursor and cannot be used with OFFSET.
+Offsets count decoded characters."
+  (setq max-chars (gptel-agent--process-validate-read job offset max-chars view))
   (with-current-buffer (gptel-agent--job-buffer job)
     (let* ((base (gptel-agent--job-base job))
            (total (+ base (buffer-size)))
-           (requested (or offset (gptel-agent--job-cursor job)))
+           (tail (equal view "tail"))
+           (requested (if tail (max base (- total max-chars))
+                        (or offset (gptel-agent--job-cursor job))))
            (start (max base requested))
            (end (min total (+ start max-chars))))
-      (when (> requested total)
-        (error "offset exceeds available output (%d characters)" total))
-      (unless offset
+      (unless (or offset tail)
         (setf (gptel-agent--job-cursor job) end))
       (concat
        (gptel-agent--process-summary job)
-       (format "output_start: %d\nnext_offset: %d\noutput_end: %d\n" start end total)
-       (when (< requested base)
+       (format "retained_start: %d\noutput_start: %d\nnext_offset: %d\noutput_end: %d\n"
+               base start end total)
+       (when (if tail (> base 0) (< requested base))
          (format "Output truncated: characters %d..%d were discarded.\n"
-                 requested base))
-       (when (< end total) "More output is available; read again.\n")
+                 (if tail 0 requested) base))
+       (when (and tail (> start base))
+         (format "Tail view omitted retained characters %d..%d; use offset to inspect them if needed.\n"
+                 base start))
+       (when (< end total) "More output is available; use view=tail for the latest output or next_offset to continue.\n")
        "STDOUT+STDERR:\n"
        (if (= start end)
            "(no new output)"
          (buffer-substring-no-properties
           (+ (point-min) (- start base)) (+ (point-min) (- end base))))))))
 
-(defun gptel-agent--manage-process (action &optional process-id input offset max-chars)
+(defun gptel-agent--process-finish-wait (waiter reason)
+  "Resolve WAITER once with REASON, or cancel silently when REASON is nil."
+  (let* ((job (gptel-agent--process-waiter-job waiter))
+         (source (gptel-agent--process-waiter-source waiter))
+         (fsm (gptel-agent--process-waiter-fsm waiter))
+         (cleanup (gptel-agent--process-waiter-cleanup waiter)))
+    (when (memq waiter (gptel-agent--job-waiters job))
+      ;; Invalidate before calling back: callbacks may remove the job or reenter.
+      (setf (gptel-agent--job-waiters job)
+            (delq waiter (gptel-agent--job-waiters job)))
+      (when-let* ((timer (gptel-agent--process-waiter-timer waiter)))
+        (cancel-timer timer)
+        (setf (gptel-agent--process-waiter-timer waiter) nil))
+      (when fsm
+        (setf (plist-get (gptel-fsm-info fsm) :post)
+              (remq cleanup (plist-get (gptel-fsm-info fsm) :post))))
+      (when (buffer-live-p source)
+        (with-current-buffer source
+          (remove-hook 'kill-buffer-hook cleanup t)
+          (when (and reason (or (null fsm) (eq (gptel-fsm-state fsm) 'TOOL)))
+            (let ((result
+                   (condition-case err
+                       (concat "wait_reason: " reason "\n"
+                               (gptel-agent--process-read
+                                job (gptel-agent--process-waiter-offset waiter)
+                                (gptel-agent--process-waiter-max-chars waiter)
+                                (gptel-agent--process-waiter-view waiter)))
+                     (error (concat "Error: " (error-message-string err))))))
+              (condition-case err
+                  (funcall (gptel-agent--process-waiter-callback waiter) result)
+                (error (message "Process wait callback failed: %s"
+                                (error-message-string err)))))))))))
+
+(defun gptel-agent--process-sentinel (job process _event)
+  "Resolve JOB's waits when PROCESS terminates, after its output is drained."
+  ;; Never insert sentinel messages into the command's output buffer.
+  (unless (process-live-p process)
+    (dolist (waiter (copy-sequence (gptel-agent--job-waiters job)))
+      (gptel-agent--process-finish-wait waiter "exit"))))
+
+(defun gptel-agent--process-wait
+    (callback job offset max-chars view until timeout-ms fsm)
+  "Wait asynchronously for JOB to exit, delivering its output to CALLBACK.
+OFFSET, MAX-CHARS and VIEW select output; VIEW defaults to tail, or unread
+when OFFSET is supplied.  UNTIL must be exit.  TIMEOUT-MS defaults to 30000
+and is bounded to 0..60000; expiry does not stop the job.  FSM, when non-nil,
+owns the wait so cancellation cannot revive an obsolete request."
+  (setq view (or view (if offset "unread" "tail"))
+        timeout-ms (or timeout-ms 30000))
+  (unless (member until '(nil "exit")) (error "until must be exit"))
+  (unless (and (integerp timeout-ms) (<= 0 timeout-ms 60000))
+    (error "timeout_ms must be between 0 and 60000"))
+  (setq max-chars (gptel-agent--process-validate-read job offset max-chars view))
+  (let* ((waiter (gptel-agent--make-process-waiter
+                  :job job :source (current-buffer) :callback callback
+                  :offset offset :max-chars max-chars :view view :fsm fsm))
+         (cleanup (lambda (&rest _) (gptel-agent--process-finish-wait waiter nil))))
+    (setf (gptel-agent--process-waiter-cleanup waiter) cleanup)
+    (push waiter (gptel-agent--job-waiters job))
+    (add-hook 'kill-buffer-hook cleanup nil t)
+    (when fsm
+      (setf (plist-get (gptel-fsm-info fsm) :post)
+            (cons cleanup (plist-get (gptel-fsm-info fsm) :post))))
+    (cond
+     ((not (process-live-p (gptel-agent--job-process job)))
+      (gptel-agent--process-finish-wait waiter "exit"))
+     ((zerop timeout-ms) (gptel-agent--process-finish-wait waiter "timeout"))
+     (t
+      (setf (gptel-agent--process-waiter-timer waiter)
+            (run-at-time
+             (/ timeout-ms 1000.0) nil
+             (lambda ()
+               (gptel-agent--process-finish-wait
+                waiter (if (process-live-p (gptel-agent--job-process job))
+                           "timeout" "exit"))))))))
+  ;; Async tools must return nil while waiting for their callback.
+  nil)
+
+(defun gptel-agent--process-tool
+    (callback action &optional process-id input offset max-chars view until timeout-ms fsm)
+  "Dispatch Process ACTION and deliver its result to CALLBACK.
+PROCESS-ID identifies a job.  INPUT is used by send.  OFFSET, MAX-CHARS and
+VIEW select read/wait output; UNTIL and TIMEOUT-MS control wait.  Optional
+FSM is supplied by the request-local dispatcher for cancellation cleanup."
+  (if (equal action "wait")
+      (let ((job (with-current-buffer (gptel-agent--process-owner)
+                   (cl-find process-id gptel-agent--processes
+                            :key #'gptel-agent--job-id :test #'equal))))
+        (unless job (error "Unknown process_id in this session: %s" process-id))
+        (gptel-agent--process-wait
+         callback job offset max-chars view until timeout-ms fsm))
+    (funcall callback
+             (gptel-agent--manage-process action process-id input offset max-chars view)))
+  nil)
+
+(defun gptel-agent--manage-process (action &optional process-id input offset max-chars view)
   "Perform ACTION on PROCESS-ID in this conversation only.
-INPUT is sent verbatim for `send'; OFFSET and MAX-CHARS control `read'."
+INPUT is sent verbatim for `send'; OFFSET, MAX-CHARS and VIEW control `read'.
+Use `gptel-agent--process-tool' for asynchronous waits."
   (with-current-buffer (gptel-agent--process-owner)
     (if (equal action "list")
         (if gptel-agent--processes
@@ -182,11 +307,11 @@ INPUT is sent verbatim for `send'; OFFSET and MAX-CHARS control `read'."
         (unless job
           (error "Unknown process_id in this session: %s" process-id))
         (pcase action
-          ("read" (gptel-agent--process-read job offset max-chars))
+          ("read" (gptel-agent--process-read job offset max-chars view))
           ("remove"
            (when (process-live-p process)
              (error "Process is still running; kill it before removing it"))
-           (gptel-agent--process-dispose job)
+           (gptel-agent--process-dispose job t)
            (setq gptel-agent--processes (delq job gptel-agent--processes))
            (format "Removed %s and its retained output." process-id))
           ((or "send" "interrupt" "kill")
