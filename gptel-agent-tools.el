@@ -4115,9 +4115,12 @@ When QUEUE is non-nil, defer submission and attention hooks until it waits."
 This tool provides access to a Bash shell with GNU coreutils (or equivalents) available.
 Use this to inspect system state, run builds, tests or other development or system administration tasks.
 
-Do NOT use this for file operations, finding, reading or editing files.
-Use the provided file tools instead: `Read`, `Write`, `Edit`, \
-`Glob`, `Grep`
+Prefer the dedicated file tools (`Read`, `Write`, `Edit`, `Insert`, `Glob`, \
+`Grep`, `PathInfo`, `Mkdir`, `Rmdir`) when they support the operation you need.
+Bash is available for file and directory operations such as moving, renaming, \
+copying, removing, creating links and changing permissions. Use it when the \
+dedicated tools do not cover the operation or the user requests a shell command.
+The preference for dedicated tools is not a ban on Bash file operations.
 
 - Quote file paths with spaces using double quotes.
 - Chain dependent commands with && (or ; if failures are OK)
@@ -4140,6 +4143,7 @@ EXAMPLES:
 - Run tests: 'npm test'
 - Build a project: 'make'
 - Inspect repository changes: 'git diff --check'
+- Move a file: 'mv -- old-name.txt new-name.txt'
 Use PathInfo for file types and Glob with type=all for directory contents.
 
 The command will be executed in the current working directory. Foreground output is
