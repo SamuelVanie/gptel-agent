@@ -1218,94 +1218,59 @@ diagnostics."
 ;;;; Make directories
 ;;;; Writing to files
 (defun gptel-agent--edit-files-preview-setup (arg-values _info)
-  "Insert tool call preview for ARG-VALUES for \"Edit\" tool."
-  (pcase-let* ((from (point)) (files-affected) (description)
-               (`(,path ,old-str ,new-str-or-diff ,diffp . ,tail) arg-values)
-               (operations (car tail)))
-
-    (cond
-     ((gptel-agent-edit--batch-p operations)
-      (setq description "BatchEdit")
-      (dolist (change (gptel-agent-edit-prepare
-                      "Edit" (list :path path :old_str old-str :new_str new-str-or-diff
-                                   :diff diffp :operations operations)))
-        (let ((file (plist-get change :path))
-              (before (plist-get change :before)) (after (plist-get change :after)))
-          (push file files-affected)
-          (insert (format "%s%s\n" file (cond ((null before) " [new file]")
-                                              ((null after) " [delete file]") (t ""))))
-          (when before
-            (insert (propertize before 'font-lock-face 'diff-removed
-                                'line-prefix (propertize "-" 'face 'diff-removed)) "\n"))
-          (when after
-            (insert (propertize after 'font-lock-face 'diff-added
-                                'line-prefix (propertize "+" 'face 'diff-added)) "\n")))))
-     ((and diffp (not (eq diffp :json-false)))
-      (insert new-str-or-diff)
-      (save-excursion
-        (while (re-search-backward "^\\+\\+\\+ \\(.*\\)$" from t)
-          (push (match-string 1) files-affected))
-        (goto-char from)
-        (when (looking-at "^ *```\\(diff\\|patch\\)\\s-*\n")
-          (delete-region (match-beginning 0) (match-end 0))))
-      (skip-chars-backward " \t\r\n")
-      (when (looking-back "^ *```\\s-*\\'" (line-beginning-position))
-        (delete-region (line-beginning-position) (line-end-position)))
-      (setq description "Patch")
-      (require 'diff-mode)
-      (gptel-agent--fontify-block 'diff-mode from (point)))
-     (old-str                          ;Text replacement
-      (push path files-affected)
-      (setq description "ReplaceIn")
-      (insert
-       (propertize old-str 'font-lock-face 'diff-removed
-                   'line-prefix (propertize "-" 'face 'diff-removed))
-       "\n" (propertize new-str-or-diff 'font-lock-face 'diff-added
-                        'line-prefix (propertize "+" 'face 'diff-added))
-       "\n")))
-    (insert "\n")
-    (font-lock-append-text-property
-     from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
-    (when (derived-mode-p 'org-mode)
-      (org-escape-code-in-region from (1- (point))))
-    (save-excursion
-      (goto-char from)
-      (insert
-       "(" (propertize description 'font-lock-face 'font-lock-keyword-face)
-       " " (mapconcat (lambda (f) (propertize (concat "\"" f "\"")
-                                              'font-lock-face 'font-lock-constant-face))
-                      files-affected " ")
-       ")\n"))
+  "Preview Edit ARG-VALUES using the same validation as execution."
+  (pcase-let ((`(,mode ,file ,root ,old ,new ,operations) arg-values)
+              (from (point)))
+    (insert (format "Edit %s\n" mode))
+    (dolist (change (gptel-agent-edit-prepare
+                    "Edit" (list :mode mode :file_path file :root_directory root
+                                 :old_str old :new_str new :operations operations)))
+      (let ((before (plist-get change :before)) (after (plist-get change :after)))
+        (insert (format "%s%s\n" (plist-get change :path)
+                        (cond ((null before) " [new file]")
+                              ((null after) " [delete file]") (t ""))))
+        (when before (insert (propertize before 'face 'diff-removed) "\n"))
+        (when after (insert (propertize after 'face 'diff-added) "\n"))))
     (gptel-agent--confirm-overlay from (point) t)))
 
-;;;; Create a directory
-(defun gptel-agent--make-directory (parent name)
-  "Create a directory NAME in PARENT directory.
+(defun gptel-agent--make-directory (directory-path)
+  "Create DIRECTORY-PATH and missing ancestors; an existing directory succeeds."
+  (let* ((path (gptel-agent-path-resolve directory-path 'directory))
+         (exists (file-directory-p path)))
+    (make-directory path t)
+    (format "Directory %s: %s" (if exists "already exists" "created") path)))
 
-Creates the directory and any missing parent directories.  If the
-directory already exists, this is a no-op and returns success.
+(defun gptel-agent--remove-directory (directory-path)
+  "Remove exactly one empty DIRECTORY-PATH, never recursively or via a symlink."
+  (let ((path (directory-file-name (gptel-agent-path-resolve directory-path 'directory t))))
+    (when (file-symlink-p path)
+      (error "Rmdir refuses symlinks: %s. Inspect the link with PathInfo" path))
+    (when (or (equal path (directory-file-name (file-truename default-directory)))
+              (file-in-directory-p default-directory path)
+              (equal path (directory-file-name (file-name-directory path))))
+      (error "Rmdir refuses the working directory or its ancestors: %s" path))
+    (when (directory-files path nil directory-files-no-dot-files-regexp t)
+      (error "Directory is not empty: %s. Inspect it with Glob, type=all; Rmdir never removes contents" path))
+    ;; Non-recursive deletion also checks emptiness atomically at the OS level.
+    (delete-directory path nil)
+    (format "Removed empty directory: %s" path)))
 
-PARENT is the parent directory path,NAME is the name of the new
-directory to create."
-  (condition-case errdata
-      (progn
-        (make-directory (expand-file-name name parent) t)
-        (format "Directory %s created/verified in %s" name parent))
-    (error "Error creating directory %s in %s:\n%S" name parent errdata)))
+(defun gptel-agent--path-info (path)
+  "Describe the exact on-disk PATH, including its type and symlink target."
+  (let* ((path (gptel-agent-path-resolve path 'any))
+         (link (file-symlink-p (directory-file-name path)))
+         (kind (gptel-agent-path-type path)))
+    (format "Path: %S\nType on disk: %s\nReadable: %s\nWritable: %s%s"
+            path kind (if (file-readable-p path) "yes" "no")
+            (if (file-writable-p path) "yes" "no")
+            (if link (format "\nSymlink target: %S" link) ""))))
 
-(defun gptel-agent--edit-files (path &optional old-str new-str-or-diff diffp operations)
-  "Replace text in PATH, or apply a unified diff when DIFFP is true.
-Prepare every affected file before writing any of them.  Diff paths are
-relative to a directory PATH; standard a/ and b/ prefixes are accepted.
-In string mode OLD-STR must match uniquely, with case significant.  If exact
-matching fails, tolerate indentation and trailing whitespace on complete lines.
-Nonempty OPERATIONS supplies an ordered mixed batch under directory PATH;
-OLD-STR and NEW-STR-OR-DIFF must then be nil or empty, and DIFFP nil or false.
-Nil or empty OPERATIONS selects a single replacement or unified diff."
+(defun gptel-agent--edit-files (mode &optional file-path root-directory old-str new-str operations)
+  "Apply explicit Edit MODE to FILE-PATH or ROOT-DIRECTORY."
   (gptel-agent-edit-apply
    (gptel-agent-edit-prepare
-    "Edit" (list :path path :old_str old-str :new_str new-str-or-diff
-                 :diff diffp :operations operations))))
+    "Edit" (list :mode mode :file_path file-path :root_directory root-directory
+                 :old_str old-str :new_str new-str :operations operations))))
 
 (defun gptel-agent--insert-in-file-preview-setup (arg-values _info)
   "Preview setup for Insert.
@@ -1315,6 +1280,7 @@ ARG-VALUES is a list: (path line-number new-str)"
         (face-bg (gptel-agent--block-bg))
         (cb (current-buffer)))
     (pcase-let ((`(,path ,line-number ,new-str) arg-values))
+      (gptel-agent-edit-prepare "Insert" (list :file_path path :line_number line-number :new_str new-str))
       (insert "("
               (propertize "insert_into_file " 'font-lock-face 'font-lock-keyword-face)
               (propertize (concat "\"" path "\"")
@@ -1357,37 +1323,20 @@ ARG-VALUES is a list: (path line-number new-str)"
   "Insert NEW-STR after LINE-NUMBER in PATH; 0 means start, -1 means end."
   (gptel-agent-edit-apply
    (gptel-agent-edit-prepare
-    "Insert" (list :path path :line_number line-number :new_str new-str))))
+    "Insert" (list :file_path path :line_number line-number :new_str new-str))))
 
 (defun gptel-agent--write-file-preview-setup (arg-values _info)
-  "Setup preview overlay for Write file tool call.
+  "Preview a Write call with ARG-VALUES (file-path content)."
+  (pcase-let ((`(,file ,content) arg-values) (from (point)))
+    (gptel-agent-edit-prepare "Write" (list :file_path file :content content))
+    (insert (format "Write %S\n%s\n" file content))
+    (gptel-agent--confirm-overlay from (point) t)))
 
-ARG-VALUES is the list of arguments for the tool call."
-  (pcase-let ((from (point))
-              (`(,path ,filename ,content) arg-values))
-    (insert
-     "(" (propertize "Write " 'font-lock-face 'font-lock-keyword-face)
-     (propertize (prin1-to-string path) 'font-lock-face 'font-lock-constant-face) " "
-     (propertize (prin1-to-string filename) 'font-lock-face 'font-lock-constant-face)
-     ")\n")
-    (let ((inner-from (point)))
-      (insert content)
-      (gptel-agent--fontify-block filename inner-from (point))
-      (insert "\n\n")
-      (font-lock-append-text-property
-       inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
-      (when (derived-mode-p 'org-mode)
-        (org-escape-code-in-region inner-from (1- (point)))))
-    (gptel-agent--confirm-overlay from (point))))
-
-;;;; Write content to a file
-(defun gptel-agent--write-file (path filename content)
-  "Write CONTENT to FILENAME in PATH, checking for unsaved buffer edits."
+(defun gptel-agent--write-file (file-path content)
+  "Write complete CONTENT to FILE-PATH, creating missing parent directories."
   (gptel-agent-edit-apply
-   (gptel-agent-edit-prepare
-    "Write" (list :path path :filename filename :content content))))
+   (gptel-agent-edit-prepare "Write" (list :file_path file-path :content content))))
 
-;;;; Find files using regexes
 (defun gptel-agent--tool-results-directory ()
   "Return the directory used for persisted oversized tool results."
   (expand-file-name "gptel-agent-temp"
@@ -1461,80 +1410,51 @@ saved file directly."
                  "\n\n[Use `Read' with file_path=%S and a narrow line range to inspect the full result.]"
                  temp-file))))))
 
-(defun gptel-agent--glob (pattern &optional path depth)
-  "Find files matching PATTERN using `tree' or GNU find.
-
-PATTERN is a case-insensitive glob pattern applied to file
-basenames, like \"*.el\".
-PATH is the optional directory to search (defaults to current directory).
-DEPTH limits recursion depth when provided (non-negative integer).
-
-Returns a string listing matching files with full paths, sorted by
-modification time.  If the output exceeds
-`gptel-agent-tool-result-max-chars', it writes the full results to a temporary
-file and returns a truncated version with instructions to use `Read' for the
-full contents.
-
-Returns a string listing matching files with full paths, sorted by
-modification time, newest first.  If the output is too large (>20000
-chars), it writes the full results to a temporary file and returns a
-truncated version with instructions to use `Read' for the full
-contents.
-
-Raises an error if PATTERN is empty, PATH is not readable, or
-neither the `tree' nor the `find' executable is found."
-  (when (string-empty-p pattern)
-    (error "Error: pattern must not be empty"))
-  (if path
-      (unless (and (file-readable-p path) (file-directory-p path))
-        (error "Error: path %s is not readable" path))
-    (setq path "."))
-  (let* ((use-tree (executable-find "tree" t))
-         (program (cond (use-tree "tree")
-                        ((executable-find "find" t) "find")
-                        (t (error "Error: Neither `tree` nor `find` \
-executable found.  This tool cannot be used"))))
-         (full-path (expand-file-name path)))
+(defun gptel-agent--glob (pattern &optional root-directory depth type)
+  "Find typed entries matching basename PATTERN under ROOT-DIRECTORY.
+DEPTH starts at 1.  TYPE is files (default), directories, or all.
+Include hidden entries, omit .git directories, and do not traverse symlinks."
+  (unless (and (stringp pattern) (not (string-empty-p pattern))
+               (not (string-match-p "/\\|\\*\\*" pattern)))
+    (error "Glob requires a nonempty basename pattern, without / or **"))
+  (unless (or (null depth) (and (integerp depth) (> depth 0)))
+    (error "Glob depth must be an integer >= 1"))
+  (setq type (or type "files"))
+  (unless (member type '("files" "directories" "all"))
+    (error "Glob type must be files, directories, or all"))
+  (let* ((root (gptel-agent-path-resolve (or root-directory ".") 'directory t))
+         (regexp (wildcard-to-regexp pattern))
+         (case-fold-search t) (pending (list (cons root 1))) entries)
+    (while pending
+      (pcase-let ((`(,directory . ,level) (pop pending)))
+        (dolist (path (directory-files directory t directory-files-no-dot-files-regexp t))
+          (let* ((name (file-name-nondirectory path))
+                 (kind (gptel-agent-path-type path))
+                 (link (file-symlink-p path)))
+            (unless (and (equal name ".git") (equal kind "directory"))
+              (when (and (equal kind "directory") (not link)
+                         (or (null depth) (< level depth)))
+                (push (cons path (1+ level)) pending))
+              (when (and (string-match-p regexp name)
+                         (or (equal type "all")
+                             (equal kind (if (equal type "files") "file" "directory"))))
+                (push (list path kind link (file-attribute-modification-time (file-attributes path))) entries)))))))
+    (setq entries (sort entries (lambda (a b)
+                                 (if (equal (nth 3 a) (nth 3 b)) (string< (car a) (car b))
+                                   (time-less-p (nth 3 b) (nth 3 a))))))
     (with-temp-buffer
-      (let* ((local-path (file-local-name full-path))
-             (args
-              (if use-tree
-                  (let ((tree-args (list "-a" "-r" "-l" "-f" "-i" "-I" ".git"
-                                         "--sort=mtime" "--ignore-case"
-                                         "--prune" "-P" pattern local-path)))
-                    (if (natnump depth)
-                        (nconc tree-args
-                               (list "-L" (number-to-string depth)))
-                      tree-args))
-                (nconc
-                 (list "-L" local-path)
-                 (and (natnump depth)
-                      (list "-maxdepth" (number-to-string depth)))
-                 (list "(" "-name" ".git" ")" "-prune"
-                       "-o" "(" "-type" "f" "-iname" pattern
-                       "-printf" "%30T@\t%p\n" ")"))))
-             (exit-code (apply #'process-file program nil t nil args)))
-        (unless use-tree
-          ;; find prints "%30T@\t%p\n" per match: drop diagnostics that
-          ;; leaked into stdout, sort by mtime newest first (the padded
-          ;; timestamp makes a lexicographic sort equivalent to a
-          ;; numeric one), then strip the timestamp field.
-          (when (> (buffer-size) 0)
-            (keep-lines "^[ 0-9.]+\t" (point-min) (point-max))
-            (sort-lines t (point-min) (point-max))
-            (goto-char (point-min))
-            (while (re-search-forward "^[ 0-9.]+\t" nil t)
-              (replace-match ""))))
-        (when (/= exit-code 0)
-          (goto-char (point-min))
-          (insert (format "Glob failed with exit code %d\n.STDOUT:\n\n"
-                          exit-code)))
-        (gptel-agent--truncate-buffer "glob")
-        (buffer-string)))))
+      (dolist (entry entries)
+        (pcase-let ((`(,path ,kind ,link ,_) entry))
+          (insert (format "[%s%s] %S%s\n" kind (if link " symlink" "") path
+                          (if link (format " -> %S" link) "")))))
+      (when (null entries) (insert "No matching entries.\n"))
+      (gptel-agent--truncate-buffer "glob")
+      (buffer-string))))
 
 ;;;; Read files or directories
 (defun gptel-agent--read-file-lines (filename start-line end-line)
   "Return lines START-LINE to END-LINE fom FILENAME."
+  (setq filename (gptel-agent-path-resolve filename 'file t))
   (unless (file-readable-p filename)
     (error "Error: File %s is not readable" filename))
 
@@ -4213,10 +4133,10 @@ the relevant tests/build immediately, even while review remains open. Report fai
 and fix them before finishing; rerun checks after revisions or refusals.
 
 EXAMPLES:
-- List files with details: 'ls -lah /path/to/dir'
-- Find recent errors: 'grep -i error /var/log/app.log | tail -20'
-- Check file type: 'file document.pdf'
-- Count lines: 'wc -l *.txt'
+- Run tests: 'npm test'
+- Build a project: 'make'
+- Inspect repository changes: 'git diff --check'
+Use PathInfo for file types and Glob with type=all for directory contents.
 
 The command will be executed in the current working directory. Foreground output is
 returned as a string. Outputs over `gptel-agent-tool-result-max-chars' are
@@ -4395,163 +4315,127 @@ too."
 
 (gptel-make-tool
  :name "Mkdir"
- :description "Create a new directory with the given name in the specified parent directory"
+ :description "Create a directory and all missing ancestors in one call. An existing directory succeeds.
+Use only when you intend to create a directory, including an empty one. Dots are allowed
+in directory names; extensions do not determine filesystem type. Write and Edit file
+creation already create missing parents, so do not call Mkdir on a file's full path.
+Example: {\"directory_path\":\"/project/src/main/java\"}."
  :function #'gptel-agent--make-directory
- :args (list '( :name "parent"
-                :type "string"
-                :description "The parent directory where the new directory should be created, e.g. /tmp")
-             '( :name "name"
-                :type "string"
-                :description "The name of the new directory to create, e.g. testdir"))
- :category "gptel-agent"
- :confirm t
- :include t)
+ :args '((:name "directory_path" :type string :description "Complete directory path to create recursively."))
+ :category "gptel-agent" :confirm t :include t)
+
+(gptel-make-tool
+ :name "Rmdir"
+ :description "Remove exactly one empty directory. Use PathInfo/Glob to inspect an accidental directory first.
+Never recursive; refuses nonempty directories, symlinks, the working directory and its ancestors.
+For an accidentally created Poulet.java directory, remove it only if empty, then use Write
+with file_path ending in Poulet.java (no slash) to create the intended file."
+ :function #'gptel-agent--remove-directory
+ :args '((:name "directory_path" :type string :description "Exact empty directory to remove."))
+ :category "gptel-agent" :confirm t :include t)
+
+(gptel-make-tool
+ :name "PathInfo"
+ :description "Inspect one exact path on disk: file, directory, missing, broken symlink or special file,
+plus permissions and symlink target. Does not change anything. Use after a path/type error;
+a dot or extension does not tell you whether a path is a file. Pending unapplied review
+content is not reflected here. Use Glob with type=all to inspect directory contents."
+ :function #'gptel-agent--path-info
+ :args '((:name "path" :type string :description "Exact file or directory path to inspect, even if missing."))
+ :category "gptel-agent" :include t)
 
 (gptel-make-tool
  :name "Edit"
- :description
- "Edit text files. Read existing files first. With confirmation enabled, proposals update \
-one cumulative diff per file without blocking. By default changes are applied immediately \
-with restorable before/after snapshots; run relevant tests/builds with Bash after editing. \
-Address incoming review comments and refusals in subsequent changes. The tool result \
-states whether changes are applied or only staged; only test on-disk changes.
+ :description "Edit text files using an explicit mode. Read existing files first. File targets must not
+end in /; directories can contain dots. Use PathInfo to resolve type errors.
 
-- Batch: set `path` to an existing root directory and supply a nonempty `operations` array to mix \
-replacements, patches, insertions, file creation/overwrites and deletions. Paths are relative \
-to the root; operations see earlier results. Omit top-level old_str/new_str/diff, or use \
-old_str=\"\", new_str=\"\", diff=false if all parameters must be supplied.
-- Replacement: file `path`, unique `old_str` copied from the file, literal `new_str` \
-(empty deletes), diff=false. Omit operations or use operations=[]. \
-Indentation/trailing whitespace differences are tolerated if unique.
-- Unified diff: diff=true, `new_str` with ---/+++ headers and @@ hunks; omit `old_str` or use \"\". \
-Omit operations or use operations=[]. \
-Multi-file diffs require a directory `path` and relative headers; a/ and b/ prefixes work.
+- mode=replace: file_path is an existing file; old_str is a nonempty unique block copied
+from Read; new_str is literal replacement text (empty removes that block).
+- mode=patch: new_str is a unified diff with ---/+++ headers and @@ hunks. Supply exactly
+one target: file_path for one existing file, OR root_directory for relative diff paths
+and file creation/deletion. Standard a/ and b/ prefixes work. Missing parents are created.
+- mode=batch: root_directory is an existing directory; operations is a nonempty ordered
+array. Each operation has explicit relative file_path, or root_directory for a patch.
+Use operation=write with complete content to create files, including missing parents;
+replace/insert require existing files (or files created earlier in this batch).
 
-Never add dummy operations to fill an unused array. Each batch item needs operation/path \
-and these fields: replace: old_str/new_str; patch: new_str; insert: line_number/new_str; \
-write: content (empty creates an empty file); delete: no other fields. Omit unused item \
-fields, or use empty strings and line_number=0 if all fields must be supplied.
+Omit unused fields, or leave strings empty and operations=[] if your provider requires
+all fields. Never infer mode from text or add dummy operations. Text changes only;
+no renames or permission changes. For one new file prefer Write; no Mkdir is needed.
 
-Examples (all top-level fields supplied):
-Replacement: {\"path\":\"/project/a.txt\",\"old_str\":\"old\",\"new_str\":\"new\",\"diff\":false,\"operations\":[]}
-Batch: {\"path\":\"/project\",\"old_str\":\"\",\"new_str\":\"\",\"diff\":false,\"operations\":[{\"operation\":\"replace\",\"path\":\"a.txt\",\"old_str\":\"old\",\"new_str\":\"new\"},{\"operation\":\"write\",\"path\":\"b.txt\",\"content\":\"created\"}]}
+Examples:
+{\"mode\":\"replace\",\"file_path\":\"/project/Poulet.java\",\"old_str\":\"old\",\"new_str\":\"new\"}
+{\"mode\":\"batch\",\"root_directory\":\"/project\",\"operations\":[{\"operation\":\"write\",\"file_path\":\"src/Poulet.java\",\"content\":\"class Poulet {}\"}]}
 
-Text changes only; no renames or permission changes."
+With confirmation enabled, changes update cumulative review without waiting. By default
+changes are applied with restorable snapshots; results state whether applied or staged.
+Test on-disk changes, address review feedback, and rerun relevant checks."
  :function #'gptel-agent--edit-files
- :args '(( :name "path"
-           :description "Existing file, or root directory for operations/multi-file diffs. Prefer an absolute path."
-           :type string)
-         ( :name "old_str"
-           :description "Replacement: required unique block copied from the current file. For diffs/batches, omit or use an empty string."
-           :type string
-           :optional t)
-         ( :name "new_str"
-           :description "Without a nonempty operations array: required literal replacement (empty deletes) or unified diff. For batches, omit or use an empty string."
-           :type string
-           :optional t)
-         ( :name "diff"
-           :description "true for a top-level unified diff; false for replacement. For batches, omit or use false; select patch within each operation."
-           :type boolean
-           :optional t)
-         ( :name "operations"
-           :description "Nonempty array selects batch mode under directory path; top-level old_str/new_str must be omitted or empty, diff omitted or false. For a single replacement/diff, omit or use []; never add dummy operations."
-           :type array
-           :optional t
-           :minItems 0
-           :items
-           ( :type object
-             :required ["operation" "path"]
-             :additionalProperties :json-false
-             :properties
-             ( :operation (:type string :enum ["replace" "patch" "insert" "write" "delete"])
-               :path (:type string :description "Path relative to the root, no ../; patch may use . for all files.")
-               :old_str (:type string :description "replace: required nonempty unique block copied from the current file. Otherwise omit or use an empty string.")
-               :new_str (:type string :description "replace/insert: required text (empty replacement deletes); patch: required unified diff with ---/+++ and @@ headers. Otherwise omit or use an empty string.")
-               :line_number (:type integer :minimum -1 :description "insert: required line to insert after; 0 = start, -1 = end. Uses earlier operation results. Otherwise omit or use 0.")
-               :content (:type string :description "write: required complete content, possibly empty; creates or overwrites the file. Otherwise omit or use an empty string.")))))
- :category "gptel-agent"
- :confirm t
- :include t)
+ :args '((:name "mode" :type string :enum ["replace" "patch" "batch"] :description "Required explicit operation mode.")
+         (:name "file_path" :type string :optional t :description "Complete file path for replace or a single-file patch; no trailing slash. Omit for batch/root patch.")
+         (:name "root_directory" :type string :optional t :description "Existing root for batch or relative patch headers. Omit when file_path is used.")
+         (:name "old_str" :type string :optional t :description "replace: nonempty unique text copied from Read. Otherwise omit or empty.")
+         (:name "new_str" :type string :optional t :description "replace: literal replacement; patch: unified diff. For batch omit or empty.")
+         (:name "operations" :type array :optional t
+          :description "batch: nonempty ordered operations. Other modes: omit or []."
+          :items (:type object :required ["operation"] :additionalProperties :json-false
+                  :properties
+                  (:operation (:type string :enum ["replace" "patch" "insert" "write" "delete"])
+                   :file_path (:type string :description "Relative file target under the batch root, no trailing slash or ../. Required except for a directory-root patch.")
+                   :root_directory (:type string :description "patch only: relative directory root, e.g. . for the batch root; omit file_path when used.")
+                   :old_str (:type string :description "replace: nonempty unique old text.")
+                   :new_str (:type string :description "replace/insert: new text; patch: unified diff.")
+                   :line_number (:type integer :minimum -1 :description "insert: line to insert after; 0=start, -1=end.")
+                   :content (:type string :description "write: complete file content; empty creates an empty file.")))))
+ :category "gptel-agent" :confirm t :include t)
 
 (gptel-make-tool
  :name "Insert"
- :description "Insert `new_str` after `line_number` in file at `path`.
-
-Use this tool for purely additive actions: adding text to a file at a \
-specific location with no changes to the surrounding context.
-With confirmation enabled, this updates the file's cumulative review and returns immediately. \
-By default changes are applied with restorable snapshots, so Bash can test them during review. \
-Address review feedback and rerun relevant tests. The result states whether changes are applied or only staged."
+ :description "Insert text after line_number in an existing text file. file_path is the complete
+filename, with no trailing slash; use Write for a new file. Read first to choose the line.
+Use PathInfo after a type error. This tool never creates directories as file targets.
+With confirmation enabled, updates cumulative review without waiting. Results state
+whether applied or staged; test on-disk changes and address review feedback."
  :function #'gptel-agent--insert-in-file
- :args '(( :name "path"
-           :description "Path of file to edit."
-           :type string)
-         ( :name "line_number"
-           :description "The line number at which to insert `new_str`, with
-- 0 to insert at the beginning, and
-- -1 to insert at the end."
-           :type integer)
-         ( :name "new_str"
-           :description "String to insert at `line_number`."
-           :type string))
- :category "gptel-agent"
- :confirm t
- :include t)
+ :args '((:name "file_path" :type string :description "Complete path of an existing file; no trailing slash.")
+         (:name "line_number" :type integer :minimum -1 :description "Insert after this line; 0=start, -1=end.")
+         (:name "new_str" :type string :description "Text to insert."))
+ :category "gptel-agent" :confirm t :include t)
 
 (gptel-make-tool
  :name "Write"
- :description "Create or overwrite a text file with complete content.
-With confirmation enabled, this updates the file's cumulative review and returns immediately. \
-By default changes are applied with restorable snapshots, so Bash can test them during review. \
-Address review feedback and rerun relevant tests. The result states whether changes are applied or only staged."
+ :description "Create or overwrite a text file with complete content. file_path includes the filename
+and must not end in /. Missing parent directories are created automatically; no Mkdir
+is needed. An existing directory at the file target is an error. Use PathInfo to inspect
+it and Rmdir only if it is an accidental empty directory. Read existing files first.
+Example: {\"file_path\":\"/project/src/Poulet.java\",\"content\":\"class Poulet {}\"}.
+With confirmation enabled, updates cumulative review without waiting. Results state
+whether applied or staged; test on-disk changes and address review feedback."
  :function #'gptel-agent--write-file
- :args (list '( :name "path"
-                :type "string"
-                :description "The directory where to create the file, \".\" is the current directory.")
-             '( :name "filename"
-                :type "string"
-                :description "The name of the file to create.")
-             '( :name "content"
-                :type "string"
-                :description "The content to write to the file"))
- :category "gptel-agent"
- :confirm t)
+ :args '((:name "file_path" :type string :description "Complete target file path, including filename; no trailing slash.")
+         (:name "content" :type string :description "Complete content; empty string creates an empty file."))
+ :category "gptel-agent" :confirm t :include t)
 
 (gptel-make-tool
  :name "Glob"
- :description "Recursively find files matching a provided glob pattern.
-
-- Supports glob patterns like \"*.md\" or \"*test*.py\".
-  The glob applies to the basename of the file (with extension).
-- Does not support double wildcard \"**/*\".
-- Hidden files and directories are included, except `.git` directories,
-  which are always omitted.
-- Returns matching file paths at all depths sorted by modification time.
-  Limit the depth of the search by providing the `depth` argument.
-- When you are doing an open ended search that may require multiple rounds
-  of globbing and grepping, use the \"Agent\" tool instead
-- You can call multiple tools in a single response.  It is always better to
-  speculatively perform multiple searches in parallel if they are potentially useful."
+ :description "Find entries recursively under root_directory using a case-insensitive basename glob
+such as *.java or * (no / or **). Every result is labelled file/directory/symlink.
+Default type=files; use type=all to inspect directories and hidden entries. Hidden entries
+are included except .git directories. Symlink directories are listed but never traversed.
+Results are sorted by modification time, newest first. depth=1 inspects immediate children.
+Results reflect disk contents; use Read for pending unapplied file review content."
  :function #'gptel-agent--glob
- :args '(( :name "pattern"
-           :type string
-           :description "Glob pattern to match, for example \"*.el\". Must not be empty.
-Use \"*\" to list all files in a directory.")
-         ( :name "path"
-           :type string
-           :description "Directory to search in.  Supports relative paths and defaults to \".\""
-           :optional t)
-         ( :name "depth"
-           :description "Limit directory depth of search, 1 or higher. Defaults to no limit."
-           :type integer
-           :optional t))
- :category "gptel-agent"
- :include t)
+ :args '((:name "pattern" :type string :description "Nonempty basename glob; * matches all names.")
+         (:name "root_directory" :type string :optional t :description "Existing search directory; defaults to .")
+         (:name "depth" :type integer :minimum 1 :optional t :description "Maximum depth; 1=immediate children. Omit for all depths.")
+         (:name "type" :type string :enum ["files" "directories" "all"] :optional t :description "Entry types to return; defaults to files."))
+ :category "gptel-agent" :include t)
 
 (gptel-make-tool
  :name "Read"
  :description (format "Read textual files' contents between specified line numbers `start_line` and `end_line`,
-with both ends included. Use only on human readable textual files
+with both ends included. Requires an existing human readable text file; file_path must not end in /.
+Use PathInfo to inspect a type error, Glob to list directories, or Write to create a missing file.
 
 Consider using the \"Grep\" tool to find the right range to read first.
 
@@ -4592,8 +4476,7 @@ When searching directories, optionally restrict the types of files in the search
            :description "File or directory to search in."
            :type string)
          ( :name "glob"
-           :description "Optional glob to restrict file types to search for.
-Only required when path is a directory.
+           :description "Optional basename glob to filter files when path is a directory.
 Examples: *.md, *.rs"
            :type string
            :optional t)

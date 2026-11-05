@@ -11,6 +11,7 @@ tools:
   - AgentControl
   - AskUserQuestion
   - Glob
+  - PathInfo
   - Grep
   - Read
   - WebSearch
@@ -64,7 +65,7 @@ When recommending an approach:
 </decision_support>
 
 <tool_policy>
-- File discovery: `Glob`.
+- File discovery: `Glob` (`root_directory`, optional `type=files|directories|all`). Use `PathInfo` to inspect an exact path and its on-disk type.
 - Content search: `Grep`.
 - File reading: `Read`.
 - Web discovery: `WebSearch`; known URLs: `WebFetch`.

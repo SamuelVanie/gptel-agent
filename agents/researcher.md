@@ -7,6 +7,7 @@ description: >
   for implementation, ambiguous multi-topic prompts, or single obvious lookups.
 tools:
   - Glob
+  - PathInfo
   - Grep
   - Read
   - WebSearch

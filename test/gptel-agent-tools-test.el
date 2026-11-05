@@ -93,8 +93,8 @@
 
 (ert-deftest gptel-agent-repetition-compares-every-search-parameter ()
   (dolist (case
-           '(("Glob" (:pattern "*.el" :path "." :depth 1)
-              (:pattern "*.EL") (:path "./") (:depth 5))
+           '(("Glob" (:pattern "*.el" :root_directory "." :depth 1)
+              (:pattern "*.EL") (:root_directory "./") (:depth 5))
              ("Grep" (:regex "alpha.*beta" :path "." :glob "*.el" :context_lines 0)
               (:regex "alpha.+beta") (:path "./") (:glob "*.EL") (:context_lines 5))
              ("Read" (:file_path "file.el" :start_line 1 :end_line 100)
@@ -126,7 +126,7 @@
       (dolist (depth '(1 2 3 4 5 6 nil))
         (should-not
          (gptel-agent--detect-repetition
-          (list :name "Glob" :args (append '(:pattern "*.el" :path ".")
+          (list :name "Glob" :args (append '(:pattern "*.el" :root_directory ".")
                                           (and depth (list :depth depth)))))))
       (should (zerop gptel-agent--tool-loop-violations)))))
 
@@ -136,9 +136,9 @@
     (let ((gptel-agent-max-tool-repetitions 2)
           (gptel-agent-max-similar-tool-calls nil))
       (should-not (gptel-agent--detect-repetition
-                   '(:name "Glob" :args (:pattern "*.el" :path "." :depth 5))))
+                   '(:name "Glob" :args (:pattern "*.el" :root_directory "." :depth 5))))
       (should (gptel-agent--detect-repetition
-               '(:name "Glob" :args (:depth 5 :path "." :pattern "*.el")))))))
+               '(:name "Glob" :args (:depth 5 :root_directory "." :pattern "*.el")))))))
 
 (ert-deftest gptel-agent-repetition-counts-exact-searches-across-history ()
   (with-temp-buffer

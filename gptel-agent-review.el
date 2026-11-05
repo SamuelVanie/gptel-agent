@@ -272,6 +272,7 @@ can inspect the new revision before accepting or restoring it."
 
 (defun gptel-agent-review-read (args &optional buffer)
   "Return a tool result for staged Read ARGS in BUFFER, or nil for disk reads."
+  (gptel-agent-path-resolve (plist-get args :file_path) 'file)
   (when-let* (((not (bound-and-true-p gptel-agent--result-file-scope)))
               (queue (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner buffer)))
               ((gptel-agent-review--queue-applied queue))

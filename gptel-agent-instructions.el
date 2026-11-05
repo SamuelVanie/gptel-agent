@@ -293,19 +293,21 @@ Used before every send and before saving a retained worker's conversation."
   (gptel-agent-instructions--initialize)
   ;; Check before the edit parser invokes file-directory-p/file-truename,
   ;; either of which can open a TRAMP connection for a remote path.
-  (dolist (key '(:path :file_path :parent :filename :name))
+  (dolist (key '(:path :file_path :root_directory :directory_path))
     (let ((path (plist-get args key)))
       (when (and (stringp path) (file-remote-p path))
         (error "Project instructions do not support remote targets: %s" path))))
-  (if (member name '("Glob" "Grep"))
-      (let ((path (or (plist-get args :path) ".")))
+  (if (member name '("Glob" "Grep" "PathInfo" "Mkdir" "Rmdir"))
+      (let ((path (pcase name
+                    ("Glob" (or (plist-get args :root_directory) "."))
+                    ((or "Mkdir" "Rmdir") (plist-get args :directory_path))
+                    (_ (plist-get args :path)))))
         (list (gptel-agent-instructions--directory
-               path (or (equal name "Glob") (file-directory-p path)))))
+               path (or (member name '("Glob" "Mkdir" "Rmdir")) (file-directory-p path)))))
     (delete-dups
      (mapcar #'gptel-agent-instructions--directory
              (pcase name
                ("Read" (list (plist-get args :file_path)))
-               ("Mkdir" (list (expand-file-name (plist-get args :name) (plist-get args :parent))))
                ((or "Edit" "Insert" "Write") (gptel-agent-edit-targets name args)))))))
 
 (defun gptel-agent-instructions--signature (records directory)
@@ -354,8 +356,8 @@ Used before every send and before saving a retained worker's conversation."
               (t (format "Loaded project instruction source %s (scope %s). Contents are supplied in the next scoped instruction block; inspect with gptel-agent-describe-project-instructions."
                          source dir)))))))
 
-(defconst gptel-agent-instructions--file-tools '("Read" "Glob" "Grep" "Edit" "Insert" "Write" "Mkdir"))
-(defconst gptel-agent-instructions--mutating-tools '("Edit" "Insert" "Write" "Mkdir"))
+(defconst gptel-agent-instructions--file-tools '("Read" "Glob" "Grep" "PathInfo" "Edit" "Insert" "Write" "Mkdir" "Rmdir"))
+(defconst gptel-agent-instructions--mutating-tools '("Edit" "Insert" "Write" "Mkdir" "Rmdir"))
 
 (defun gptel-agent-instructions--pre-tool (original fsm)
   "Discover all FSM targets and defer stale operations before ORIGINAL's hooks."
@@ -387,6 +389,8 @@ Used before every send and before saving a retained worker's conversation."
                                           (gptel-agent-instructions--read-ack (plist-get call :args)))
                                          ((member name gptel-agent-instructions--mutating-tools) steering)))))
                   (when result
+                    (when (assq call failures)
+                      (setf (plist-get call :error) t))
                     (gptel--process-tool-call
                      fsm (cl-find name (plist-get info :tools) :key #'gptel-tool-name :test #'equal)
                      call result)))))))

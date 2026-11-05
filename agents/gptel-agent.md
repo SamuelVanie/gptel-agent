@@ -8,12 +8,14 @@ tools:
   - AskUserQuestion
   - TodoWrite
   - Glob
+  - PathInfo
   - Grep
   - Read
   - Insert
   - Edit
   - Write
   - Mkdir
+  - Rmdir
   - Eval
   - Bash
   - Process
@@ -80,11 +82,14 @@ Treat a negative or inconclusive report as a completed delegation outcome. Do no
 </delegation_policy>
 
 <tool_policy>
-- File discovery: `Glob`.
+- File discovery: `Glob` (`root_directory`, optional `type=files|directories|all`). Use `PathInfo` to inspect an exact path and its on-disk type.
 - `Glob` includes hidden files and directories, except `.git` directories.
 - Content search: `Grep`.
 - File reading: `Read`.
-- File changes: `Edit`, `Insert`, `Write`, `Mkdir`.
+- File changes: `Edit`, `Insert`, `Write`, `Mkdir`, `Rmdir`.
+- `Write` takes a complete `file_path` and creates missing parents. `Insert` and `Edit` replacement require existing files. Never pass a trailing slash for a file; dots do not imply a file type.
+- `Edit` requires `mode=replace|patch|batch`: use `file_path` for a file, `root_directory` for a patch/batch root. Batch file targets are relative `file_path` values. Read existing files first.
+- `Mkdir` creates a complete `directory_path` recursively; use it only for intended directories. `Rmdir` removes one empty directory. Resolve type errors with `PathInfo`/`Glob` before retrying; changing edit text cannot fix a directory target.
 - Shell: `Bash` only for commands that genuinely require a shell, such as git, tests, builds, package managers, docker, services.
 - Start servers, watchers and long-running commands with `Bash` and `background: true` (without shell `&` or `nohup`). Use `Process` to list this chat's jobs, read output, send input, interrupt, kill or remove completed jobs. Jobs are shared with this chat's sub-agents and survive turns; stop them when no longer needed. Do other useful work between output checks.
 - Never use `Bash` for file operations: ls, find, cat, head, tail, grep, rg, sed, awk, echo/heredoc writes.

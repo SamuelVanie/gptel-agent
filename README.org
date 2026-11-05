@@ -116,7 +116,7 @@ or agent identity. The first outgoing request includes these instructions even
 with =Read= or all tools disabled. Discovery starts at the conversation's
 project root and follows the directory chain to its working directory. Without
 an Emacs project, the working directory is the boundary. File context and
-=Read=, =Glob=, =Grep=, =Edit=, =Insert=, =Write= and =Mkdir= targets discover deeper
+=Read=, =Glob=, =Grep=, =PathInfo=, =Edit=, =Insert=, =Write=, =Mkdir= and =Rmdir= targets discover deeper
 chains as needed; the project is never scanned recursively.
 
 For example, work on =frontend/view.ts= receives the root =AGENTS.md= followed
@@ -906,3 +906,35 @@ agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by
 the "arxiv" MCP server.
 
 #+html: </details>
+
+** File tool path contracts
+
+File tools use filesystem types, never filename extensions. A directory can be
+named =Poulet.java=; a file can have no extension. Use =PathInfo(path)= to inspect
+an exact on-disk target, or =Glob(pattern, root_directory, depth, type)= with
+=type=all= to list typed entries. Glob includes hidden entries, omits =.git=
+directories, and does not traverse directory symlinks.
+
+- =Write(file_path, content)= creates or overwrites a complete file, automatically
+  creating missing parent directories. File paths must not end in =/=.
+- =Insert(file_path, line_number, new_str)= adds text to an existing file.
+- =Edit= requires =mode=replace=, =mode=patch=, or =mode=batch=. Replacement uses
+  =file_path= and a nonempty =old_str=. A patch explicitly selects either
+  =file_path= for one existing file or =root_directory= for relative diff headers.
+  A batch uses =root_directory= and ordered =operations= with relative
+  =file_path= targets (or =root_directory= for a directory patch).
+- =Mkdir(directory_path)= creates a directory and all missing ancestors. It is
+  unnecessary before file creation with Write or Edit.
+- =Rmdir(directory_path)= removes exactly one empty directory, refusing symlinks,
+  nonempty directories, and the working directory or its ancestors.
+
+For example, create a Java file directly:
+#+begin_src json
+{"file_path":"/project/src/Poulet.java","content":"class Poulet {}"}
+#+end_src
+If that target already exists as an accidental directory, inspect it with
+PathInfo and Glob, use Rmdir only if it is empty, then Write the file.
+
+These contracts replace the former =path=/=filename= Write arguments,
+=parent=/=name= Mkdir arguments and inferred Edit modes. Reapply agent presets
+after loading the updated tools so sessions receive the new schemas.

@@ -38,7 +38,7 @@
                          gptel-context nil gptel-use-context nil
                          gptel-use-tools t gptel-confirm-tool-calls nil
                          gptel-pre-tool-call-functions nil gptel-post-tool-call-functions nil
-                         gptel-tools (mapcar #'gptel-get-tool '("Read" "Glob" "Grep" "Write" "Insert" "Edit" "Mkdir"))))
+                         gptel-tools (mapcar #'gptel-get-tool '("Read" "Glob" "Grep" "Write" "Insert" "Edit" "Mkdir" "Rmdir" "PathInfo"))))
            (cl-letf (((symbol-function 'project-current) (lambda (&rest _) (cons 'transient root)))
                      ((symbol-function 'gptel--update-status) #'ignore)
                      ((symbol-function 'gptel-curl-get-response)
@@ -182,7 +182,7 @@
         (setq gptel-confirm-tool-calls review)
         (setq gptel-pre-tool-call-functions '(smv/gptel-ediff-tool-call)))
       (setq fsm (gptel-agent-instructions-test--request parent))
-      (let ((args (list :path front :filename "new.txt" :content "first proposal")))
+      (let ((args (list :file_path (expand-file-name "new.txt" front)  :content "first proposal")))
         (gptel-agent-workers-test--tool fsm "Write" args)
         (should-not (file-exists-p (concat front "new.txt")))
         (should-not (buffer-local-value 'gptel-agent-review--queue parent))
@@ -203,10 +203,10 @@
       (setq gptel-confirm-tool-calls t gptel-pre-tool-call-functions '(smv/gptel-ediff-tool-call)))
     (setq fsm (gptel-agent-instructions-test--request parent))
     (gptel-agent-workers-test--tool
-     fsm "Edit" (list :path root :operations
-                      [(:operation "write" :path "old.txt" :content "new")
-                       (:operation "write" :path "frontend/new.txt" :content "front")
-                       (:operation "write" :path "backend/new.txt" :content "back")]))
+     fsm "Edit" (list :mode "batch" :root_directory root :operations
+                      [(:operation "write" :file_path "old.txt" :content "new")
+                       (:operation "write" :file_path "frontend/new.txt" :content "front")
+                       (:operation "write" :file_path "backend/new.txt" :content "back")]))
     (should (equal (with-temp-buffer (insert-file-contents (concat root "old.txt")) (buffer-string)) "old"))
     (should-not (file-exists-p (concat front "new.txt")))
     (should-not (buffer-local-value 'gptel-agent-review--queue parent))
@@ -218,7 +218,7 @@
   (gptel-agent-instructions-test--with-project
     (setq fsm (gptel-agent-instructions-test--request parent))
     (let ((old-snapshot (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
-          (args (list :path root :filename "new.txt" :content "new")))
+          (args (list :file_path (expand-file-name "new.txt" root)  :content "new")))
       (gptel-agent-instructions-test--write (concat root "AGENTS.md") "ROOT-CHANGED")
       (gptel-agent-workers-test--tool fsm "Write" args)
       (should-not (file-exists-p (concat root "new.txt")))
@@ -244,11 +244,11 @@
                           :key #'gptel-tool-name :test #'equal))
            (function (gptel-tool-function tool)))
       (gptel-agent-instructions-test--write (concat root "AGENTS.md") "APPROVAL-CHANGE")
-      (should (string-match-p "Deferred before staging" (funcall function root "new.txt" "new")))
+      (should (string-match-p "Deferred before staging" (funcall function (concat root "new.txt") "new")))
       (should-not (file-exists-p (concat root "new.txt")))
       (gptel--handle-wait fsm)
       (gptel--fsm-transition fsm 'ABRT)
-      (should (string-match-p "Cancelled" (funcall function root "new.txt" "new")))
+      (should (string-match-p "Cancelled" (funcall function (concat root "new.txt") "new")))
       (should-not (file-exists-p (concat root "new.txt"))))))
 
 (ert-deftest gptel-agent-instructions-path-policy-and-unavailable-sources ()
@@ -267,7 +267,7 @@
     (setq fsm (gptel-agent-instructions-test--request parent))
     (cl-letf (((symbol-function 'file-readable-p) (lambda (_path) nil))
               ((symbol-function 'display-warning) #'ignore))
-      (gptel-agent-workers-test--tool fsm "Write" (list :path root :filename "new.txt" :content "new")))
+      (gptel-agent-workers-test--tool fsm "Write" (list :file_path (expand-file-name "new.txt" root)  :content "new")))
     (should-not (file-exists-p (concat root "new.txt")))
     (should (string-match-p "UNAVAILABLE" (gptel-agent-instructions-test--payload fsm)))
     (should-not (string-match-p "ROOT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))))
@@ -414,14 +414,14 @@
   (gptel-agent-instructions-test--with-project
     (setq fsm (gptel-agent-instructions-test--request parent))
     (let* ((patch "--- /dev/null\n+++ b/frontend/new.txt\n@@ -0,0 +1 @@\n+new\n")
-           (args (list :path root :operations (vector (list :operation "patch" :path "." :new_str patch)))))
+           (args (list :mode "batch" :root_directory root :operations (vector (list :operation "patch" :root_directory "." :new_str patch)))))
       (gptel-agent-workers-test--tool fsm "Edit" args)
       (should-not (file-exists-p (concat front "new.txt")))
       (should (string-match-p "FRONT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm))))
-    (gptel-agent-workers-test--tool fsm "Mkdir" (list :parent back :name "new/deeper"))
+    (gptel-agent-workers-test--tool fsm "Mkdir" (list :directory_path (concat back "new/deeper")))
     (should-not (file-exists-p (concat back "new")))
     (should (string-match-p "BACK-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
-    (gptel-agent-workers-test--tool fsm "Mkdir" (list :parent back :name "new/deeper"))
+    (gptel-agent-workers-test--tool fsm "Mkdir" (list :directory_path (concat back "new/deeper")))
     (should (file-directory-p (concat back "new/deeper")))))
 
 (ert-deftest gptel-agent-instructions-rechecks-after-edit-preparation ()
@@ -432,7 +432,7 @@
                  (lambda (&rest args)
                    (prog1 (apply prepare args)
                      (gptel-agent-instructions-test--write (concat root "AGENTS.md") "CHANGED-DURING-PREPARE")))))
-        (gptel-agent-workers-test--tool fsm "Write" (list :path root :filename "new.txt" :content "new"))))
+        (gptel-agent-workers-test--tool fsm "Write" (list :file_path (expand-file-name "new.txt" root)  :content "new"))))
     (should-not (file-exists-p (concat root "new.txt")))
     (should (string-match-p "CHANGED-DURING-PREPARE" (gptel-agent-instructions-test--payload fsm)))))
 
@@ -472,7 +472,7 @@
                          (progn (setq remote-access t) (error "Remote access"))
                        (apply truename file args)))))
           (should-error (gptel-agent-instructions--tool-targets
-                         "Edit" '(:path "/ssh:example:/tmp/" :operations [(:operation "delete" :path "a")]))))
+                         "Edit" '(:mode "batch" :root_directory "/ssh:example:/tmp/" :operations [(:operation "delete" :file_path "a")]))))
         (should-not remote-access))
       (delete-file (concat root "AGENTS.md"))
       (make-symbolic-link (concat front "AGENTS.md") (concat root "AGENTS.md"))
@@ -506,12 +506,24 @@
 (ert-deftest gptel-agent-instructions-search-targets-discover-only-selected-chains ()
   (gptel-agent-instructions-test--with-project
     (setq fsm (gptel-agent-instructions-test--request parent))
-    (gptel-agent-workers-test--tool fsm "Glob" (list :path front :pattern "*.md"))
+    (gptel-agent-workers-test--tool fsm "Glob" (list :root_directory front :pattern "*.md"))
     (should (string-match-p "FRONT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
     (should-not (string-match-p "BACK-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
     (gptel-agent-workers-test--tool fsm "Grep" (list :path (concat root "old.txt") :regex "old"))
     (should-not (string-match-p "FRONT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
     (should (= 2 (length (buffer-local-value 'gptel-agent-instructions--registry parent))))))
+
+(ert-deftest gptel-agent-instructions-pathinfo-and-rmdir-respect-scopes ()
+  (gptel-agent-instructions-test--with-project
+    (make-directory (concat back "empty"))
+    (setq fsm (gptel-agent-instructions-test--request parent))
+    (gptel-agent-workers-test--tool fsm "PathInfo" (list :path (concat front "new.java")))
+    (should (string-match-p "FRONT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+    (gptel-agent-workers-test--tool fsm "Rmdir" (list :directory_path (concat back "empty")))
+    (should (file-directory-p (concat back "empty")))
+    (should (string-match-p "BACK-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+    (gptel-agent-workers-test--tool fsm "Rmdir" (list :directory_path (concat back "empty")))
+    (should-not (file-exists-p (concat back "empty")))))
 
 (provide 'gptel-agent-instructions-test)
 ;;; gptel-agent-instructions-test.el ends here

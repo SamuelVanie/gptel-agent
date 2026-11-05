@@ -43,7 +43,7 @@
 
 (ert-deftest gptel-review-updates-open-ediff-in-place ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
     (cl-letf (((symbol-function 'recursive-edit) (lambda () (ert-fail "Blocking review"))))
       (gptel-review-test--open 1))
     (let* ((view (gptel-agent-review--queue-view gptel-agent-review--queue))
@@ -51,7 +51,7 @@
            (original (smv/gptel-ediff--view-original view))
            (proposed (smv/gptel-ediff--view-proposed view))
            (window (selected-window)))
-      (gptel-review-test--submit "Insert" '(:path "one" :line_number -1 :new_str "tail\n"))
+      (gptel-review-test--submit "Insert" '(:file_path "one" :line_number -1 :new_str "tail\n"))
       (should (eq window (selected-window)))
       (should (eq control (smv/gptel-ediff--view-control view)))
       (should (eq proposed (smv/gptel-ediff--view-proposed view)))
@@ -60,7 +60,7 @@
       (should (= 2 (smv/gptel-ediff--view-revision view)))
       (should (= 1 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
       (should (> (buffer-local-value 'ediff-number-of-differences control) 0))
-      (gptel-review-test--submit "Write" '(:path "." :filename "two" :content "two"))
+      (gptel-review-test--submit "Write" '(:file_path "two"  :content "two"))
       (should (eq view (gptel-agent-review--queue-view gptel-agent-review--queue)))
       (gptel-review-test--in-queue (should (= 2 (length tabulated-list-entries))))
       (gptel-edit-test--key "q")
@@ -68,7 +68,7 @@
       (should-not (buffer-live-p original))
       (should-not (buffer-live-p proposed)))
     (should (eq (plist-get (gptel-review-test--file 1) :status) 'accepted))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "tail" :new_str "TAIL"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "tail" :new_str "TAIL"))
     (should (eq (plist-get (gptel-review-test--file 1) :status) 'pending))
     (should (= 3 (plist-get (gptel-review-test--file 1) :revision)))
     (should (equal (gptel-edit-test--read "one") "old\n"))
@@ -80,7 +80,7 @@
 
 (ert-deftest gptel-review-comments-send-immediately-with-displayed-context ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
     (gptel-review-test--open 1)
     (let ((owner (current-buffer))
           (proposed (buffer-local-value 'ediff-buffer-B (gptel-edit-test--control))))
@@ -88,7 +88,7 @@
                  (lambda (&rest _)
                    ;; A tool finishes while the reviewer types in the minibuffer.
                    (with-current-buffer owner
-                     (gptel-review-test--submit "Insert" '(:path "one" :line_number -1 :new_str "tail")))
+                     (gptel-review-test--submit "Insert" '(:file_path "one" :line_number -1 :new_str "tail")))
                    "Keep this behavior")))
         (with-current-buffer proposed
           (goto-char (point-min))
@@ -100,7 +100,7 @@
     (should (eq (plist-get (gptel-review-test--file 1) :status) 'feedback))
     (should (equal (plist-get (gptel-review-test--submit "Read" '(:file_path "one")) :result) "new\ntail"))
     (should-error (gptel-edit-test--key "q") :type 'user-error)
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "new" :new_str "revised"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "new" :new_str "revised"))
     (should (eq (plist-get (gptel-review-test--file 1) :status) 'pending))
     (gptel-edit-test--key "q")
     (gptel-review-test--in-queue (gptel-agent-review-done))
@@ -108,10 +108,10 @@
 
 (ert-deftest gptel-review-refusal-discards-file-and-allows-fresh-revision ()
   (gptel-review-test--with-files '(("one" . "old\n") ("two" . "two\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
-    (gptel-review-test--submit "Edit" '(:path "." :operations
-                                              [(:operation "insert" :path "one" :line_number -1 :new_str "tail")
-                                               (:operation "replace" :path "two" :old_str "two" :new_str "TWO")]))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
+    (gptel-review-test--submit "Edit" '(:mode "batch" :root_directory "." :operations
+                                              [(:operation "insert" :file_path "one" :line_number -1 :new_str "tail")
+                                               (:operation "replace" :file_path "two" :old_str "two" :new_str "TWO")]))
     (gptel-review-test--open 1)
     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "Preserve the old behavior")))
       (gptel-edit-test--key "R"))
@@ -121,7 +121,7 @@
     (should (eq (plist-get (gptel-review-test--file 2) :status) 'pending))
     (should (equal (plist-get (gptel-review-test--submit "Read" '(:file_path "one")) :result) "old\n"))
     (with-temp-file "one" (insert "user version\n"))
-    (gptel-review-test--submit "Insert" '(:path "one" :line_number -1 :new_str "safe addition"))
+    (gptel-review-test--submit "Insert" '(:file_path "one" :line_number -1 :new_str "safe addition"))
     (let ((view (gptel-agent-review--queue-view gptel-agent-review--queue)))
       (should (= 3 (smv/gptel-ediff--view-revision view)))
       (should (equal (smv/gptel-ediff--view-before view) "user version\n"))
@@ -133,7 +133,7 @@
 
 (ert-deftest gptel-review-navigation-preserves-hunks-and-requires-every-file ()
   (gptel-review-test--with-files '(("one" . "first\na\nb\nc\nlast\n") ("sub/two" . "second\n"))
-    (gptel-review-test--submit "Edit" (list :path directory :diff t :new_str gptel-edit-test--multi-diff))
+    (gptel-review-test--submit "Edit" (list :mode "patch" :root_directory directory  :new_str gptel-edit-test--multi-diff))
     (gptel-review-test--open 1)
     (with-current-buffer (gptel-edit-test--control)
       (should (= 2 ediff-number-of-differences))
@@ -155,10 +155,10 @@
 (ert-deftest gptel-review-whitespace-differences-stay-visible-on-refresh ()
   (gptel-review-test--with-files '(("one" . "text\n"))
     (let ((ediff-diff-options "-w"))
-      (gptel-review-test--submit "Edit" '(:path "one" :old_str "text" :new_str "text "))
+      (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "text" :new_str "text "))
       (gptel-review-test--open 1)
       (should (= 1 (buffer-local-value 'ediff-number-of-differences (gptel-edit-test--control))))
-      (gptel-review-test--submit "Edit" '(:path "one" :old_str "text " :new_str "text  "))
+      (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "text " :new_str "text  "))
       (should (= 1 (buffer-local-value 'ediff-number-of-differences (gptel-edit-test--control))))
       (should (equal ediff-diff-options "-w"))
       (gptel-edit-test--key "Q"))))
@@ -166,7 +166,7 @@
 (ert-deftest gptel-review-hidden-or-modified-ediff-never-applies ()
   (gptel-review-test--with-files '(("one" . "old\n"))
     (let ((registry (copy-sequence ediff-session-registry)))
-      (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
+      (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
       (gptel-review-test--open 1)
       (gptel-edit-test--key "Q")
       (should (equal ediff-session-registry registry))
@@ -182,7 +182,7 @@
 
 (ert-deftest gptel-review-mixed-batch-real-ediff-visits-all-files ()
   (gptel-review-test--with-files '(("one" . "old\ntail\n") ("overwrite" . "original\n") ("obsolete" . ""))
-    (gptel-review-test--submit "Edit" (list :path "." :operations gptel-edit-test--mixed-operations))
+    (gptel-review-test--submit "Edit" (list :mode "batch" :root_directory "." :operations gptel-edit-test--mixed-operations))
     (should (= 5 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
     (dotimes (index 5)
       (gptel-review-test--open (1+ index))
@@ -195,9 +195,9 @@
 
 (ert-deftest gptel-review-cancel-all-from-ediff-closes-the-queue ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Write" '(:path "." :filename "new" :content "created"))
+    (gptel-review-test--submit "Write" '(:file_path "new"  :content "created"))
     (gptel-review-test--in-queue (gptel-agent-review-accept-all))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
     (gptel-review-test--open 2)
     (let ((control (gptel-edit-test--control)))
       (gptel-edit-test--key "C")
@@ -210,17 +210,17 @@
 
 (ert-deftest gptel-review-create-edit-delete-and-recreate-share-one-file ()
   (gptel-review-test--with-files nil
-    (gptel-review-test--submit "Write" '(:path "." :filename "new" :content "draft"))
+    (gptel-review-test--submit "Write" '(:file_path "new"  :content "draft"))
     (gptel-review-test--open 1)
-    (gptel-review-test--submit "Edit" '(:path "new" :old_str "draft" :new_str "final"))
-    (gptel-review-test--submit "Edit" '(:path "." :operations [(:operation "delete" :path "new")]))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "new" :old_str "draft" :new_str "final"))
+    (gptel-review-test--submit "Edit" '(:mode "batch" :root_directory "." :operations [(:operation "delete" :file_path "new")]))
     (let ((file (gptel-review-test--file 1)))
       (should (= 3 (plist-get file :revision)))
       (should (eq (plist-get file :status) 'unchanged))
       (should-not (plist-get file :before))
       (should-not (plist-get file :after))
       (should (= 0 (buffer-local-value 'ediff-number-of-differences (gptel-edit-test--control)))))
-    (gptel-review-test--submit "Write" '(:path "." :filename "new" :content "recreated"))
+    (gptel-review-test--submit "Write" '(:file_path "new"  :content "recreated"))
     (should (= 1 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
     (should (= 4 (plist-get (gptel-review-test--file 1) :revision)))
     (gptel-edit-test--key "q")
@@ -229,16 +229,16 @@
 
 (ert-deftest gptel-review-refresh-drains-revisions-arriving-during-diff ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "first"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "first"))
     (gptel-review-test--open 1)
     (let ((owner (current-buffer)) (update (symbol-function 'ediff-update-diffs)) (calls 0))
       (cl-letf (((symbol-function 'ediff-update-diffs)
                  (lambda ()
                    (when (= (cl-incf calls) 1)
                      (with-current-buffer owner
-                       (gptel-review-test--submit "Insert" '(:path "one" :line_number -1 :new_str "third"))))
+                       (gptel-review-test--submit "Insert" '(:file_path "one" :line_number -1 :new_str "third"))))
                    (funcall update))))
-        (gptel-review-test--submit "Edit" '(:path "one" :old_str "first" :new_str "second")))
+        (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "first" :new_str "second")))
       (should (= 2 calls)))
     (let ((view (gptel-agent-review--queue-view gptel-agent-review--queue)))
       (should (= 3 (smv/gptel-ediff--view-revision view)))
@@ -255,7 +255,7 @@
           (progn
             (with-current-buffer child
               (setq-local gptel-agent--supervised-run run)
-              (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new")))
+              (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new")))
             (gptel-agent-review--comment gptel-agent-review--queue (gptel-review-test--file 1) "Keep compatibility")
             (should (= 1 (length outcomes)))
             (should (eq (caar outcomes) owner))
@@ -275,7 +275,7 @@
 (ert-deftest gptel-review-in-flight-preparation-cannot-overwrite-newer-review-state ()
   (dolist (decision '(revise refuse close))
     (gptel-review-test--with-files '(("one" . "old\n") ("two" . "two\n"))
-      (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "staged"))
+      (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "staged"))
       (let ((prepare (symbol-function 'gptel-agent-edit-prepare)) interrupted)
         (cl-letf (((symbol-function 'gptel-agent-edit-prepare)
                    (lambda (name args)
@@ -283,10 +283,10 @@
                        (unless interrupted
                          (setq interrupted t)
                          (pcase decision
-                           ('revise (gptel-review-test--submit "Write" '(:path "." :filename "one" :content "newer")))
+                           ('revise (gptel-review-test--submit "Write" '(:file_path "one"  :content "newer")))
                            ('refuse (gptel-agent-review--cancel gptel-agent-review--queue (gptel-review-test--file 1) "Rejected"))
                            ('close (gptel-review-test--in-queue (gptel-agent-review-cancel-all)))))))))
-          (let ((call (gptel-review-test--submit "Write" '(:path "." :filename "one" :content "outdated"))))
+          (let ((call (gptel-review-test--submit "Write" '(:file_path "one"  :content "outdated"))))
             (should (plist-get call :error))
             (should (string-match-p "review changed\\|Review changed" (plist-get call :result))))))
       (if (eq decision 'close)
@@ -333,12 +333,12 @@
     (cl-letf (((symbol-function 'recursive-edit) (lambda () (ert-fail "Tool blocked on review"))))
       (dolist (confirm '(t auto))
         (let ((call (gptel-review-test--submit
-                     "Insert" '(:path "one" :line_number 0 :new_str "first") confirm)))
+                     "Insert" '(:file_path "one" :line_number 0 :new_str "first") confirm)))
           (should-not (plist-get call :error))
           (should (string-match-p "NOT applied" (plist-get call :result)))))
-      (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
-      (gptel-review-test--submit "Write" '(:path "." :filename "created" :content "draft\n"))
-      (gptel-review-test--submit "Edit" '(:path "created" :old_str "draft" :new_str "final")))
+      (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
+      (gptel-review-test--submit "Write" '(:file_path "created"  :content "draft\n"))
+      (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "created" :old_str "draft" :new_str "final")))
     (should (= 2 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
     (should (equal (gptel-edit-test--read "one") "old\n"))
     (should-not (file-exists-p "created"))
@@ -357,9 +357,9 @@
 
 (ert-deftest gptel-review-cancel-all-discards-accepted-and-pending-proposals ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
     (gptel-review-test--in-queue (gptel-agent-review-accept-all))
-    (gptel-review-test--submit "Write" '(:path "." :filename "new" :content "created"))
+    (gptel-review-test--submit "Write" '(:file_path "new"  :content "created"))
     (gptel-review-test--in-queue (gptel-agent-review-cancel-all))
     (should (equal (gptel-edit-test--read "one") "old\n"))
     (should-not (file-exists-p "new"))
@@ -368,11 +368,11 @@
 
 (ert-deftest gptel-review-failed-batch-keeps-earlier-proposals-intact ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "staged"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "staged"))
     (let ((call (gptel-review-test--submit
-                 "Edit" '(:path "." :operations
-                                [(:operation "replace" :path "one" :old_str "staged" :new_str "bad")
-                                 (:operation "replace" :path "missing" :old_str "x" :new_str "y")]))))
+                 "Edit" '(:mode "batch" :root_directory "." :operations
+                                [(:operation "replace" :file_path "one" :old_str "staged" :new_str "bad")
+                                 (:operation "replace" :file_path "missing" :old_str "x" :new_str "y")]))))
       (should (plist-get call :error)))
     (should (= 1 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
     (should (equal (plist-get (gptel-review-test--submit "Read" '(:file_path "one")) :result) "staged\n"))
@@ -381,14 +381,14 @@
 
 (ert-deftest gptel-review-batch-and-patch-build-on-earlier-proposals ()
   (gptel-review-test--with-files '(("one" . "  first\n  last  \n"))
-    (gptel-review-test--submit "Write" '(:path "." :filename "created" :content "draft\n"))
+    (gptel-review-test--submit "Write" '(:file_path "created"  :content "draft\n"))
     (gptel-review-test--submit
-     "Edit" '(:path "." :operations
-                    [(:operation "replace" :path "one" :old_str "first\nlast\n" :new_str "new\nlast\n")
-                     (:operation "patch" :path "created" :new_str "--- created\n+++ created\n@@ -1 +1 @@\n-draft\n+final\n")
-                     (:operation "write" :path "empty" :content "")]))
+     "Edit" '(:mode "batch" :root_directory "." :operations
+                    [(:operation "replace" :file_path "one" :old_str "first\nlast\n" :new_str "new\nlast\n")
+                     (:operation "patch" :file_path "created" :new_str "--- created\n+++ created\n@@ -1 +1 @@\n-draft\n+final\n")
+                     (:operation "write" :file_path "empty" :content "")]))
     (gptel-review-test--submit
-     "Edit" '(:path "created" :new_str "--- created\n+++ created\n@@ -1 +1 @@\n-final\n+FINAL\n"))
+     "Edit" '(:mode "patch" :file_path "created" :new_str "--- created\n+++ created\n@@ -1 +1 @@\n-final\n+FINAL\n"))
     (gptel-review-test--in-queue (gptel-agent-review-accept-all) (gptel-agent-review-done))
     (should (equal (gptel-edit-test--read "one") "  new\n  last\n"))
     (should (equal (gptel-edit-test--read "created") "FINAL\n"))
@@ -401,17 +401,17 @@
         (should-not
          (plist-get
           (gptel-review-test--submit
-           "Edit" '(:path "." :old_str "" :new_str "" :diff :json-false
+           "Edit" '(:mode "batch" :root_directory "." :old_str "" :new_str ""
                           :operations
-                          [(:operation "replace" :path "one" :old_str "old" :new_str "first"
+                          [(:operation "replace" :file_path "one" :old_str "old" :new_str "first"
                                        :line_number 0 :content "")
-                           (:operation "replace" :path "two" :old_str "old" :new_str "second"
+                           (:operation "replace" :file_path "two" :old_str "old" :new_str "second"
                                        :line_number 0 :content "")]))
           :error))
         (should-not
          (plist-get
           (gptel-review-test--submit
-           "Edit" '(:path "one" :old_str "first" :new_str "final" :diff :json-false :operations []))
+           "Edit" '(:mode "replace" :file_path "one" :old_str "first" :new_str "final"  :operations []))
           :error))
         (should (= 2 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
         (should (equal (gptel-edit-test--read "one") (if immediate "final\n" "old\n")))
@@ -426,10 +426,10 @@
 (ert-deftest gptel-review-staged-read-ranges-deletions-and-symlinks ()
   (gptel-review-test--with-files '(("one" . "old\n"))
     (make-symbolic-link "one" "alias")
-    (gptel-review-test--submit "Write" '(:path "." :filename "alias" :content "first\nsecond\nlast\n"))
+    (gptel-review-test--submit "Write" '(:file_path "alias"  :content "first\nsecond\nlast\n"))
     (should (equal (plist-get (gptel-review-test--submit "Read" '(:file_path "one" :start_line 2 :end_line 2)) :result)
                    "second\n"))
-    (gptel-review-test--submit "Edit" '(:path "." :operations [(:operation "delete" :path "one")]))
+    (gptel-review-test--submit "Edit" '(:mode "batch" :root_directory "." :operations [(:operation "delete" :file_path "one")]))
     (should (plist-get (gptel-review-test--submit "Read" '(:file_path "alias")) :error))
     (gptel-review-test--in-queue (gptel-agent-review-cancel-all))
     (should (file-symlink-p "alias"))
@@ -437,9 +437,9 @@
 
 (ert-deftest gptel-review-stale-and-unsaved-files-keep-whole-queue ()
   (gptel-review-test--with-files '(("one" . "old\n") ("two" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "." :operations
-                                              [(:operation "replace" :path "one" :old_str "old" :new_str "new")
-                                               (:operation "replace" :path "two" :old_str "old" :new_str "new")]))
+    (gptel-review-test--submit "Edit" '(:mode "batch" :root_directory "." :operations
+                                              [(:operation "replace" :file_path "one" :old_str "old" :new_str "new")
+                                               (:operation "replace" :file_path "two" :old_str "old" :new_str "new")]))
     (gptel-review-test--in-queue (gptel-agent-review-accept-all))
     (let ((buffer (find-file-noselect "two")))
       (with-current-buffer buffer (insert "unsaved"))
@@ -458,14 +458,14 @@
     (let ((parent (current-buffer)) (child (generate-new-buffer " *review-child*")))
       (unwind-protect
           (progn
-            (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "parent"))
+            (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "parent"))
             (with-current-buffer child
               (setq-local gptel-agent--supervised-run
                           (gptel-agent--make-run :parent-buffer parent :tool-calls 0 :web-tool-calls 0))
-              (gptel-review-test--submit "Insert" '(:path "one" :line_number -1 :new_str "child")))
+              (gptel-review-test--submit "Insert" '(:file_path "one" :line_number -1 :new_str "child")))
             (kill-buffer child)
             (with-temp-buffer
-              (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "other"))
+              (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "other"))
               (should (= 1 (length (gptel-agent-review--queue-files gptel-agent-review--queue)))))
             (should (= 1 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
             (gptel-review-test--in-queue (gptel-agent-review-accept-all) (gptel-agent-review-done))
@@ -474,7 +474,7 @@
 
 (ert-deftest gptel-review-hiding-or-killing-list-does-not-discard-proposals ()
   (gptel-review-test--with-files nil
-    (gptel-review-test--submit "Write" '(:path "." :filename "new" :content "created"))
+    (gptel-review-test--submit "Write" '(:file_path "new"  :content "created"))
     (kill-buffer (gptel-agent-review--queue-buffer gptel-agent-review--queue))
     (gptel-agent-review--refresh gptel-agent-review--queue)
     (gptel-review-test--in-queue
@@ -541,8 +541,8 @@
 (ert-deftest gptel-review-dispatch-multiple-tools-in-one-response ()
   (gptel-review-test--with-files nil
     (let* ((gptel-confirm-tool-calls t)
-           (calls '((:name "Write" :args (:path "." :filename "new" :content "draft\n"))
-                    (:name "Edit" :args (:path "new" :old_str "draft" :new_str "final"))
+           (calls '((:name "Write" :args (:file_path "new"  :content "draft\n"))
+                    (:name "Edit" :args (:mode "replace" :file_path "new" :old_str "draft" :new_str "final"))
                     (:name "Read" :args (:file_path "new"))))
            (info (list :backend t :buffer (current-buffer) :tools (mapcar #'gptel-get-tool '("Write" "Edit" "Read"))
                        :tool-use (copy-tree calls)
@@ -560,18 +560,18 @@
 
 (ert-deftest gptel-review-confirmation-toggle-does-not-bypass-queue ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
-    (gptel-edit-test--dispatch "Insert" '(:path "one" :line_number -1 :new_str "tail") nil)
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
+    (gptel-edit-test--dispatch "Insert" '(:file_path "one" :line_number -1 :new_str "tail") nil)
     (should (= 1 (length (gptel-agent-review--queue-files gptel-agent-review--queue))))
     (should (equal (gptel-edit-test--read "one") "old\n"))
     (gptel-review-test--in-queue (gptel-agent-review-cancel-all))
-    (gptel-review-test--submit "Write" '(:path "." :filename "new" :content "created"))
+    (gptel-review-test--submit "Write" '(:file_path "new"  :content "created"))
     (should (= 2 (plist-get (car (gptel-agent-review--queue-files gptel-agent-review--queue)) :id)))))
 
 (ert-deftest gptel-review-commit-write-failure-rolls-back-and-keeps-decisions ()
   (gptel-review-test--with-files '(("one" . "old\n") ("two" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
-    (gptel-review-test--submit "Edit" '(:path "two" :old_str "old" :new_str "fail"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "two" :old_str "old" :new_str "fail"))
     (let ((write (symbol-function 'gptel-agent-edit--write)))
       (cl-letf (((symbol-function 'gptel-agent-edit--write)
                  (lambda (change content)
@@ -594,7 +594,7 @@
       (unwind-protect
           (progn
             (with-current-buffer owner
-              (gptel-review-test--submit "Write" '(:path "." :filename "new" :content "created"))
+              (gptel-review-test--submit "Write" '(:file_path "new"  :content "created"))
               (setq queue-buffer (gptel-agent-review--queue-buffer gptel-agent-review--queue))
               (setq gptel-agent-review--delivery-timer (run-at-time 100 nil #'ignore)
                     timer gptel-agent-review--delivery-timer))
@@ -619,7 +619,7 @@
 
 (ert-deftest gptel-review-staged-reads-do-not-bypass-result-explorer-scope ()
   (gptel-review-test--with-files '(("one" . "old\n"))
-    (gptel-review-test--submit "Edit" '(:path "one" :old_str "old" :new_str "new"))
+    (gptel-review-test--submit "Edit" '(:mode "replace" :file_path "one" :old_str "old" :new_str "new"))
     (let ((gptel-agent--result-file-scope "/scoped/result"))
       (should-not (gptel-agent-review-read '(:file_path "one"))))))
 

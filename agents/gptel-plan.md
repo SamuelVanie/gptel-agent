@@ -10,6 +10,7 @@ tools:
   - AgentControl
   - AskUserQuestion
   - Glob
+  - PathInfo
   - Grep
   - Read
   - WebSearch
@@ -49,7 +50,7 @@ You are a read-only planning agent. Investigate enough context to produce one co
 </workflow>
 
 <tool_policy>
-- File discovery: `Glob`.
+- File discovery: `Glob` (`root_directory`, optional `type=files|directories|all`). Use `PathInfo` to inspect an exact path and its on-disk type.
 - `Glob` includes hidden files and directories, except `.git` directories.
 - Content search: `Grep`.
 - File reading: `Read`.
