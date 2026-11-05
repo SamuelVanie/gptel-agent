@@ -15,7 +15,7 @@
           (parent-fsm (gptel-make-fsm))
           (snapshot '(("researcher" :description "Research" :system "Original system"
                        :task-timeout 60 :max-request-rounds 4)
-                      ("executor" :description "Executes work" :system "Execute")))
+                      ("test-worker" :description "Executes work" :system "Execute")))
           (gptel-agent--runs (make-hash-table :test #'equal))
           (gptel-agent--run-history nil)
           requests received
@@ -147,7 +147,7 @@
                              :key #'gptel-tool-name :test #'equal)) captured)
           (cl-letf (((symbol-function 'gptel-agent--task)
                      (lambda (&rest args) (setq captured args))))
-            (funcall (gptel-tool-function tool) #'ignore "executor" "Nested" "Task"))
+            (funcall (gptel-tool-function tool) #'ignore "test-worker" "Nested" "Task"))
           (should (eq (nth 4 captured) next)))
         ;; Old callbacks cannot write into or finish the new invocation.
         (funcall (plist-get info :callback) "LATE OLD RESPONSE" info)
@@ -178,7 +178,7 @@
       (should (= (length requests) 1))
       (gptel-agent-followup-test--finish fsm "Done")
       (dolist (args (list (list "unknown-id" "researcher" parent-fsm)
-                          (list id "executor" parent-fsm)
+                          (list id "test-worker" parent-fsm)
                           (list id "researcher"
                                 (gptel-make-fsm :info (list :buffer (current-buffer))))))
         (gptel-agent--task deliver (nth 1 args) "Invalid" "Follow up"
@@ -250,7 +250,7 @@
           (pcase i
             (0
              (gptel-agent-followup-test--finish fsm "Done")
-             (gptel-agent--task deliver "executor" "Nested" "Investigate"
+             (gptel-agent--task deliver "test-worker" "Nested" "Investigate"
                                 (gptel-make-fsm
                                  :info (list :buffer (car children) :position 1))
                                 snapshot)

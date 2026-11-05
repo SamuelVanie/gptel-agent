@@ -206,11 +206,10 @@
     (dolist (action '("list" "read" "interrupt" "kill" "remove"))
       (should-not (funcall (gptel-tool-confirm tool) action)))
     (should (funcall (gptel-tool-confirm tool) "send")))
-  (dolist (name '("gptel-agent" "executor"))
-    (let* ((file (expand-file-name
-                  (format "agents/%s.md" name)
-                  (file-name-directory (locate-library "gptel-agent"))))
-           (tools (plist-get (gptel-agent-parse-markdown-frontmatter file nil nil t) :tools)))
-      (should (member "Process" tools)))))
+  (let* ((file (expand-file-name
+                "agents/gptel-agent.md"
+                (file-name-directory (locate-library "gptel-agent"))))
+         (tools (plist-get (gptel-agent-parse-markdown-frontmatter file nil nil t) :tools)))
+    (should (member "Process" tools))))
 
 ;;; gptel-agent-process-test.el ends here

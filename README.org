@@ -510,7 +510,7 @@ output when connected to a pipe. Remote process support depends on the Emacs
 file handler. Sending input follows normal tool confirmation; reading,
 listing and stopping owned jobs need no tool-specific confirmation.
 
-The default agent and executor include =Process=. Custom agents using
+The default agent includes =Process=. Custom agents using
 background Bash should add =Process= to their tools as well.
 
 *** What is an "agent"?
@@ -670,8 +670,6 @@ Markdown or Org files in a directory.  To see how to specify agents, examine the
 of agents to =gptel-agent-dirs=, which see.
 
 The following sub-agents are bundled:
-- =executor= is a copy of the main LLM, directed to work autonomously and
-  noninteractively, returning a final response.
 - =researcher= is read-only and can search the web or through local files for
   information.
 - =introspector= can examine the state of Emacs, and access or search
@@ -679,10 +677,9 @@ The following sub-agents are bundled:
 - =result-explorer= extracts evidence from oversized saved tool results.
 
 Each parent's definition controls its sub-agents through an =agents= list.
-The default =gptel-agent= offers =executor=, =researcher= and
-=result-explorer=.  The read-only =gptel-plan= and =ask= definitions offer
-=researcher= and =result-explorer=.  The =executor= definition also lists
-=introspector=, subject to its parent's allowed list.
+The default =gptel-agent= and the read-only =gptel-plan= and =ask= definitions
+offer =researcher= and =result-explorer=.  The default agent handles
+implementation and verification directly.
 Worker availability has no package-level exclusion list.
 The interactive =gptel-agent=, =gptel-plan= and
 =ask= presets are main agents, never sub-agents; an agent also cannot delegate
@@ -776,8 +773,8 @@ tools and request parameters.  Tasks are unlimited by default.  Add
 =task-timeout= and/or =max-request-rounds= to an agent's frontmatter or Org
 properties to bound that agent; =nil= or =false= explicitly means unlimited.
 The built-in researcher uses a 3600 second timeout and 100 model request rounds;
-the result explorer uses 1800 seconds and 60 rounds.  The executor and
-introspector are unlimited.  The global fallback options are
+the result explorer uses 1800 seconds and 60 rounds.  The introspector is
+unlimited.  The global fallback options are
 =gptel-agent-task-timeout= and =gptel-agent-max-request-rounds=; an omitted
 per-agent value inherits its global fallback, and both fallbacks default to nil.
 Transient transport retries remain bounded by
@@ -868,13 +865,13 @@ search for and gather information efficiently.
 to inherit the global defaults, which are unlimited.
 
 For an agent with the =Agent= tool, =agents= lists the sub-agent names it may
-call, for example =agents: [executor, researcher]=.  An empty list
+call, for example =agents: [researcher, result-explorer]=.  An empty list
 (=agents: []=) disables delegation.  Omitting the field allows all discovered
 sub-agents except the caller itself; main presets are always excluded.
 A delegated agent may further restrict its
 selection through its own definition; it cannot expand the inherited list.
 In Org definitions, use a space-separated property such as
-=:agents: executor researcher=, or an empty =:agents:= property for none.
+=:agents: researcher result-explorer=, or an empty =:agents:= property for none.
 
 You can specify any other keys that gptel recognizes as preset keys, including a
 specific model, backend and API parameters.  See =gptel-make-preset= for

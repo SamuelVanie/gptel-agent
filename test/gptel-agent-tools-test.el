@@ -297,7 +297,7 @@
 
 (ert-deftest gptel-agent-built-in-prompts-report-impossible-outcomes ()
   (let ((case-fold-search t))
-    (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"
+    (dolist (name '("gptel-agent" "gptel-plan" "ask"
                     "researcher" "introspector"))
       (let ((prompt (gptel-agent-test--agent-prompt name)))
         (should (string-match-p
@@ -307,7 +307,7 @@
         (should (string-match-p "confidence" prompt))))))
 
 (ert-deftest gptel-agent-built-in-prompts-have-balanced-policy-tags ()
-  (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"
+  (dolist (name '("gptel-agent" "gptel-plan" "ask"
                   "researcher" "introspector" "result-explorer"))
     (with-temp-buffer
       (insert (gptel-agent-test--agent-prompt name))
@@ -334,7 +334,7 @@
       (should (string-match-p requirement prompt)))))
 
 (ert-deftest gptel-agent-all-delegating-prompts-accept-inconclusive-reports ()
-  (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"))
+  (dolist (name '("gptel-agent" "gptel-plan" "ask"))
     (should (string-match-p
              "completed delegation outcome"
              (gptel-agent-test--agent-prompt name)))))
@@ -797,14 +797,11 @@
 
 (ert-deftest gptel-agent-built-in-supervision-policy-is-role-specific ()
   (let ((researcher (gptel-agent-test--agent-prompt "researcher"))
-        (executor (gptel-agent-test--agent-prompt "executor"))
         (introspector (gptel-agent-test--agent-prompt "introspector")))
     (should-not gptel-agent-task-timeout)
     (should-not gptel-agent-max-request-rounds)
     (should (string-match-p "task-timeout: 3600" researcher))
     (should (string-match-p "max-request-rounds: 100" researcher))
-    (should-not (string-match-p "task-timeout:" executor))
-    (should-not (string-match-p "max-request-rounds:" executor))
     (should-not (string-match-p "task-timeout:" introspector))
     (should-not (string-match-p "max-request-rounds:" introspector))))
 
@@ -826,16 +823,13 @@
                     (lambda (name)
                       (gptel-agent-read-file
                        (expand-file-name (format "agents/%s.md" name) directory)))
-                    '("gptel-agent" "gptel-plan" "ask" "executor" "introspector"
+                    '("gptel-agent" "gptel-plan" "ask" "introspector"
                       "researcher" "result-explorer"))))
-    (dolist (name '("gptel-agent" "gptel-plan" "ask" "executor"))
+    (dolist (name '("gptel-agent" "gptel-plan" "ask"))
       (with-temp-buffer
         (setq-local gptel-agent--current-agent name
                     gptel-agent--registry-snapshot registry)
-        (let* ((expected (pcase name
-                           ("gptel-agent" '("executor" "researcher" "result-explorer"))
-                           ("executor" '("introspector" "researcher" "result-explorer"))
-                           (_ '("researcher" "result-explorer"))))
+        (let* ((expected '("researcher" "result-explorer"))
                (fsm (gptel-make-fsm :info (list :buffer (current-buffer))))
                (snapshot (gptel-agent--snapshot-agent-definitions)))
           (should (equal (mapcar #'car snapshot) expected))
@@ -872,9 +866,7 @@
         (gptel--apply-preset
          preset (lambda (sym val) (set (make-local-variable sym) val)))
         (should (equal gptel-agent--current-agent (symbol-name preset)))
-        (let ((expected (if (eq preset 'gptel-agent)
-                            '("executor" "researcher" "result-explorer")
-                          '("researcher" "result-explorer"))))
+        (let ((expected '("researcher" "result-explorer")))
           (cl-letf (((symbol-function 'completing-read-multiple)
                      (lambda (_prompt candidates _predicate _require-match initial
                                       &rest _)
@@ -925,7 +917,12 @@
   (gptel-agent-test--with-main-presets
     (gptel--apply-preset
      'gptel-agent (lambda (sym val) (set (make-local-variable sym) val)))
-    (setq-local gptel-agent--enabled-agents '("executor" "researcher"))
+    ;; Give this chat a wider parent declaration than the inline preset.
+    (setf (plist-get (cdr (assoc "gptel-agent" gptel-agent--registry-snapshot)) :agents)
+          '("introspector" "researcher" "result-explorer"))
+    (setq-local gptel-agent--enabled-agents '("introspector" "researcher"))
+    (should (equal (sort (mapcar #'car (gptel-agent--snapshot-agent-definitions)) #'string<)
+                   '("introspector" "researcher")))
     (let ((fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
       (with-temp-buffer
         (insert "@ask Explain this code")
@@ -933,7 +930,7 @@
         (gptel--transform-apply-preset fsm)
         (gptel-agent--localize-agent-tool fsm)
         (let ((tool (cl-find "Agent" gptel-tools :key #'gptel-tool-name :test #'equal)))
-          ;; @ask excludes executor, and the chat's selection excludes
+          ;; @ask excludes introspector, and the chat's selection excludes
           ;; result-explorer.  Only researcher satisfies both restrictions.
           (should (equal (plist-get (car (gptel-tool-args tool)) :enum)
                          ["researcher"])))))
@@ -942,14 +939,14 @@
 (ert-deftest gptel-agent-shared-main-preset-preserves-worker-identity ()
   (gptel-agent-test--with-main-presets
     (with-temp-buffer
-      (setq-local gptel-agent--current-agent "executor"
+      (setq-local gptel-agent--current-agent "test-worker"
                   gptel-agent--agent-snapshot
-                  '(("executor" :agents ("researcher"))
+                  '(("test-worker" :agents ("researcher"))
                     ("researcher" :description "Researches")))
       (gptel-agent--apply-subagent-configuration
        (gptel-agent--resolve-subagent-preset 'gptel-agent)
        '(:system "Execute the task"))
-      (should (equal gptel-agent--current-agent "executor"))
+      (should (equal gptel-agent--current-agent "test-worker"))
       (should-not gptel-agent--registry-snapshot)
       (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
                      '("researcher"))))))
@@ -959,14 +956,14 @@
     (setq-local
      gptel-agent--current-agent "custom-parent"
      gptel-agent--registry-snapshot
-     '(("custom-parent" :agents ("executor" "researcher"))
-       ("executor" :agents ("researcher" "introspector") :description "Executes")
+     '(("custom-parent" :agents ("test-worker" "researcher"))
+       ("test-worker" :agents ("researcher" "introspector") :description "Executes")
        ("researcher" :description "Researches")
        ("introspector" :description "Inspects")))
     (let* ((snapshot (gptel-agent--snapshot-agent-definitions))
            (fsm (gptel-make-fsm :info (list :buffer (current-buffer))))
            (message (gptel-agent--agents-tool-message gptel-agent--registry-snapshot)))
-      (should (equal (mapcar #'car snapshot) '("executor" "researcher")))
+      (should (equal (mapcar #'car snapshot) '("test-worker" "researcher")))
       (should-not (string-match-p "introspector" message))
       (with-temp-buffer
         (setq-local gptel-tools (list (gptel-get-tool "Agent")))
@@ -978,7 +975,7 @@
           (should (string-match-p "not available for this request" result))))
       ;; The child can narrow its parent's list, but cannot add introspector.
       (with-temp-buffer
-        (setq-local gptel-agent--current-agent "executor"
+        (setq-local gptel-agent--current-agent "test-worker"
                     gptel-agent--agent-snapshot snapshot)
         (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
                        '("researcher")))))))
@@ -988,11 +985,11 @@
     (setq-local gptel-agent--current-agent "parent"
                 gptel-agent--registry-snapshot
                 '(("parent" :description "Parent")
-                  ("executor" :description "Executes")
+                  ("test-worker" :description "Executes")
                   ("ask" :description "Explains")))
     ;; No declaration: allow workers, but never main presets or self-calls.
     (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
-                   '("executor")))
+                   '("test-worker")))
     (setcdr (car gptel-agent--registry-snapshot) '(:agents nil))
     (should-not (gptel-agent--snapshot-agent-definitions))
     (setq-local gptel-tools (list (gptel-get-tool "Agent") (gptel-get-tool "Read")))
@@ -1004,12 +1001,12 @@
   (dolist (declared '(nil t))
     (dolist (inherited '(nil t))
       (with-temp-buffer
-        (let* ((names '("gptel-agent" "gptel-plan" "ask" "executor"
+        (let* ((names '("gptel-agent" "gptel-plan" "ask" "test-worker"
                         "researcher" "custom-worker"))
                (registry (mapcar (lambda (name) (list name :description name)) names)))
           (when declared
-            (setcdr (assoc "executor" registry) (list :agents names)))
-          (setq-local gptel-agent--current-agent "executor"
+            (setcdr (assoc "test-worker" registry) (list :agents names)))
+          (setq-local gptel-agent--current-agent "test-worker"
                       gptel-agent--enabled-agents names
                       gptel-agent--registry-snapshot registry
                       gptel-agent--agent-snapshot (and inherited registry))
@@ -1035,8 +1032,8 @@
 
 (ert-deftest gptel-agent-dispatch-rejects-main-presets-and-self ()
   (with-temp-buffer
-    (setq-local gptel-agent--current-agent "executor")
-    (let* ((names '("gptel-agent" "gptel-plan" "ask" "executor" "EXECUTOR"))
+    (setq-local gptel-agent--current-agent "test-worker")
+    (let* ((names '("gptel-agent" "gptel-plan" "ask" "test-worker" "TEST-WORKER"))
            ;; Simulate a stale or externally supplied snapshot containing
            ;; invalid targets.  Dispatch must guard these independently.
            (snapshot (mapcar (lambda (name) (list name :description name)) names))
@@ -1053,8 +1050,8 @@
 
 (ert-deftest gptel-agent-selector-is-local-and-limited-by-parent ()
   (let ((gptel-agent--agents
-         '(("parent" :agents ("executor" "researcher"))
-           ("executor" :description "Executes")
+         '(("parent" :agents ("test-worker" "researcher"))
+           ("test-worker" :description "Executes")
            ("researcher" :description "Researches")
            ("introspector" :description "Inspects"))))
     (with-temp-buffer
@@ -1063,34 +1060,34 @@
       (cl-letf (((symbol-function 'completing-read-multiple)
                  (lambda (_prompt candidates _predicate _require-match initial
                                   &rest _args)
-                   (should (equal candidates '("executor" "researcher")))
-                   (should (equal initial "executor,researcher"))
-                   '("executor"))))
+                   (should (equal candidates '("test-worker" "researcher")))
+                   (should (equal initial "test-worker,researcher"))
+                   '("test-worker"))))
         (gptel-agent-toggle-agent))
       (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
-                     '("executor")))
+                     '("test-worker")))
       ;; Another conversation still follows its parent file.
       (with-temp-buffer
         (setq-local gptel-agent--current-agent "parent"
                     gptel-agent--registry-snapshot gptel-agent--agents)
         (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
-                       '("executor" "researcher"))))
+                       '("test-worker" "researcher"))))
       (cl-letf (((symbol-function 'completing-read-multiple) (lambda (&rest _) nil)))
         (gptel-agent-toggle-agent))
       (should-not (gptel-agent--snapshot-agent-definitions)))))
 
 (ert-deftest gptel-agent-agent-lists-parse-from-markdown-and-org ()
   (require 'yaml)
-  (dolist (text '("agents: [executor, researcher]"
-                  "agents: executor researcher"
-                  "agents:\n  - executor\n  - researcher"))
+  (dolist (text '("agents: [test-worker, researcher]"
+                  "agents: test-worker researcher"
+                  "agents:\n  - test-worker\n  - researcher"))
     (should (equal (plist-get (gptel-agent--parse-yaml-frontmatter text #'always)
                              :agents)
-                   '("executor" "researcher"))))
+                   '("test-worker" "researcher"))))
   (should (equal (plist-get (gptel-agent--org-properties-alist-to-plist
-                            '(("AGENTS" . "executor researcher")) #'always)
+                            '(("AGENTS" . "test-worker researcher")) #'always)
                            :agents)
-                 '("executor" "researcher")))
+                 '("test-worker" "researcher")))
   (dolist (plist (list (gptel-agent--parse-yaml-frontmatter "agents: []" #'always)
                        (gptel-agent--org-properties-alist-to-plist
                         '(("AGENTS" . "")) #'always)))
@@ -1107,7 +1104,7 @@
        gptel-tools (list global-tool)
        gptel-agent--current-agent nil
        gptel-agent--agent-snapshot
-       '(("executor" :description "Executes work" :system "execute")
+       '(("test-worker" :description "Executes work" :system "execute")
          ("researcher" :description "Finds evidence" :system "research")))
       (gptel-agent--localize-agent-tool fsm)
       (setq local-tool (car gptel-tools)))
@@ -1115,7 +1112,7 @@
       (should-not (eq local-tool global-tool))
       (should (equal (append (plist-get (car (gptel-tool-args local-tool)) :enum)
                              nil)
-                     '("executor" "researcher")))
+                     '("test-worker" "researcher")))
       (should (equal (mapcar (lambda (arg) (plist-get arg :name))
                              (gptel-tool-args local-tool))
                      '("subagent_type" "description" "prompt"
@@ -1124,11 +1121,11 @@
       (cl-letf (((symbol-function 'gptel-agent--task)
                  (lambda (&rest args) (setq captured args))))
         (funcall (gptel-tool-function local-tool)
-                 #'ignore "executor" "do work" "details" nil nil "agent-42"))
+                 #'ignore "test-worker" "do work" "details" nil nil "agent-42"))
       (should (equal (nth 8 captured) "agent-42"))
       (should (eq (nth 4 captured) fsm))
       (should (equal (mapcar #'car (nth 5 captured))
-                     '("executor" "researcher"))))))
+                     '("test-worker" "researcher"))))))
 
 (ert-deftest gptel-agent-session-records-its-initial-preset ()
   (let ((session-buffer (generate-new-buffer " *gptel-agent-session-test*"))
@@ -1193,10 +1190,10 @@
 (ert-deftest gptel-agent-default-preset-does-not-override-request-parent ()
   (let ((gptel-agent--current-agent "ask"))
     (with-temp-buffer
-      (setq-local gptel-agent--current-agent "executor"
+      (setq-local gptel-agent--current-agent "test-worker"
                   gptel-agent--registry-snapshot
-                  '(("ask" :agents ("executor"))
-                    ("executor" :agents ("researcher"))
+                  '(("ask" :agents ("test-worker"))
+                    ("test-worker" :agents ("researcher"))
                     ("researcher" :description "Researches")))
       (let ((fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
         (with-temp-buffer

@@ -1,7 +1,7 @@
 ---
 name: gptel-agent
 description: The default gptel-agent
-agents: [executor, researcher, result-explorer]
+agents: [researcher, result-explorer]
 tools:
   - Agent
   - AgentControl
@@ -53,19 +53,19 @@ Before acting, classify the task:
 </task_protocol>
 
 <delegation_policy>
-Use subagents as focused evidence or execution workers, not as authorities. Validate their reports before relying on them.
-Use only subagents listed by `Agent`: `executor` for bounded implementation, `researcher` for investigation, and `result-explorer` for saved tool output.
+Use subagents as focused evidence workers, not as authorities. Validate their reports before relying on them.
+Use only subagents listed by `Agent`: `researcher` for investigation and `result-explorer` for saved tool output. Perform implementation and verification directly.
 
 For independent tasks, use `Agent` with `background: true`, then continue useful work. Worker reports arrive automatically. Use `AgentControl` to inspect progress, send corrections to active work, cancel unnecessary work, or wait when no useful work remains. Use `Agent` with `agent_id` for a completed worker's follow-up. The harness keeps your turn open until every descendant finishes and all outcomes reach you; synthesize their evidence before the final answer.
 
 Delegate when:
 - open-ended exploration is needed;
 - a concept/pattern spans 3+ files;
-- a clear implementation spans multiple files or verification steps;
 - live Emacs/elisp state is the source of truth;
 - independent investigations can run in parallel.
 
 Handle inline when:
+- implementing changes or running verification, including work across multiple files;
 - the path is obvious and only 1-2 files are involved;
 - the search is a single focused lookup;
 - the edit is tiny and low risk.

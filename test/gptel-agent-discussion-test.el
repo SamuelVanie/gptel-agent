@@ -695,7 +695,8 @@
        (should (equal (buffer-local-value 'gptel-system-prompt child)
                       (plist-get (gptel-get-preset 'gptel-agent) :system)))
        (should (cl-find "Write" child-tools :key #'gptel-tool-name :test #'equal))
-       (should (member "executor" (append (plist-get (car (gptel-tool-args agent)) :enum) nil)))
+       (should (equal (sort (append (plist-get (car (gptel-tool-args agent)) :enum) nil) #'string<)
+                      '("researcher" "result-explorer")))
        (should (equal (buffer-local-value 'gptel-agent--current-agent parent) "gptel-plan"))
        (should-not (cl-find "Write" (plist-get (gptel-fsm-info fsm) :tools)
                             :key #'gptel-tool-name :test #'equal))))))
@@ -746,29 +747,33 @@
       (should-not (gptel-agent-discussion--interaction-overlays interaction))
       (should (equal (buffer-string) "Keep this transcript\n")))))
 
-(ert-deftest gptel-agent-discussion-executor-approval-stays-local-and-settles ()
+(ert-deftest gptel-agent-discussion-worker-approval-stays-local-and-settles ()
   (dolist (background '(nil t))
     (dolist (decision '(approve cancel))
       (gptel-agent-test--with-main-presets
         (gptel-agent-discussion-test--with-chat
-         (gptel-make-preset 'discussion-test-executor
+         (gptel-make-preset 'discussion-test-worker
            :parents 'gptel-agent
+           :agent--registry-snapshot
+           '(("gptel-agent" :agents ("test-worker"))
+             ("test-worker" :description "Test worker" :system "Complete the task"
+              :tools ("TodoWrite")))
            :prompt-transform-functions
            '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize))
          (gptel-agent-workers-test--tool
-          fsm "Discussion" '(:title "Executor work" :prompt "Implement" :preset "discussion-test-executor"))
+          fsm "Discussion" '(:title "Worker task" :prompt "Implement" :preset "discussion-test-worker"))
          (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
          (let* ((child (gptel-agent-discussion--chat-buffer chat))
                 (child-fsm (gptel-agent-discussion--chat-fsm chat)))
            (with-current-buffer child (setq-local gptel-confirm-tool-calls nil))
            (gptel-agent-workers-test--tool
-            child-fsm "Agent" `(:subagent_type "executor" :description "Implement"
+            child-fsm "Agent" `(:subagent_type "test-worker" :description "Implement"
                                               :prompt "Bounded task" :background ,background))
            (let* ((run (car (hash-table-values gptel-agent--runs)))
                   (worker-fsm (gptel-agent--run-fsm run))
                   (worker (gptel-agent--run-child-buffer run)))
              (when background
-               (gptel-agent-workers-test--answer child-fsm "Waiting for executor")
+               (gptel-agent-workers-test--answer child-fsm "Waiting for worker")
                (should (eq (gptel-fsm-state child-fsm) 'AGWT)))
              (gptel-agent-workers-test--tool
               worker-fsm "TodoWrite"
@@ -802,13 +807,13 @@
                      (gptel-agent-workers-test--tool
                       worker-fsm "TodoWrite"
                       '(:todos [(:content "Implement" :activeForm "Implementing" :status "completed")]))
-                     (gptel-agent-workers-test--answer worker-fsm "EXECUTOR-FINISHED")
+                     (gptel-agent-workers-test--answer worker-fsm "WORKER-FINISHED")
                      (should (eq (gptel-agent--run-state run) 'completed)))
                  (should-not tool-callback)
                  (should (eq (gptel-agent--run-state run) 'cancelled))))
              (gptel-agent-workers-test--wake child-fsm)
              (should (eq (gptel-fsm-state child-fsm) 'WAIT))
-             (should (string-match-p (if (eq decision 'approve) "EXECUTOR-FINISHED" "aborted")
+             (should (string-match-p (if (eq decision 'approve) "WORKER-FINISHED" "aborted")
                                      (gptel-agent-workers-test--data child-fsm)))
              (gptel-agent-workers-test--answer child-fsm "Implementation complete")
              (should (eq (gptel-agent-discussion--chat-state chat) 'idle))

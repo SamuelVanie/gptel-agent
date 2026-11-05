@@ -27,7 +27,7 @@
           (gptel-prompt-prefix-alist '((fundamental-mode . "USER> ")))
           (snapshot '(("researcher" :system "Research" :task-timeout nil
                        :max-request-rounds nil)
-                      ("executor" :system "Execute" :task-timeout nil
+                      ("test-worker" :system "Execute" :task-timeout nil
                        :max-request-rounds nil)))
           requests statuses acknowledgements tool-callback)
      (unwind-protect
@@ -140,7 +140,7 @@
     (gptel-agent-workers-test--with-chat
       (with-current-buffer parent
         (setq-local gptel-agent-preset '(:tools ("TodoWrite"))))
-      (let* ((run (gptel-agent-workers-test--launch fsm "executor" nil background))
+      (let* ((run (gptel-agent-workers-test--launch fsm "test-worker" nil background))
              (worker (gptel-agent--run-child-buffer run))
              (worker-fsm (gptel-agent--run-fsm run)))
         ;; Workers do not use gptel-send's buffer-local FSM.  Their request's
@@ -162,7 +162,7 @@
               (should (string-match-p (if (equal status "completed") "✓" "●")
                                        (overlay-get ov 'after-string)))))
           (should (eq (buffer-local-value 'gptel-agent--todos parent) 'parent-todos)))
-        (gptel-agent-workers-test--answer worker-fsm "EXECUTOR-FINISHED")
+        (gptel-agent-workers-test--answer worker-fsm "TEST-WORKER-FINISHED")
         (should (eq (gptel-agent--run-state run) 'completed))
         (gptel-agent-workers-test--wake fsm)
         (gptel-agent-workers-test--answer fsm "Parent finished")
@@ -390,7 +390,7 @@
 
 (ert-deftest gptel-agent-workers-nested-completion-gates-every-level ()
   (gptel-agent-workers-test--with-chat
-    (let* ((run (gptel-agent-workers-test--launch fsm "executor"))
+    (let* ((run (gptel-agent-workers-test--launch fsm "test-worker"))
            (child (gptel-agent--run-fsm run))
            (grandchild (gptel-agent-workers-test--launch child "researcher")))
       (gptel-agent-workers-test--answer child "Worker interim")
@@ -409,7 +409,7 @@
 (ert-deftest gptel-agent-workers-cancellation-closes-subtree-and-late-wakeups ()
   (dolist (method '(abort kill error cancel timeout))
     (gptel-agent-workers-test--with-chat
-      (let* ((run (gptel-agent-workers-test--launch fsm "executor"))
+      (let* ((run (gptel-agent-workers-test--launch fsm "test-worker"))
              (child (gptel-agent--run-fsm run))
              (nested (gptel-agent-workers-test--launch child "researcher"))
              (gate (gptel-agent--workers-for fsm))
@@ -552,7 +552,7 @@
 
 (ert-deftest gptel-agent-workers-failure-retry-and-permission-wait-stay-active ()
   (gptel-agent-workers-test--with-chat
-    (let* ((run (gptel-agent-workers-test--launch fsm "executor"))
+    (let* ((run (gptel-agent-workers-test--launch fsm "test-worker"))
            (child (gptel-agent--run-fsm run))
            (info (gptel-fsm-info child))
            (gptel-agent-retry-delay 3600))

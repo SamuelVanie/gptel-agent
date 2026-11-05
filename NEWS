@@ -4,6 +4,10 @@
 
 ** New features and UI changes
 
+- The bundled ~executor~ agent has been removed. The default agent now
+  handles implementation and verification directly, with ~researcher~ and
+  ~result-explorer~ available for delegated investigation.
+
 - File review now offers ~A~ to ask about a proposal in an independent gptel
   aside, from the queue or either Ediff pane. It inherits conversation context
   and settings, includes the displayed revision and selected lines, and keeps
@@ -111,7 +115,7 @@
   preset can override the child's tools; ~DiscussionReport~ remains available.
 
 - Discussion approval cleanup now supports gptel versions without the private
-  overlay cleanup helper, preventing failed approvals from stranding executor
+  overlay cleanup helper, preventing failed approvals from stranding worker
   tools. Worker ~TodoWrite~ calls use their own request and diagnostic buffer;
   completing a chat's todo list also clears its active-task header immediately.
 
