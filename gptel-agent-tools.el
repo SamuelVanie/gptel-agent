@@ -4209,11 +4209,11 @@ shell job control: detached children cannot be managed as part of the group."
          (:name "input" :type string :optional t
           :description "For send: exact input to write, including any required newline.")
          (:name "offset" :type integer :optional t :minimum 0
-          :description "For read/wait: absolute character offset for replay without moving the cursor. Cannot be combined with view=tail.")
+          :description "For read/wait: absolute character offset for replay without moving the cursor. Omit this argument entirely for view=tail; even offset=0 cannot be combined with tail.")
          (:name "max_chars" :type integer :optional t :minimum 1 :maximum 20000
           :description "For read/wait: maximum output characters (default 12000, maximum 20000).")
          (:name "view" :type string :optional t :enum ["unread" "tail"]
-          :description "unread reads forward, consuming output unless offset is set. tail returns the latest output without moving the cursor. Default: unread for read; tail for wait unless offset is set.")
+          :description "unread reads forward, consuming output unless offset is set. tail returns the latest output without moving the cursor; omit offset when selecting tail. Default: unread for read; tail for wait unless offset is set.")
          (:name "until" :type string :optional t :enum ["exit"]
           :description "For wait: wait for process termination (default exit), not merely new output.")
          (:name "timeout_ms" :type integer :optional t :minimum 0 :maximum 60000

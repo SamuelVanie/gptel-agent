@@ -109,6 +109,10 @@
 
 ** Notable bug fixes
 
+- ~Process~ returns invalid read/wait arguments and other operation errors to
+  the model instead of aborting the request with a misleading HTTP 200 error.
+  Tail-view guidance now explicitly says to omit ~offset~, including zero.
+
 - Loading a skill preserves globally configured conversation tools across
   turns. Discussions inherit the parent's full active tool list, including
   tools activated by skills, without inheriting skill pre-approvals. An explicit

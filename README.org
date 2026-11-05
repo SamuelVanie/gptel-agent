@@ -491,8 +491,8 @@ character position without changing the unread cursor; =max_chars= limits a
 read to 1–20000 characters (default 12000). Results include =next_offset= and
 =output_end=. The unread cursor is shared by the chat and its sub-agents.
 Set =view= to =tail= to read the latest characters directly without changing
-that cursor. Tail cannot be combined with =offset=. Results also include
-=retained_start= and =output_start= and distinguish discarded output from
+that cursor. Omit =offset= entirely for tail, including =offset=0=. Results
+also include =retained_start= and =output_start= and distinguish discarded output from
 earlier retained output omitted by the tail view. Use an explicit =offset=
 to inspect that earlier output if needed.
 
@@ -508,6 +508,8 @@ is needed. Servers and watchers may never exit, so use read to inspect them.
 Removing a completed job resolves any pending waits with =wait_reason=removed=.
 Cancelling a request or killing its calling buffer cancels its waits without
 stopping jobs owned by a surviving conversation.
+Invalid arguments return a tool error so the agent can correct the call
+without aborting the request or stopping the job.
 
 Each job retains the most recent =gptel-agent-process-output-limit= characters
 (default 200000). Older output is discarded and a read reports any missing

@@ -148,7 +148,7 @@ Return the effective character limit."
   (unless (member view '(nil "unread" "tail"))
     (error "view must be unread or tail"))
   (when (and offset (equal view "tail"))
-    (error "offset cannot be combined with view=tail"))
+    (error "offset cannot be combined with view=tail; omit offset (including 0) for tail, or use view=unread to replay from offset"))
   (setq max-chars (or max-chars 12000))
   (unless (and (integerp max-chars) (> max-chars 0) (<= max-chars 20000))
     (error "max_chars must be between 1 and 20000"))
@@ -279,16 +279,27 @@ owns the wait so cancellation cannot revive an obsolete request."
   "Dispatch Process ACTION and deliver its result to CALLBACK.
 PROCESS-ID identifies a job.  INPUT is used by send.  OFFSET, MAX-CHARS and
 VIEW select read/wait output; UNTIL and TIMEOUT-MS control wait.  Optional
-FSM is supplied by the request-local dispatcher for cancellation cleanup."
-  (if (equal action "wait")
-      (let ((job (with-current-buffer (gptel-agent--process-owner)
-                   (cl-find process-id gptel-agent--processes
-                            :key #'gptel-agent--job-id :test #'equal))))
-        (unless job (error "Unknown process_id in this session: %s" process-id))
-        (gptel-agent--process-wait
-         callback job offset max-chars view until timeout-ms fsm))
-    (funcall callback
-             (gptel-agent--manage-process action process-id input offset max-chars view)))
+FSM is supplied by the request-local dispatcher for cancellation cleanup.
+Report operation errors through CALLBACK so the model can correct its call."
+  ;; Some gptel versions only catch errors from synchronous tools.  Process is
+  ;; asynchronous even for read/list, so validation must not escape into the
+  ;; request error handler (which may still carry a successful HTTP status).
+  (let ((result
+         (condition-case err
+             (if (equal action "wait")
+                 (let ((job (with-current-buffer (gptel-agent--process-owner)
+                              (cl-find process-id gptel-agent--processes
+                                       :key #'gptel-agent--job-id :test #'equal))))
+                   (unless job
+                     (error "Unknown process_id in this session: %s" process-id))
+                   (gptel-agent--process-wait
+                    callback job offset max-chars view until timeout-ms fsm))
+               (gptel-agent--manage-process
+                action process-id input offset max-chars view))
+           (error (concat "Error: " (error-message-string err))))))
+    ;; Wait delivers its own result and returns nil.  Keep immediate callbacks
+    ;; outside the error handler: a downstream failure must not deliver twice.
+    (when result (funcall callback result)))
   nil)
 
 (defun gptel-agent--manage-process (action &optional process-id input offset max-chars view)

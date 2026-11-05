@@ -3,6 +3,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'gptel-agent)
+(require 'gptel-openai-responses)
 
 (defun gptel-agent-process-test--wait (predicate)
   "Wait at most five seconds for PREDICATE while servicing subprocesses."
@@ -65,7 +66,10 @@
                        "No background processes in this session."))
         (dolist (action '("read" "send" "interrupt" "kill" "remove"))
           (should-error (gptel-agent--manage-process action id "oops\n")))
-        (should-error (gptel-agent--process-tool #'ignore "wait" id))
+        (let (result)
+          (should-not (gptel-agent--process-tool
+                       (lambda (value) (setq result value)) "wait" id))
+          (should (string-prefix-p "Error: Unknown process_id" result)))
         (let* ((other (gptel-agent--execute-bash #'ignore "read -r answer" "Test" t))
                (other-id (gptel-agent--job-id (process-get other 'gptel-agent-job))))
           (should-not (equal id other-id))
@@ -320,9 +324,78 @@
                       (nil nil nil nil 1.5) (nil nil nil "idle" nil)
                       (nil 0 nil nil nil) (nil nil "bad" nil nil)
                       (0 nil "tail" nil nil) (1 nil nil nil nil)))
-        (should-error (apply #'gptel-agent--process-tool #'ignore "wait" id nil args))
+        (let (results)
+          (should-not
+           (apply #'gptel-agent--process-tool
+                  (lambda (result) (push result results)) "wait" id nil args))
+          (should (= (length results) 1))
+          (should (string-prefix-p "Error: " (car results))))
         (should-not (gptel-agent--job-waiters job))
         (should (= (gptel-agent--job-cursor job) 0))))))
+
+(ert-deftest gptel-agent-process-tool-does-not-retry-a-failed-callback ()
+  (gptel-agent-process-test--with-session
+    ;; Neither a successful operation nor an operation error should cause a
+    ;; callback's own failure to be caught and delivered as a second result.
+    (dolist (action '("list" "wait"))
+      (let ((calls 0))
+        (should-error
+         (gptel-agent--process-tool
+          (lambda (_result) (cl-incf calls) (error "Callback failed")) action))
+        (should (= calls 1))))))
+
+(ert-deftest gptel-agent-process-invalid-output-options-remain-tool-results ()
+  ;; Exercise the real async dispatcher and worker error handler.  An escaping
+  ;; validation error used to become ERRS with the successful HTTP status intact.
+  (dolist (localized '(nil t))
+    (gptel-agent-process-test--with-job
+        (process "printf ready; read -r answer; printf done")
+      (let* ((job (process-get process 'gptel-agent-job))
+             (id (gptel-agent--job-id job))
+             (gptel-confirm-tool-calls nil)
+             (gptel-agent-use-project-instructions nil)
+             (backend (gptel-make-openai-responses
+                       "process-test" :key "unused" :host "example.invalid"
+                       :models '(test)))
+             (gptel-tools (list (gptel-get-tool "Process")))
+             (fsm (gptel-make-fsm
+                   :table gptel-send--transitions
+                   :handlers '((TOOL gptel--handle-tool-use))
+                   :info (list :buffer (current-buffer) :backend backend
+                               :callback #'ignore :http-status "200"
+                               :status "HTTP/2 200"))))
+        (when localized (gptel-agent--localize-agent-tool fsm))
+        (setf (plist-get (gptel-fsm-info fsm) :tools) gptel-tools)
+        (gptel-agent--workers-install fsm)
+        (dolist (action '("read" "wait"))
+          (let ((call (list :name "Process" :args
+                            (list :action action :process_id id
+                                  :offset 0 :view "tail"))))
+            (setf (plist-get (gptel-fsm-info fsm) :tool-use) (list call))
+            (gptel--fsm-transition fsm 'TOOL)
+            (should (eq (gptel-fsm-state fsm) 'TRET))
+            (should-not (plist-get (gptel-fsm-info fsm) :error))
+            (should (string-prefix-p "Error: " (plist-get call :result)))
+            (should (string-match-p "offset cannot be combined with view=tail"
+                                    (plist-get call :result)))
+            (should-not (gptel-agent--job-waiters job))
+            (should (= (gptel-agent--job-cursor job) 0))
+            (should (process-live-p process))))
+        ;; The model can correct the arguments and wait in the same request.
+        (let ((call (list :name "Process" :args
+                          (list :action "wait" :process_id id :until "exit"
+                                :view "tail" :timeout_ms 60000))))
+          (setf (plist-get (gptel-fsm-info fsm) :tool-use) (list call))
+          (gptel--fsm-transition fsm 'TOOL)
+          (should (eq (gptel-fsm-state fsm) 'TOOL))
+          (should-not (plist-get call :result))
+          (gptel-agent--manage-process "send" id "go\n")
+          (gptel-agent-process-test--wait (lambda () (plist-get call :result)))
+          (should (eq (gptel-fsm-state fsm) 'TRET))
+          (should (string-match-p "wait_reason: exit" (plist-get call :result)))
+          (should (string-suffix-p "readydone" (plist-get call :result)))
+          (should-not (plist-get (gptel-fsm-info fsm) :error))
+          (should-not (gptel-agent--job-waiters job)))))))
 
 (ert-deftest gptel-agent-process-tool-schema-dispatches-read-wait-and-send ()
   (gptel-agent-process-test--with-job
