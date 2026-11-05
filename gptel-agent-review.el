@@ -35,7 +35,7 @@ Changing this setting affects new review queues only."
 
 (cl-defstruct (gptel-agent-review--queue
                (:constructor gptel-agent-review--make-queue))
-  owner buffer files view applied)
+  owner buffer files view applied asides)
 
 (defvar-local gptel-agent-review--queue nil
   "Review owned by this conversation, or displayed in this review buffer.")
@@ -309,6 +309,7 @@ can inspect the new revision before accepting or restoring it."
     (define-key map (kbd "RET") #'gptel-agent-review-file)
     (define-key map (kbd "r") #'gptel-agent-review-cancel)
     (define-key map (kbd "H") #'gptel-agent-review-comment)
+    (define-key map (kbd "A") #'gptel-agent-review-ask)
     (define-key map (kbd "a") #'gptel-agent-review-accept-all)
     (define-key map (kbd "D") #'gptel-agent-review-done)
     (define-key map (kbd "C") #'gptel-agent-review-cancel-all)
@@ -322,7 +323,7 @@ can inspect the new revision before accepting or restoring it."
   (setq-local tabulated-list-use-header-line nil)
   (tabulated-list-init-header)
   (setq-local header-line-format
-              " RET: Ediff   H: comment   r: refuse file   a: accept all   D: done   C: cancel all   q: hide"))
+              " RET: Ediff   A: ask aside   H: comment   r: refuse file   a: accept all   D: done   C: cancel all   q: hide"))
 
 (defun gptel-agent-review--refresh (queue)
   "Update QUEUE's file list and any open Ediff without stealing focus."
@@ -412,6 +413,21 @@ can inspect the new revision before accepting or restoring it."
   (let* ((queue gptel-agent-review--queue) (file (gptel-agent-review--selected))
          (revision (plist-get file :revision)))
     (gptel-agent-review--comment queue file (read-string "Review comment: ") nil revision)))
+
+(defun gptel-agent-review--ask (queue file &optional context)
+  "Ask about FILE in QUEUE with optional CONTEXT, without deciding its review."
+  (require 'gptel-agent-review-aside)
+  ;; Capture the displayed revision before minibuffer callbacks can change it.
+  (let* ((snapshot (copy-sequence file))
+         (question (read-string "Ask about this change (empty to open aside): ")))
+    (gptel-agent-review-aside queue snapshot question context)))
+
+(declare-function gptel-agent-review-aside "gptel-agent-review-aside")
+
+(defun gptel-agent-review-ask ()
+  "Ask about the selected file in a separate conversation."
+  (interactive)
+  (gptel-agent-review--ask gptel-agent-review--queue (gptel-agent-review--selected)))
 
 (defun gptel-agent-review--cancel (queue file reason)
   "Undo FILE's proposed changes in QUEUE and send REASON immediately."

@@ -4,6 +4,12 @@
 
 ** New features and UI changes
 
+- File review now offers ~A~ to ask about a proposal in an independent gptel
+  aside, from the queue or either Ediff pane. It inherits conversation context
+  and settings, includes the displayed revision and selected lines, and keeps
+  questions and answers out of the original chat. Asking leaves the review
+  decision unchanged. Follow-ups use ~C-c RET~; ~C-c C-r~ returns to Ediff.
+
 - All gptel conversations now discover scoped ~AGENTS.md~ instructions, with private
   per-conversation registries and replaceable per-call instruction blocks.
   File mutations defer when their scope or instruction versions require a new

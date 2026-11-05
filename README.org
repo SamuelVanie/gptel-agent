@@ -260,6 +260,7 @@ In the review queue:
 |-----+--------|
 | =RET= | Inspect the selected file's cumulative diff in Ediff |
 | =H= | Send a comment on this file immediately |
+| =A= | Ask about this file in an independent aside chat |
 | =r= | Restore this file's original contents and send optional feedback |
 | =a= | Explicitly accept all current file revisions |
 | =D= | Finish review quietly once every file has a decision |
@@ -279,7 +280,25 @@ In the Ediff control buffer:
 | =R= | Restore this file's original contents and send feedback immediately |
 | =C= | Cancel the entire queue and finish review |
 | =H= | Send a comment; in A/B include the selected region or current line |
+| =A= | Ask in an aside; in A/B include the selected region or current line |
 | =C-]= | Refuse this file and close its Ediff |
+
+=A= opens a =*Review aside: …*= chat below Ediff. Asking leaves the proposal's
+decision unchanged, so you can still accept it immediately. The aside starts
+with a snapshot of the conversation's history, model, system prompt and request
+settings, plus the original/proposed file contents and the displayed revision.
+It includes the usual attached context and scoped project instructions. Its
+tools are disabled: questions request explanations, not edits. Questions and
+answers stay in the aside and are never added to the original conversation.
+
+Each file has its own aside. Ask further questions with =A=, or type directly
+in the aside and send with =C-c RET=. An empty answer to the =A= prompt reopens
+the aside without sending. =C-c C-r= returns to the file's Ediff, =C-c C-q=
+hides the aside, and =C-c C-k= cancels only its current answer. Closing Ediff or
+finishing review keeps the aside available as a normal buffer. Killing the
+aside cancels its request without affecting the original agent. The inherited
+conversation history is a snapshot; asking again with =A= includes the file
+revision you are then viewing.
 
 By default, proposals are applied to working files immediately, with before/after
 copies saved before writing. Bash commands, tests, builds, =Read=, =Grep= and

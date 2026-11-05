@@ -5,6 +5,7 @@
 ;; a nonblocking review queue.  Ediff runs only when the user opens a proposal.
 ;; The original side stays fixed while the proposed side updates in place.
 ;; H submits comments immediately; R refuses this file, C cancels all files.
+;; A asks questions in an independent chat, without making a review decision.
 
 ;;; Code:
 
@@ -27,6 +28,9 @@
 
 (defvar smv/gptel-ediff-comment-key "H"
   "Key bound in Ediff review buffers to send a region-specific comment.")
+
+(defvar smv/gptel-ediff-ask-key "A"
+  "Key bound in Ediff review buffers to ask about changes in an aside.")
 
 (defvar-local smv/gptel-ediff-review-mode nil
   "Buffer-local flag enabling temporary gptel ediff review bindings.")
@@ -226,6 +230,21 @@ If none exists, split one off the frame root."
          (comment (read-string (format "Comment for %s, %s: " (plist-get file :path) range))))
     (gptel-agent-review--comment (smv/gptel-ediff--view-queue view) file comment context revision)))
 
+(defun smv/gptel-ediff--ask (view &optional source)
+  "Ask about VIEW without deciding it; SOURCE identifies a selected side."
+  (let ((file (copy-sequence (smv/gptel-ediff--view-file view))) context)
+    (setf (plist-get file :revision) (smv/gptel-ediff--view-revision view)
+          (plist-get file :before) (smv/gptel-ediff--view-before view)
+          (plist-get file :after) (smv/gptel-ediff--view-after view))
+    (when source
+      (let* ((region (use-region-p))
+             (beg (if region (region-beginning) (line-beginning-position)))
+             (end (if region (region-end) (line-end-position))))
+        (setq context (format " (%s), %s:\n%s" source
+                              (smv/gptel-ediff--line-range beg (if region (max beg (1- end)) end))
+                              (buffer-substring-no-properties beg end)))))
+    (gptel-agent-review--ask (smv/gptel-ediff--view-queue view) file context)))
+
 (defun smv/gptel-ediff-open (queue file)
   "Open FILE's cumulative diff from QUEUE and return immediately.
 Updates reuse the same buffers and control window; no recursive edit is used."
@@ -255,7 +274,7 @@ Updates reuse the same buffers and control window; no recursive edit is used."
             (setq-local ediff-keep-variants t)
             (setq-local ediff-ignore-similar-regions nil)
             (setq-local ediff-brief-help-message-function
-                        (lambda () " n/p: change   N/P: file   f: choose file\n q: accept file   Q: hide   R: refuse file   C: cancel all\n H: submit comment immediately (also in A/B)   ?: help"))
+                        (lambda () " n/p: change   N/P: file   f: choose file\n q: accept file   Q: hide   R: refuse file   C: cancel all\n A: ask aside   H: submit comment (also in A/B)   ?: help"))
             (add-hook 'ediff-after-quit-hook-internal (lambda () (smv/gptel-ediff--destroy view)) nil t)
             (smv/gptel-ediff--buffer-local-set-key
              "q" (lambda ()
@@ -287,6 +306,8 @@ Updates reuse the same buffers and control window; no recursive edit is used."
                           (paths (mapcar (lambda (f) (cons (plist-get f :path) f)) files)))
                      (smv/gptel-ediff-open queue (cdr (assoc (completing-read "Review file: " paths nil t) paths))))))
             (smv/gptel-ediff--buffer-local-set-key
+             smv/gptel-ediff-ask-key (lambda () (interactive) (smv/gptel-ediff--ask view)))
+            (smv/gptel-ediff--buffer-local-set-key
              smv/gptel-ediff-comment-key
              (lambda () (interactive)
                (let ((revision (smv/gptel-ediff--view-revision view)))
@@ -297,6 +318,8 @@ Updates reuse the same buffers and control window; no recursive edit is used."
                               (cons (smv/gptel-ediff--view-proposed view) "proposed changes")))
             (let ((source (cdr pair)))
               (with-current-buffer (car pair)
+                (smv/gptel-ediff--buffer-local-set-key
+                 smv/gptel-ediff-ask-key (lambda () (interactive) (smv/gptel-ediff--ask view source)))
                 (smv/gptel-ediff--buffer-local-set-key
                  smv/gptel-ediff-comment-key (lambda () (interactive) (smv/gptel-ediff--comment view source))))))
           (smv/gptel-ediff--headers view)
