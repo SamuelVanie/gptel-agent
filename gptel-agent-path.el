@@ -7,6 +7,14 @@
 
 (define-error 'gptel-agent-path-error "Invalid filesystem target")
 
+(defun gptel-agent-path-working-directory (directory &optional fallback)
+  "Validate DIRECTORY relative to `default-directory' and add a trailing slash.
+Nil, JSON null or an empty string uses FALLBACK, or `default-directory'."
+  (file-name-as-directory
+   (gptel-agent-path-resolve
+    (if (member directory '(nil :null "")) (or fallback default-directory) directory)
+    'directory t)))
+
 (defun gptel-agent-path-type (path)
   "Return the filesystem type of PATH, following symlinks."
   (setq path (directory-file-name path))

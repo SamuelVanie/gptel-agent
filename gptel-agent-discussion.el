@@ -656,13 +656,9 @@ DIRECTORY selects its working directory."
                                                   (gptel-get-preset (intern-soft preset))))))
                           (copy-tree spec))
                         (user-error "Cannot find gptel preset %S" preset))))
-         (directory (file-name-as-directory
-                     (expand-file-name
-                      (if (and directory (not (equal directory ""))) directory
-                        (buffer-local-value 'default-directory owner))
-                      (buffer-local-value 'default-directory owner))))
+         (directory (with-current-buffer owner
+                      (gptel-agent-path-working-directory directory)))
          (id (gptel-agent-discussion--id "discussion")))
-    (unless (file-directory-p directory) (user-error "Not a directory: %s" directory))
     (let* ((buffer (generate-new-buffer (format "*gptel:%s*" (truncate-string-to-width title 70))))
            (chat (gptel-agent-discussion--make-chat
                   :id id :title title :owner owner :buffer buffer)))
@@ -1017,7 +1013,7 @@ If a draft remains, send it explicitly with `gptel-send' instead."
  :args '((:name "title" :type string :description "Short discussion title.")
          (:name "prompt" :type string :description "Self-contained opening message; parent transcript is not copied.")
          (:name "preset" :type string :optional t :description "Omit or leave empty to inherit this request's current settings. Otherwise apply any registered gptel preset by name, including user-defined presets outside gptel-agent. Its specified settings override inherited values; unspecified settings remain inherited. For example, a planning conversation can use gptel-agent for an implementation discussion.")
-         (:name "directory" :type string :optional t :description "Optional existing working directory; defaults to this conversation's directory."))
+         (:name "directory" :type string :optional t :description "Existing working directory, including a different project. Relative paths resolve against the calling chat's directory. Omit or leave empty to inherit that directory. The child discovers its own project instructions."))
  :category "gptel-agent" :async t :include t :confirm t)
 
 (gptel-make-tool

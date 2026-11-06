@@ -39,6 +39,8 @@ outgoing call; already submitted calls retain their snapshot."
 Records contain :path, :scope, :text, :version, and optionally :error.")
 (defvar-local gptel-agent-instructions--boundary nil
   "Canonical discovery boundary owned by this conversation.")
+(defvar-local gptel-agent-instructions--working-directory nil
+  "Canonical working directory used to establish the current boundary.")
 (defvar-local gptel-agent-instructions--targets nil
   "Directories most recently targeted by this conversation.")
 (defvar-local gptel-agent-instructions--sent nil
@@ -51,6 +53,7 @@ Records contain :path, :scope, :text, :version, and optionally :error.")
 `plist-put' may prepend a new property, so always save the resulting head."
   (let ((info (gptel-fsm-info fsm)))
     (dolist (key '(:agent-instructions-context
+                  :agent-instructions-directory :agent-instructions-sent-directory
                   :agent-instructions-started :agent-instructions-targets
                   :agent-instructions-sent :agent-instructions-rendering
                   :agent-instructions-wrapped :agent-instructions-tool-batch))
@@ -93,15 +96,31 @@ Do not change the base system prompt, including function/list prompts."
   (or (equal (directory-file-name path) (directory-file-name directory))
       (string-prefix-p (file-name-as-directory directory) path)))
 
-(defun gptel-agent-instructions--initialize ()
-  "Establish this conversation's boundary without visiting remote files."
-  (unless gptel-agent-instructions--boundary
-    (when (file-remote-p default-directory)
-      (error "Project instructions do not support remote working directories"))
-    (setq gptel-agent-instructions--boundary
-          (file-name-as-directory
-           (file-truename (if-let* ((project (project-current nil default-directory)))
-                              (project-root project) default-directory))))))
+(defun gptel-agent-instructions--initialize (&optional fsm)
+  "Refresh this conversation's boundary after a working-directory change.
+Also reset FSM's discovery targets when supplied.  Keep its last sent
+snapshot and rendering until the next send, so pending edits still require
+fresh instructions and the old managed prompt block can be removed."
+  (when (file-remote-p default-directory)
+    (error "Project instructions do not support remote working directories"))
+  (let ((directory (file-name-as-directory (file-truename default-directory))))
+    (unless (and gptel-agent-instructions--boundary
+                 (equal directory gptel-agent-instructions--working-directory))
+      (let ((boundary
+             (file-name-as-directory
+              (file-truename (if-let* ((project (project-current nil default-directory)))
+                                 (project-root project) default-directory)))))
+        (setq gptel-agent-instructions--boundary boundary
+              gptel-agent-instructions--working-directory directory
+              gptel-agent-instructions--registry nil
+              gptel-agent-instructions--targets nil
+              gptel-agent-instructions--sent nil)))
+    (when fsm
+      (let ((info (gptel-agent-instructions--info fsm)))
+        (unless (equal directory (plist-get info :agent-instructions-directory))
+          (setf (plist-get info :agent-instructions-directory) directory
+                (plist-get info :agent-instructions-started) nil
+                (plist-get info :agent-instructions-targets) nil))))))
 
 (defun gptel-agent-instructions--directory (path &optional directory)
   "Resolve PATH to a canonical scope, treating it as a DIRECTORY if non-nil.
@@ -264,7 +283,7 @@ Used before every send and before saving a retained worker's conversation."
       (with-current-buffer (plist-get info :buffer)
         (let (records)
           (when (gptel-agent-instructions--enabled-p fsm)
-            (gptel-agent-instructions--initialize)
+            (gptel-agent-instructions--initialize fsm)
             (unless (plist-get info :agent-instructions-started)
               (dolist (path (mapcar #'car gptel-agent-instructions--registry))
                 (gptel-agent-instructions--load path))
@@ -283,6 +302,8 @@ Used before every send and before saving a retained worker's conversation."
                                (list (gptel-agent-instructions--directory default-directory t))))))
           (gptel-agent-instructions--render info (gptel-agent-instructions--format records))
           (setf (plist-get info :agent-instructions-started) t
+                (plist-get info :agent-instructions-sent-directory)
+                gptel-agent-instructions--working-directory
                 (plist-get info :agent-instructions-sent) (copy-tree records t))
           (setq gptel-agent-instructions--sent (copy-tree records t))
           (gptel-agent-instructions--wrap-tools fsm)
@@ -322,11 +343,14 @@ Used before every send and before saving a retained worker's conversation."
   (let* ((info (gptel-fsm-info fsm))
          (records (gptel-agent-instructions--records directories))
          (sent (plist-get info :agent-instructions-sent)))
-    (when (or (cl-some (lambda (r) (plist-get r :error)) records)
+    (when (or (and directories (plist-get info :agent-instructions-sent-directory)
+                   (not (equal (plist-get info :agent-instructions-sent-directory)
+                               gptel-agent-instructions--working-directory)))
+              (cl-some (lambda (r) (plist-get r :error)) records)
               (cl-some (lambda (dir)
                          (not (equal (gptel-agent-instructions--signature records dir)
                                      (gptel-agent-instructions--signature sent dir)))) directories))
-      (format (concat "Deferred before staging or writing. Project instructions changed or were not "
+      (format (concat "Deferred before staging or writing. Working directory or project instructions changed, or instructions were not "
                       "supplied for targets: %s. Applicable sources: %s. "
                       "Read the updated scoped instructions on the next call, reconsider, and propose "
                       "a new operation. The old arguments will not be replayed.")
@@ -366,6 +390,7 @@ Used before every send and before saving a retained worker's conversation."
       (setf (plist-get info :agent-instructions-tool-batch) (plist-get info :tool-use))
       (with-current-buffer (plist-get info :buffer)
         (when (gptel-agent-instructions--enabled-p fsm)
+          (gptel-agent-instructions--initialize fsm)
           (let (directories mutation-directories calls failures)
             (dolist (call (plist-get info :tool-use))
               (when (and (not (plist-get call :result))
@@ -407,6 +432,7 @@ Used before every send and before saving a retained worker's conversation."
 (defun gptel-agent-instructions--guard-directories (fsm directories)
   "Recheck DIRECTORIES before staging/writing; signal when FSM must reconsider."
   (when (gptel-agent-instructions--enabled-p fsm)
+    (gptel-agent-instructions--initialize fsm)
     (gptel-agent-instructions--select
      fsm (delete-dups (append (plist-get (gptel-fsm-info fsm) :agent-instructions-targets)
                               directories)))
@@ -451,6 +477,7 @@ Used before every send and before saving a retained worker's conversation."
                                             (setq args (plist-put args (intern (concat ":" (plist-get spec :name))) value)))
                                           (gptel-tool-args tool) values)
                                  (when (gptel-agent-instructions--enabled-p fsm)
+                                   (gptel-agent-instructions--initialize fsm)
                                    (let ((dirs (gptel-agent-instructions--tool-targets name args)))
                                      (gptel-agent-instructions--select
                                       fsm (delete-dups

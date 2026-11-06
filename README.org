@@ -108,6 +108,24 @@ buffers and the minibuffer.
 Please note: gptel-agent uses significantly more tokens than the average
 gptel LLM interaction.
 
+*** Working directories
+
+Use =M-x cd= in a chat buffer to change its working directory. Subsequent
+tools and requests use the new directory; project-instruction discovery
+refreshes automatically, including when moving to a different project. The
+conversation history remains available. Other chats and already running
+workers or shell processes keep their own directories.
+
+Both =Agent= and =Discussion= accept an optional =directory= argument, for
+example ="/path/to/project"= or ="../other-project"=. The directory must exist;
+relative paths resolve against the calling chat's directory. Each child
+discovers project instructions in its own directory. Omitting =directory=
+inherits the parent's directory for a new child. An =Agent= follow-up using
+=agent_id= keeps the worker's current directory unless =directory= is supplied.
+
+A =cd= inside =Bash= affects only that shell invocation. To change the chat's
+directory from the agent, =Eval= can evaluate =(cd "/path/to/project")=.
+
 *** Scoped project instructions
 
 All gptel conversations automatically discover plain-text =AGENTS.md= files
@@ -565,7 +583,8 @@ prompt. It inherits the creating request's model, backend, system prompt, active
 tools (including tools activated by skills) and confirmation settings; an
 optional existing =preset= can override them.
 It starts without the parent's transcript or attached context. An optional
-=directory= selects its working directory. Skill instructions and pre-approvals
+=directory= selects its working directory, including another project; relative
+paths resolve against the creating chat's directory. Skill instructions and pre-approvals
 belong to each conversation separately; inherited tools use their original
 confirmation settings. A child loads skills for their instructions and its own
 pre-approvals. Approving discussion management does not approve child tool calls.
@@ -766,7 +785,8 @@ for tools, permissions, retries or descendants remain active; task timeouts
 continue to apply. Aborting or closing a chat cancels its worker subtree and
 pending wakeups. Unrecoverable parent failures also stop descendants.
 
-Worker orchestration is scoped to the existing chat and workspace. It does not
+Worker orchestration is owned by the creating chat; workers can use separate
+working directories through =directory=. It does not
 add peer messaging, shared scheduling, worktree isolation or persistence across
 Emacs restarts. Background shell jobs keep their separate existing lifecycle.
 

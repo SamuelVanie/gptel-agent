@@ -3245,7 +3245,7 @@ The value must be nil (unlimited) or a non-negative integer."
 
 (defun gptel-agent--task (main-cb agent-type description prompt
                                   &optional parent-fsm agent-snapshot
-                                  result-file query agent-id background)
+                                  result-file query agent-id background directory)
   "Call a gptel agent to do specific compound tasks.
 
 MAIN-CB is the main callback to return a value to the main loop.
@@ -3257,7 +3257,10 @@ RESULT-FILE and QUERY are the enforced scope contract used only by the
 `result-explorer' agent.  AGENT-ID continues a completed conversation owned
 by the same parent buffer; nil or a blank string starts a new conversation.
 BACKGROUND equal to t acknowledges launch immediately; completion is queued
-on PARENT-FSM and cannot finish that parent turn before delivery."
+on PARENT-FSM and cannot finish that parent turn before delivery.
+DIRECTORY is an existing working directory, relative to the parent chat.
+If omitted, new agents inherit the parent's directory and follow-ups keep
+the child's current directory."
   (let* ((parent-info (and (gptel-fsm-p parent-fsm)
                            (gptel-fsm-info parent-fsm)))
          (parent-buffer (and parent-info (plist-get parent-info :buffer)))
@@ -3269,6 +3272,19 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
                        (with-current-buffer parent-buffer
                          (cdr (assoc agent-id gptel-agent--sessions)))))
          (previous (and session (gptel-agent--session-run session)))
+         (directory-error
+          (when (buffer-live-p parent-buffer)
+            (condition-case err
+                (with-current-buffer parent-buffer
+                  (setq directory
+                        (gptel-agent-path-working-directory
+                         directory
+                         (when (and previous
+                                    (buffer-live-p (gptel-agent--run-child-buffer previous)))
+                           (buffer-local-value 'default-directory
+                                               (gptel-agent--run-child-buffer previous)))))
+                  nil)
+              (error (error-message-string err)))))
          (agent-snapshot (or agent-snapshot gptel-agent--agent-snapshot
                              (gptel-agent--snapshot-agent-definitions)))
          (agent-plist (cdr (assoc-string agent-type agent-snapshot t)))
@@ -3315,6 +3331,9 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
                         (gptel-agent--run-child-buffer previous)))))
       (with-current-buffer parent-buffer
         (funcall main-cb "Error: A result-explorer follow-up must keep the original result_file and query.")))
+     (directory-error
+      (with-current-buffer parent-buffer
+        (funcall main-cb (concat "Error: " directory-error))))
      (t
       (let* ((where (gptel-agent--task-response-position parent-fsm))
              task-timeout max-request-rounds
@@ -3386,9 +3405,8 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
                 (gptel-agent--copy-parent-request-config
                  parent-buffer child-buffer parent-fsm))
               (with-current-buffer child-buffer
+                (setq default-directory directory)
                 (unless previous
-                  (setq default-directory
-                        (buffer-local-value 'default-directory parent-buffer))
                   (setq-local gptel-agent--current-agent agent-type
                               gptel-agent--agent-snapshot agent-snapshot
                               gptel-agent--supervised-run run
@@ -3406,8 +3424,9 @@ on PARENT-FSM and cannot finish that parent turn before delivery."
                               :request-params (copy-tree gptel--request-params))))
                 (let ((inhibit-read-only t))
                   (goto-char (point-max))
-                  (insert (format "Sub-agent run: %s\nAgent: %s\nTask: %s\nModel: %s\nTimeout: %s\nRound limit: %s\n\nPrompt:\n%s\n\n"
+                  (insert (format "Sub-agent run: %s\nAgent: %s\nTask: %s\nDirectory: %s\nModel: %s\nTimeout: %s\nRound limit: %s\n\nPrompt:\n%s\n\n"
                                   (gptel-agent--run-id run) agent-type description
+                                  default-directory
                                   (gptel--model-name gptel-model)
                                   (or task-timeout "unlimited")
                                   (or max-request-rounds "unlimited")
@@ -4124,7 +4143,9 @@ The preference for dedicated tools is not a ban on Bash file operations.
 
 - Quote file paths with spaces using double quotes.
 - Chain dependent commands with && (or ; if failures are OK)
-- Use absolute paths instead of cd when possible
+- Use absolute paths instead of cd when possible. Shell cd affects only this \
+invocation; to change the conversation's working directory, use Eval with \
+(cd \"/path/to/project\"). Agent and Discussion accept directory for a child's workspace.
 - For parallel commands, make multiple `Bash` calls in one message
 - Prefer foreground Bash (background=false, the default) for tests, builds and \
 commands whose result you need before proceeding. It waits for completion.
@@ -4639,6 +4660,8 @@ call Agent again with that agent_id, the same subagent_type, and the new \
 description and prompt. The agent retains its conversation and tool evidence. \
 Omit agent_id or leave it empty to start a new conversation. Only idle, \
 completed agents in this chat can be continued; each follow-up gets fresh task limits. \
+Set directory to choose the worker's working directory, including another project. \
+Omit it to inherit this chat's directory for a new agent or keep a resumed agent's directory. \
 Treat agent results as evidence reports: inspect their evidence, assumptions, \
 verification gaps and confidence before relying on them.  A negative or \
 inconclusive report is a valid completed outcome; do not repeat the same \
@@ -4750,9 +4773,9 @@ the global registry while this request is in flight."
             (plist-get (car args) :enum) (vconcat (mapcar #'car snapshot))
             (gptel-tool-function tool)
             (lambda (main-cb agent-type description prompt
-                             &optional result-file query agent-id background)
+                             &optional result-file query agent-id background directory)
               (gptel-agent--task main-cb agent-type description prompt
-                                 fsm snapshot result-file query agent-id background)))
+                                 fsm snapshot result-file query agent-id background directory)))
       (setq-local
        gptel-tools
        (if snapshot
@@ -4783,10 +4806,10 @@ The registered tool is deliberately immutable.  See
   (gptel-get-tool "Agent"))
 
 (defun gptel-agent--task-tool-dispatch
-    (main-cb agent-type description prompt &optional result-file query agent-id background)
+    (main-cb agent-type description prompt &optional result-file query agent-id background directory)
   "Dispatch an Agent tool call before request-local FSM ownership is attached."
   (gptel-agent--task main-cb agent-type description prompt
-                     nil nil result-file query agent-id background))
+                     nil nil result-file query agent-id background directory))
 
 (gptel-make-tool
  :name "Agent"
@@ -4821,7 +4844,11 @@ automatically appended.")
          ( :name "background"
            :type boolean
            :optional t
-           :description "Return immediately with agent_id and run_id; completion is delivered automatically. Omit or false preserves blocking behavior."))
+           :description "Return immediately with agent_id and run_id; completion is delivered automatically. Omit or false preserves blocking behavior.")
+         ( :name "directory"
+           :type string
+           :optional t
+           :description "Existing working directory for the agent, including a different project. Relative paths resolve against the calling chat's directory. Omit or leave empty to inherit that directory for a new agent, or retain a resumed agent's current directory. An explicit directory also changes a resumed agent's directory."))
  :category "gptel-agent"
  :async t
  :confirm t
