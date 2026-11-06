@@ -228,9 +228,16 @@ same request resumes with the answers or cancellation before it can finish.
 
 Questions appear in a separate =*Questions: …*= buffer that refreshes in
 place as the list grows. Existing answers, choices and custom text are
-preserved. The buffer does not take focus or mix its UI into the conversation.
-Use =M-x gptel-agent-questions= from the conversation to reopen it, including
-questions from its workers. Each request has its own queue.
+preserved. By default, it opens below the conversation window, without taking
+focus. It only splits that window, leaving other windows alone. If the window
+is too short to split, questions temporarily replace the conversation there.
+Set =gptel-agent-questions-display= to =same-window= to always use that behavior;
+submitting or cancelling restores the conversation. Its default value is
+=below=.
+
+If the conversation is hidden, questions stay queued without changing the
+layout. Use =M-x gptel-agent-questions= from the conversation to show them,
+including questions from its workers. Each request has its own queue.
 
 | Key | Action |
 |-----+--------|

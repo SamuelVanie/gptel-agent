@@ -3537,6 +3537,19 @@ the child's current directory."
 
 ;;; Ask tools (user interaction)
 
+(defcustom gptel-agent-questions-display 'below
+  "Where to show questions relative to their conversation window.
+With `below', split that window from the bottom, falling back to the
+same window if it cannot be split.  With `same-window', temporarily
+replace the conversation with its questions.
+
+Automatic display never selects the questions window.  If neither the
+conversation nor its questions are visible, leave the questions queued;
+use `gptel-agent-questions' to show them explicitly."
+  :type '(choice (const :tag "Below the conversation" below)
+                 (const :tag "In the conversation window" same-window))
+  :group 'gptel-agent)
+
 (cl-defstruct (gptel-agent--question-queue
                (:constructor gptel-agent--make-question-queue))
   fsm source owner buffer overlay callback result)
@@ -3546,6 +3559,42 @@ the child's current directory."
 
 (defvar-local gptel-agent--question-queue nil
   "Queue displayed in this questions buffer.")
+
+(defun gptel-agent--ask-display-below (buffer alist)
+  "Display BUFFER in a new window below the selected one, using ALIST.
+Return nil if that window cannot be split.  Never reuse a neighboring
+window displaying unrelated work."
+  (let ((window-combination-resize nil)
+        (window-combination-limit t))
+    (when-let* ((window (condition-case nil
+                           (split-window nil nil 'below)
+                         (error nil))))
+      (window--display-buffer buffer window 'window alist))))
+
+(defun gptel-agent--ask-display (queue &optional select)
+  "Display QUEUE at its owning conversation, optionally SELECT its window.
+Reuse an existing questions window.  Otherwise use the visible owner,
+or, only for an explicit SELECT, the selected window if the owner is hidden."
+  (let* ((buffer (gptel-agent--question-queue-buffer queue))
+         (owner (gptel-agent--question-queue-owner queue))
+         (parent (and (buffer-live-p owner) (get-buffer-window owner 'visible)))
+         (window (and (buffer-live-p buffer) (get-buffer-window buffer 'visible))))
+    (when (and (buffer-live-p buffer) (not window) (or parent select))
+      (with-selected-window (or parent (selected-window))
+        ;; Keep generic popup rules from splitting the user's current work
+        ;; or falling back to an unrelated window when this one is too small.
+        (let ((display-buffer-overriding-action
+               `(,(append
+                   (when (and parent
+                              (eq (buffer-local-value
+                                   'gptel-agent-questions-display owner) 'below))
+                     '(gptel-agent--ask-display-below))
+                   '(display-buffer-same-window display-buffer-no-window))
+                 (allow-no-window . t)
+                 (inhibit-same-window . nil))))
+          (setq window (display-buffer buffer)))))
+    (when (and select window) (select-window window))
+    window))
 
 (defun gptel-agent--ask-insert-result (gate result)
   "Retain an automatically collected RESULT in GATE's editable transcript.
@@ -3609,7 +3658,7 @@ Deliver the result as harness context, without fabricating a model tool call."
               ((buffer-live-p buffer)))
     (with-current-buffer buffer
       (setq gptel-agent--question-queue nil)
-      (kill-buffer buffer))))
+      (quit-windows-on buffer t))))
 
 (defun gptel-agent--ask-finish (queue result)
   "Store RESULT once for QUEUE, delivering it only to an explicit waiter."
@@ -3647,9 +3696,13 @@ Deliver the result as harness context, without fabricating a model tool call."
          (buffers (delq nil (mapcar #'gptel-agent--question-queue-buffer queues)))
          (names (mapcar #'buffer-name (seq-filter #'buffer-live-p buffers))))
     (unless names (user-error "No pending questions"))
-    (pop-to-buffer (if (cdr names)
-                       (completing-read "Questions: " names nil t)
-                     (car names)))))
+    (gptel-agent--ask-display
+     (buffer-local-value
+      'gptel-agent--question-queue
+      (get-buffer (if (cdr names)
+                      (completing-read "Questions: " names nil t)
+                    (car names))))
+     t)))
 
 (defun gptel-agent--ask-normalize (questions)
   "Copy QUESTIONS and append the free-text choice to each one."
@@ -3722,7 +3775,7 @@ CALLBACK receives an acknowledgement for add, or the user's result for wait."
                                       (make-vector (length questions)
                                                    (and (eq property 'gptel-ask--selections) 0)))))
               (gptel-agent--ask-update-overlay ov)))
-          (display-buffer (overlay-buffer ov))
+          (gptel-agent--ask-display queue)
           (setq result
                 (format "status: collecting\nquestions: %d\nQuestions queued; no answers returned yet. Continue independent work and add further questions with AskUserQuestion. When ready, call AskUserQuestion with action=wait and omit questions; wait for its result before dependent work or finishing."
                         (length (overlay-get ov 'gptel-ask--questions))))))))
@@ -3746,7 +3799,7 @@ CALLBACK receives an acknowledgement for add, or the user's result for wait."
           (with-current-buffer (gptel-agent--question-queue-owner queue)
             (run-hook-with-args 'gptel-agent-question-functions
                                 ov (overlay-get ov 'gptel-ask--questions) source))
-          (when (overlay-buffer ov) (display-buffer (overlay-buffer ov)))))))
+          (when (overlay-buffer ov) (gptel-agent--ask-display queue))))))
      (t (setq result "Error: action must be add or wait.")))
     (unless deferred (funcall callback result))
     nil))

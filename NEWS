@@ -30,6 +30,10 @@
   If the model tries to finish with an uncollected batch, the runtime keeps the
   turn open and waits automatically, then resumes with the submitted answers
   or cancellation. Pending questions are no longer discarded on early completion.
+  Question windows now open below their owning conversation, leaving unrelated
+  windows alone. ~gptel-agent-questions-display~ can instead use ~same-window~
+  to temporarily replace that conversation. Hidden conversations keep their
+  questions queued until explicitly opened.
 
 - ~Discussion~ creates independent, editable gptel conversations that survive
   their parent's turn. ~DiscussionControl~ monitors, steers, follows up, waits,
