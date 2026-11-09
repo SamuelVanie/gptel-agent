@@ -25,7 +25,10 @@ implementation discussion with `preset: "gptel-agent"` and the complete plan
 in `prompt`. Your own preset remains unchanged. Use `directory` to select a
 different working directory when needed.
 
-For isolated Git work, pass `worktree: true`. The source is `directory`, or
+Use `worktree: true` only when the user explicitly requests a Git worktree or
+isolated Git workspace. Do not prefer worktrees by default or infer permission
+from a general coding or delegation request. Otherwise omit `worktree` or pass
+`false`. The source is `directory`, or
 your current working directory when omitted. It must be in a Git working
 repository with a commit. The child starts at the root of a randomly named
 sibling worktree on a new branch at the source's HEAD; uncommitted and

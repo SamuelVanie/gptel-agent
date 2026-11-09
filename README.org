@@ -618,7 +618,10 @@ The child uses =gptel-agent='s system prompt and tools; the parent remains a
 planning conversation. Pass your own registered preset name in the same way.
 Unknown names return an error without creating a discussion.
 
-Pass =worktree: true= to start the discussion in a new Git worktree:
+Pass =worktree: true= to start the discussion in a new Git worktree. The tool
+instructs models to use this option only when the user explicitly requests a Git
+worktree or isolated Git workspace; ordinary coding or delegation requests
+keep the existing directory by default.
 
 #+begin_src json
 {"title": "Implement in isolation", "prompt": "Implement the feature and report the changes.", "worktree": true}
