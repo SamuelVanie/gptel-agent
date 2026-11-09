@@ -4,6 +4,12 @@
 
 ** New features and UI changes
 
+- ~Discussion~ accepts ~worktree: true~ to create a randomly named Git
+  worktree and branch from the selected ~directory~, or the caller's directory.
+  The child starts at the new worktree root. Creation and status results
+  include the path, branch, source repository/directory and starting commit.
+  Worktrees start at the source's committed HEAD and remain after closing.
+
 - The bundled ~executor~ agent has been removed. The default agent now
   handles implementation and verification directly, with ~researcher~ and
   ~result-explorer~ available for delegated investigation.

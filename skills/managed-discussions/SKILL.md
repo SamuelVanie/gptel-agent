@@ -25,6 +25,15 @@ implementation discussion with `preset: "gptel-agent"` and the complete plan
 in `prompt`. Your own preset remains unchanged. Use `directory` to select a
 different working directory when needed.
 
+For isolated Git work, pass `worktree: true`. The source is `directory`, or
+your current working directory when omitted. It must be in a Git working
+repository with a commit. The child starts at the root of a randomly named
+sibling worktree on a new branch at the source's HEAD; uncommitted and
+untracked files are not copied. The result includes its path, branch, source
+repository/directory and starting commit, also available through
+`DiscussionControl list/read`. Closing a discussion retains its worktree and
+branch for review, integration and manual cleanup.
+
 Use `DiscussionControl` to list or read owned discussions, send a follow-up or
 steering message, or close a discussion while retaining its transcript. Do useful
 work while a discussion runs. Ordinary replies and attention alerts stay in the

@@ -22,7 +22,7 @@
 
 (cl-defstruct (gptel-agent-discussion--chat
                (:constructor gptel-agent-discussion--make-chat))
-  id title owner buffer fsm (turn 0) (state 'idle) result pending review)
+  id title owner buffer fsm (turn 0) (state 'idle) result pending review worktree)
 
 (cl-defstruct (gptel-agent-discussion--interaction
                (:constructor gptel-agent-discussion--make-interaction))
@@ -68,12 +68,19 @@
 
 (defun gptel-agent-discussion--status (chat)
   "Return a compact status for CHAT."
-  (format "discussion_id: %s\ntitle: %s\nbuffer: %s\nstatus: %s\nturn: %d"
-          (gptel-agent-discussion--chat-id chat)
-          (gptel-agent-discussion--chat-title chat)
-          (or (buffer-name (gptel-agent-discussion--chat-buffer chat)) "(killed)")
-          (gptel-agent-discussion--chat-state chat)
-          (gptel-agent-discussion--chat-turn chat)))
+  (concat
+   (format "discussion_id: %s\ntitle: %s\nbuffer: %s\nstatus: %s\nturn: %d"
+           (gptel-agent-discussion--chat-id chat)
+           (gptel-agent-discussion--chat-title chat)
+           (or (buffer-name (gptel-agent-discussion--chat-buffer chat)) "(killed)")
+           (gptel-agent-discussion--chat-state chat)
+           (gptel-agent-discussion--chat-turn chat))
+   (when (buffer-live-p (gptel-agent-discussion--chat-buffer chat))
+     (format "\ndirectory: %s"
+             (buffer-local-value 'default-directory
+                                 (gptel-agent-discussion--chat-buffer chat))))
+   (when-let* ((worktree (gptel-agent-discussion--chat-worktree chat)))
+     (concat "\n" (gptel-agent-discussion--worktree-info worktree)))))
 
 (defun gptel-agent-discussion--clip (text)
   "Bound TEXT for model reports, leaving the transcript available via read."
@@ -359,9 +366,9 @@ and can be inspected with DiscussionControl read without waking the owner."
             (setf (gptel-tool-function tool)
                   (if (equal name "Discussion")
                       (let ((config (plist-get info :discussion-config)))
-                        (lambda (callback title prompt &optional preset directory)
+                        (lambda (callback title prompt &optional preset directory worktree)
                           (gptel-agent-discussion--dispatch-create
-                           callback fsm config title prompt preset directory)))
+                           callback fsm config title prompt preset directory worktree)))
                     (lambda (callback action &optional id message request-id ids offset)
                       (gptel-agent-discussion--control
                        callback fsm action id message request-id ids offset))))
@@ -643,13 +650,63 @@ SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
   (unless (and (stringp text) (not (string-empty-p (string-trim text))))
     (user-error "%s must be nonempty" label)))
 
-(defun gptel-agent-discussion--create (owner config title prompt preset directory)
+(defun gptel-agent-discussion--git (directory &rest args)
+  "Run Git with ARGS in DIRECTORY and return its output, or signal an error."
+  (with-temp-buffer
+    (let* ((default-directory directory)
+           (status (apply #'process-file "git" nil '(t t) nil args))
+           (output (string-trim-right (buffer-string))))
+      (unless (eq status 0)
+        (user-error "Git %s failed in %s: %s" (car args) directory output))
+      output)))
+
+(defun gptel-agent-discussion--make-worktree (directory)
+  "Create a random sibling Git worktree from DIRECTORY's HEAD.
+Return its path, branch, source repository, source directory and base commit.
+Subdirectories and existing worktrees are accepted.  Uncommitted changes
+are not copied.  Use `process-file' and host-local arguments for TRAMP."
+  (unless (equal (gptel-agent-discussion--git directory "rev-parse" "--is-inside-work-tree")
+                 "true")
+    (user-error "Worktree requires a Git working repository: %s" directory))
+  (let* ((root (file-name-as-directory
+                (concat (file-remote-p directory)
+                        (gptel-agent-discussion--git directory "rev-parse" "--show-toplevel"))))
+         (commit (gptel-agent-discussion--git directory "rev-parse" "--verify" "HEAD^{commit}"))
+         (prefix (concat (directory-file-name root) "-discussion-"))
+         ;; Reserving an empty sibling directory avoids races and keeps the
+         ;; checkout outside the source tree and temporary-file cleanup.
+         (path (make-temp-file prefix t))
+         (branch (concat "gptel-discussion/" (substring path (length prefix)))))
+    (condition-case err
+        (gptel-agent-discussion--git
+         root "worktree" "add" "--quiet" "-b" branch "--" (file-local-name path) commit)
+      (error
+       ;; Remove only our empty reservation.  Never force-remove a checkout
+       ;; or delete a branch: Git/hooks may have left recoverable work there.
+       (when (and (file-directory-p path) (directory-empty-p path))
+         (delete-directory path))
+       (user-error "Could not create worktree %s (branch %s): %s"
+                   path branch (error-message-string err))))
+    (list :path (file-name-as-directory path) :branch branch :repository root
+          :source-directory directory :base-commit commit)))
+
+(defun gptel-agent-discussion--worktree-info (worktree)
+  "Format the creation metadata for WORKTREE."
+  (format "worktree: %s\nworktree_branch: %s\nworktree_repository: %s\nworktree_source_directory: %s\nworktree_base_commit: %s"
+          (plist-get worktree :path) (plist-get worktree :branch)
+          (plist-get worktree :repository) (plist-get worktree :source-directory)
+          (plist-get worktree :base-commit)))
+
+(defun gptel-agent-discussion--create (owner config title prompt preset directory &optional worktree)
   "Create an independent chat for OWNER using CONFIG, TITLE and PROMPT.
 Omitted or empty PRESET keeps inherited request settings.  Otherwise any
 registered gptel PRESET overrides the settings it specifies.
-DIRECTORY selects its working directory."
+DIRECTORY selects its working directory.  When WORKTREE is t, create a
+new Git worktree from that directory and start the chat in its root."
   (gptel-agent-discussion--nonempty title "title")
   (gptel-agent-discussion--nonempty prompt "prompt")
+  (unless (memq worktree '(nil t :json-false :null))
+    (user-error "worktree must be a boolean"))
   (let* ((spec (and preset (not (equal preset ""))
                     (or (and-let* ((spec (or (gptel-get-preset preset)
                                              (and (stringp preset) (intern-soft preset)
@@ -658,12 +715,16 @@ DIRECTORY selects its working directory."
                         (user-error "Cannot find gptel preset %S" preset))))
          (directory (with-current-buffer owner
                       (gptel-agent-path-working-directory directory)))
+         (worktree (and (eq worktree t)
+                        (gptel-agent-discussion--make-worktree directory)))
+         (directory (or (plist-get worktree :path) directory))
          (id (gptel-agent-discussion--id "discussion")))
     (let* ((buffer (generate-new-buffer (format "*gptel:%s*" (truncate-string-to-width title 70))))
            (chat (gptel-agent-discussion--make-chat
-                  :id id :title title :owner owner :buffer buffer)))
+                  :id id :title title :owner owner :buffer buffer :worktree worktree)))
       (condition-case err
           (with-current-buffer buffer
+            (setq default-directory directory)
             (funcall gptel-default-mode)
             (dolist (entry config)
               (set (make-local-variable (car entry))
@@ -682,6 +743,8 @@ DIRECTORY selects its working directory."
               (gptel--apply-preset spec
                                    (lambda (symbol value)
                                      (set (make-local-variable symbol) value))))
+            (when worktree
+              (setq default-directory directory))
             (setq-local gptel-prompt-transform-functions
                         (copy-sequence gptel-prompt-transform-functions))
             (add-hook 'gptel-prompt-transform-functions
@@ -689,8 +752,12 @@ DIRECTORY selects its working directory."
             (gptel-mode 1)
             (setq-local gptel-agent-discussion--self chat)
             (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
-            (insert (gptel-prompt-prefix-string)
-                    "Message from the managing conversation:\n" prompt)
+            (insert (gptel-prompt-prefix-string))
+            (when worktree
+              (insert "Git worktree created for this discussion:\n"
+                      (gptel-agent-discussion--worktree-info worktree)
+                      "\nStarts at the source HEAD commit; uncommitted and untracked files are not copied. The worktree and branch remain after this discussion closes.\n\n"))
+            (insert "Message from the managing conversation:\n" prompt)
             (with-current-buffer owner
               (push chat gptel-agent-discussion--children))
             (let ((mark-active nil)) (gptel-send)))
@@ -724,9 +791,9 @@ DIRECTORY selects its working directory."
      (plist-get info :tools))))
 
 (defun gptel-agent-discussion--dispatch-create
-    (callback fsm config title prompt preset directory)
+    (callback fsm config title prompt preset directory &optional worktree)
   "Create a chat from live owner FSM, then return its identity to CALLBACK.
-CONFIG, TITLE, PROMPT, PRESET and DIRECTORY describe the new discussion."
+CONFIG, TITLE, PROMPT, PRESET, DIRECTORY and WORKTREE describe the discussion."
   (let ((result
          (condition-case err
              (progn
@@ -740,7 +807,7 @@ CONFIG, TITLE, PROMPT, PRESET and DIRECTORY describe the new discussion."
                      (gptel-agent-discussion--inherited-tools fsm))
                (let ((chat (gptel-agent-discussion--create
                             (plist-get (gptel-fsm-info fsm) :buffer)
-                            config title prompt preset directory)))
+                            config title prompt preset directory worktree)))
                  (concat (gptel-agent-discussion--status chat)
                          "\nReplies and attention alerts stay in the discussion. Only an explicit DiscussionReport notifies you. Use send to ask for a report, or read to inspect its work and pending interactions. The user can open this buffer or M-x gptel-agent-discussions.")))
            (error (concat "Error: " (error-message-string err))))))
@@ -1013,7 +1080,8 @@ If a draft remains, send it explicitly with `gptel-send' instead."
  :args '((:name "title" :type string :description "Short discussion title.")
          (:name "prompt" :type string :description "Self-contained opening message; parent transcript is not copied.")
          (:name "preset" :type string :optional t :description "Omit or leave empty to inherit this request's current settings. Otherwise apply any registered gptel preset by name, including user-defined presets outside gptel-agent. Its specified settings override inherited values; unspecified settings remain inherited. For example, a planning conversation can use gptel-agent for an implementation discussion.")
-         (:name "directory" :type string :optional t :description "Existing working directory, including a different project. Relative paths resolve against the calling chat's directory. Omit or leave empty to inherit that directory. The child discovers its own project instructions."))
+         (:name "directory" :type string :optional t :description "Existing working directory, including a different project. Relative paths resolve against the calling chat's directory. Omit or leave empty to inherit that directory. With worktree=true, selects the source Git repository. The child discovers its own project instructions.")
+         (:name "worktree" :type boolean :optional t :description "Create a randomly named Git worktree and new branch from the selected directory's HEAD, then start the child at the worktree root. Requires a Git working repository with a commit. The worktree is a sibling of the source repository; uncommitted and untracked files are not copied. Returns its path, branch, source repository/directory and starting commit. Closing the discussion retains the worktree and branch. Omit or use false for the existing directory."))
  :category "gptel-agent" :async t :include t :confirm t)
 
 (gptel-make-tool

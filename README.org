@@ -618,6 +618,32 @@ The child uses =gptel-agent='s system prompt and tools; the parent remains a
 planning conversation. Pass your own registered preset name in the same way.
 Unknown names return an error without creating a discussion.
 
+Pass =worktree: true= to start the discussion in a new Git worktree:
+
+#+begin_src json
+{"title": "Implement in isolation", "prompt": "Implement the feature and report the changes.", "worktree": true}
+#+end_src
+
+The source is =directory= when supplied, or the calling chat's current
+directory otherwise. Relative paths resolve against the caller. A repository
+subdirectory or an existing worktree is accepted. The source must belong to a
+Git working repository with at least one commit; invalid sources return an
+error without starting a discussion.
+
+The new checkout is a randomly named sibling of the source repository root,
+such as =/projects/app-discussion-aB12cD/=, on a new branch such as
+=gptel-discussion/aB12cD=. It starts at the source's current =HEAD= commit;
+uncommitted and untracked files are not copied. The child starts at the new
+worktree root and discovers project instructions there. Omitting =worktree=
+or passing =false= keeps the ordinary directory behavior.
+
+The creation result and =DiscussionControl list/read= include the working
+directory, worktree path, branch at creation, source repository and directory,
+and starting commit. These details are also included in the child's opening
+context. Closing either conversation retains the worktree and branch for
+review, merging and manual cleanup. If child startup fails after checkout,
+the failed discussion retains these details so the workspace stays inspectable.
+
 **** Skill tool declarations
 
 =allowed-tools= follows the experimental [[https://agentskills.io/specification#allowed-tools-field][Agent Skills specification]]: a
