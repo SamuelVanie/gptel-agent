@@ -123,8 +123,23 @@ discovers project instructions in its own directory. Omitting =directory=
 inherits the parent's directory for a new child. An =Agent= follow-up using
 =agent_id= keeps the worker's current directory unless =directory= is supplied.
 
-A =cd= inside =Bash= affects only that shell invocation. To change the chat's
-directory from the agent, =Eval= can evaluate =(cd "/path/to/project")=.
+Agents can request a move with =ChangeDirectory(directory, reason)=, for example
+=ChangeDirectory("../other-project", "Read the shared API implementation")=.
+The approval shows the agent/chat, current directory, absolute destination and
+reason. Use the normal tool approval controls (=C-c C-c= to approve,
+=C-c C-k= to cancel). This tool always requires approval, even with ordinary
+tool confirmations disabled or skill pre-approvals enabled. Cancelling leaves
+the directory unchanged. The destination must already exist and be local.
+
+Call =ChangeDirectory= alone; a batch combining it with other tools is deferred
+without running any of them. After approval, the next model call receives the
+new project's instructions before the agent retries its read or write. To move
+back, request another change. A stale approval after cancellation, a manual
+directory change, or a destination change cannot move the agent.
+
+A =cd= inside =Bash= affects only that shell invocation. =ChangeDirectory= is
+an approval workflow for moving the conversation, not an operating-system
+sandbox for arbitrary shell commands or Elisp evaluation.
 
 *** Scoped project instructions
 
@@ -191,11 +206,12 @@ Internal workers restricted to a single result file do not perform project
 instruction discovery, even when their parent enables it.
 New workers and discussions inherit the effective boolean preference only.
 
-The first implementation supports local files within the conversation's fixed
+The first implementation supports local files within the conversation's current
 discovery boundary. File/directory symlinks inside that boundary resolve to their
 canonical target scopes. Escaping symlinks, remote targets, and targets outside
-the boundary report an error before managed file operations; start a separate
-conversation in that project or disable this feature locally to work there.
+the boundary report an error before managed file operations. Use
+=ChangeDirectory= to request permission to move into the target project, or
+change the chat directory yourself with =M-x cd=.
 =AGENTS.md= itself must be a regular, non-symlinked file. Unreadable instructions
 and files exceeding =gptel-agent-project-instructions-max-bytes= (128 KiB by
 default) produce visible diagnostics and block mutations in their scopes;

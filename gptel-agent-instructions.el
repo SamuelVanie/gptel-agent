@@ -132,7 +132,7 @@ Internal symlinks work; remote paths and escapes from the boundary fail closed."
          (dir (file-name-as-directory (if directory path (file-name-directory path)))))
     (unless (and (gptel-agent-instructions--inside-p path gptel-agent-instructions--boundary)
                  (gptel-agent-instructions--inside-p dir gptel-agent-instructions--boundary))
-      (error "Instruction target is outside this conversation's boundary (%s): %s"
+      (error "Instruction target is outside this conversation's boundary (%s): %s. Use ChangeDirectory to request the user's approval to work in that project, then retry after reviewing its instructions"
              gptel-agent-instructions--boundary path))
     dir))
 

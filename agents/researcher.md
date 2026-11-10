@@ -6,6 +6,7 @@ description: >
   a bounded “find all” question. Returns concise evidence with paths/URLs and confidence. Do not use
   for implementation, ambiguous multi-topic prompts, or single obvious lookups.
 tools:
+  - ChangeDirectory
   - Glob
   - PathInfo
   - Grep

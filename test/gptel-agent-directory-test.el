@@ -2,6 +2,216 @@
 
 (require 'gptel-agent-instructions-test)
 
+(defun gptel-agent-directory-test--request (owner)
+  "Start a request in OWNER with ChangeDirectory available."
+  (with-current-buffer owner
+    (push (gptel-get-tool "ChangeDirectory") gptel-tools))
+  (gptel-agent-instructions-test--request owner))
+
+(defun gptel-agent-directory-test--ask (fsm directory &optional reason)
+  "Request DIRECTORY in FSM and return the pending approval calls."
+  (let ((callback (plist-get (gptel-fsm-info fsm) :callback)) pending)
+    (setf (plist-get (gptel-fsm-info fsm) :callback)
+          (lambda (response info)
+            (if (eq (car-safe response) 'tool-call)
+                (setq pending (cdr response))
+              (funcall callback response info))))
+    (gptel-agent-instructions-test--tool
+     fsm "ChangeDirectory" (list :directory directory :reason (or reason "Inspect the other project")))
+    pending))
+
+(ert-deftest gptel-agent-directory-approved-change-refreshes-all-providers ()
+  (dolist (backend (list (gptel-make-openai "move-openai" :host "example.invalid" :key "unused" :models '(test))
+                        (gptel-make-openai-responses "move-responses" :key "unused" :models '(test))
+                        (gptel-make-anthropic "move-anthropic" :key "unused" :models '(test))
+                        (gptel-make-gemini "move-gemini" :key "unused" :models '(test))
+                        (gptel-make-ollama "move-ollama" :models '(test))))
+    (let ((gptel-agent-instructions-test--backend backend))
+      (gptel-agent-instructions-test--with-project
+        (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
+          (with-current-buffer parent (cd front))
+          (setq fsm (gptel-agent-directory-test--request parent))
+          ;; Outside targets fail with actionable recovery guidance.
+          (gptel-agent-instructions-test--tool fsm "Read" (list :file_path (concat back "AGENTS.md")))
+          (should (string-match-p "Use ChangeDirectory" (gptel-agent-instructions-test--payload fsm)))
+          (let ((calls (gptel-agent-directory-test--ask fsm "../backend")))
+            (should (= (length calls) 1))
+            (should (eq (gptel-fsm-state fsm) 'TOOL))
+            (should (equal (plist-get (cadar calls) :directory) back))
+            (should (equal (buffer-local-value 'default-directory parent) front))
+            ;; Approval can be displayed/executed in another buffer.
+            (with-temp-buffer
+              (setq default-directory root)
+              (gptel--accept-tool-calls calls)
+              (should (equal default-directory root)))
+            (should (equal (buffer-local-value 'default-directory parent) back))
+            (should (equal (buffer-local-value 'gptel-agent-instructions--boundary parent) back))
+            (let ((sent (plist-get (gptel-fsm-info fsm) :agent-instructions-sent)))
+              (should (equal (mapcar (lambda (record) (plist-get record :text)) sent)
+                             '("BACK-INSTRUCTION"))))
+            (gptel-agent-instructions-test--tool fsm "Write" '(:file_path "new.txt" :content "approved"))
+            (should (file-exists-p (concat back "new.txt")))
+            (should-not (file-exists-p (concat front "new.txt")))))))))
+
+(ert-deftest gptel-agent-directory-confirmation-survives-settings-and-grants ()
+  (dolist (setting '(nil auto t))
+    (dolist (instructions '(nil t))
+      (gptel-agent-instructions-test--with-project
+        (with-current-buffer parent
+          (cd front)
+          (setq gptel-confirm-tool-calls setting
+                gptel-agent-use-project-instructions instructions
+                gptel-pre-tool-call-functions (list (lambda (_) '(:confirm nil)))))
+        (setq fsm (gptel-agent-directory-test--request parent))
+        ;; Simulate a skill pre-approval without mutating the registry template.
+        (let ((grant (gptel--copy-tool (gptel-get-tool "ChangeDirectory"))))
+          (setf (gptel-tool-confirm grant) nil
+                (plist-get (gptel-fsm-info fsm) :tools) (list grant)))
+        (should (gptel-agent-directory-test--ask fsm "../backend"))
+        (should (equal (buffer-local-value 'default-directory parent) front))))))
+
+(ert-deftest gptel-agent-directory-invalid-targets-never-ask-or-move ()
+  (dolist (directory '(nil :null "" 42 "missing" "../old.txt" "/ssh:host:/tmp/"))
+    (gptel-agent-instructions-test--with-project
+      (with-current-buffer parent (cd front))
+      (setq fsm (gptel-agent-directory-test--request parent))
+      (should-not (gptel-agent-directory-test--ask fsm directory))
+      (should (equal (buffer-local-value 'default-directory parent) front))
+      (should-not (eq (gptel-fsm-state fsm) 'TOOL))
+      (should (string-match-p "Error:" (gptel-agent-instructions-test--payload fsm)))))
+  (gptel-agent-instructions-test--with-project
+    (setq fsm (gptel-agent-directory-test--request parent))
+    (should-not (gptel-agent-directory-test--ask fsm back "  "))
+    (should (equal (buffer-local-value 'default-directory parent) root))))
+
+(ert-deftest gptel-agent-directory-denial-and-abort-invalidate-approval ()
+  (dolist (action '(deny abort manual-cd removed-target redirected-target))
+    (gptel-agent-instructions-test--with-project
+      (with-current-buffer parent (cd front))
+      (setq fsm (gptel-agent-directory-test--request parent))
+      (let* ((calls (gptel-agent-directory-test--ask fsm back))
+             (function (gptel-tool-function (caar calls))))
+        (pcase action
+          ('deny
+           (with-current-buffer parent (gptel--reject-tool-calls calls))
+           (should (string-match-p "denied by the user" (gptel-agent-instructions-test--payload fsm))))
+          ('abort (gptel--fsm-transition fsm 'ABRT))
+          ('manual-cd (with-current-buffer parent (cd root)))
+          ('removed-target (delete-directory back t))
+          ('redirected-target
+           (delete-directory back t)
+           (make-symbolic-link front (directory-file-name back))))
+        (should-error (funcall function back "Inspect the other project"))
+        (should (equal (buffer-local-value 'default-directory parent)
+                       (if (eq action 'manual-cd) root front)))))))
+
+(ert-deftest gptel-agent-directory-mixed-batch-never-reaches-edit-hooks ()
+  (gptel-agent-instructions-test--with-project
+    (with-current-buffer parent (cd front))
+    (setq fsm (gptel-agent-directory-test--request parent))
+    (let* ((info (gptel-fsm-info fsm))
+           (calls (list (list :id "move" :name "ChangeDirectory" :args (list :directory back :reason "Work there"))
+                        (list :id "write" :name "Write" :args '(:file_path "new.txt" :content "wrong project"))))
+           hooks)
+      (with-current-buffer parent
+        (setq-local gptel-pre-tool-call-functions (list (lambda (_) (setq hooks t)))))
+      (gptel--parse-response
+       (plist-get info :backend)
+       (if (gptel-openai-responses-p (plist-get info :backend))
+           `(:output ,(vconcat
+                       (mapcar (lambda (call)
+                                 `(:type "function_call" :call_id ,(plist-get call :id)
+                                         :name ,(plist-get call :name)
+                                         :arguments ,(gptel--json-encode (plist-get call :args))))
+                               calls)))
+         `(:choices [(:message (:role "assistant" :content :null
+                                     :tool_calls ,(vconcat
+                                                   (mapcar
+                                                    (lambda (call)
+                                                      `(:id ,(plist-get call :id) :type "function"
+                                                            :function (:name ,(plist-get call :name)
+                                                                             :arguments ,(gptel--json-encode (plist-get call :args)))))
+                                                    calls))))])) info)
+      (gptel--fsm-transition fsm 'TYPE)
+      (gptel--fsm-transition fsm)
+      (should-not hooks)
+      (should-not (file-exists-p (concat front "new.txt")))
+      (should-not (file-exists-p (concat back "new.txt")))
+      (should (equal (buffer-local-value 'default-directory parent) front))
+      (should (string-match-p "Call ChangeDirectory alone" (gptel-agent-instructions-test--payload fsm)))
+      (should (eq (gptel-fsm-state fsm) 'WAIT)))))
+
+(ert-deftest gptel-agent-directory-approval-preview-names-owner-and-reason ()
+  (gptel-agent-instructions-test--with-project
+    (with-current-buffer parent (cd front))
+    (with-temp-buffer
+      (gptel-agent-directory--preview (list back "Read sibling API") (list :buffer parent))
+      (dolist (text (list (buffer-name parent) front back "Read sibling API"))
+        (should (string-match-p (regexp-quote text) (buffer-string)))))))
+
+(ert-deftest gptel-agent-directory-worker-approval-moves-only-worker ()
+  (gptel-agent-instructions-test--with-project
+    (gptel-agent-workers-test--with-chat
+      (with-current-buffer parent
+        (cd front)
+        (setq-local gptel-agent-preset '(:tools ("ChangeDirectory"))))
+      (let* ((run (gptel-agent-workers-test--launch fsm))
+             (child (gptel-agent--run-child-buffer run))
+             (worker (gptel-agent--run-fsm run)))
+        (gptel-agent-workers-test--tool
+         worker "ChangeDirectory" '(:directory "../backend" :reason "Read the sibling API"))
+        (with-current-buffer parent
+          (let* ((overlay (cl-find-if
+                           (lambda (ov) (overlay-get ov 'gptel-tool))
+                           (overlays-in (point-min) (point-max))))
+                 (calls (overlay-get overlay 'gptel-tool)))
+            (should (equal (gptel-tool-name (caar calls)) "ChangeDirectory"))
+            (should (string-match-p (regexp-quote (buffer-name child)) (buffer-string)))
+            (should (equal (buffer-local-value 'default-directory child) front))
+            (gptel--accept-tool-calls calls overlay)
+            (should (equal default-directory front))))
+        (should (equal (buffer-local-value 'default-directory child) back))
+        (gptel-agent-workers-test--answer worker "Done")))))
+
+(ert-deftest gptel-agent-directory-api-without-pre-tool-handler-still-asks ()
+  (gptel-agent-instructions-test--with-project
+    (with-current-buffer parent
+      (cd front)
+      (push (gptel-get-tool "ChangeDirectory") gptel-tools)
+      (setq fsm (gptel-request "Move" :buffer parent :stream nil :callback #'ignore
+                               :transforms '(gptel-agent-instructions--transform))))
+    (should-not (assq 'TPRE (gptel-fsm-handlers fsm)))
+    (let ((calls (gptel-agent-directory-test--ask fsm back)))
+      (should calls)
+      (should (equal (buffer-local-value 'default-directory parent) front))
+      (gptel--accept-tool-calls calls)
+      (should (equal (buffer-local-value 'default-directory parent) back)))))
+
+(ert-deftest gptel-agent-directory-discussion-approval-and-cancellation ()
+  (dolist (approve '(nil t))
+    (gptel-agent-instructions-test--with-project
+      (gptel-agent-discussion-test--with-chat
+        (with-current-buffer parent (cd front))
+        (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+        (let* ((child (gptel-agent-discussion--chat-buffer chat))
+               (worker (gptel-agent-discussion--chat-fsm chat)))
+          (push (gptel-get-tool "ChangeDirectory") (plist-get (gptel-fsm-info worker) :tools))
+          (gptel-agent-workers-test--tool
+           worker "ChangeDirectory" (list :directory back :reason "Read the sibling project"))
+          (let* ((pending (car (gptel-agent-discussion--chat-pending chat)))
+                 (calls (gptel-agent-discussion--interaction-calls pending))
+                 (overlay (car (gptel-agent-discussion--interaction-overlays pending))))
+            (should (equal (buffer-local-value 'default-directory child) front))
+            (with-current-buffer child
+              (if approve (gptel--accept-tool-calls calls overlay)
+                (gptel--reject-tool-calls calls overlay)))
+            (should (equal (buffer-local-value 'default-directory child) (if approve back front)))
+            (should (equal (buffer-local-value 'default-directory parent) front))
+            (unless approve
+              (should (eq (gptel-fsm-state worker) 'ABRT))
+              (gptel--accept-tool-calls calls)
+              (should (equal (buffer-local-value 'default-directory child) front)))))))))
+
 (ert-deftest gptel-agent-directory-cd-refreshes-active-request-all-providers ()
   (dolist (backend (list (gptel-make-openai "cd-openai" :key "unused" :models '(test))
                         (gptel-make-openai-responses "cd-responses" :key "unused" :models '(test))
