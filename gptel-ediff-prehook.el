@@ -104,7 +104,8 @@ If none exists, split one off the frame root."
 
 
 (cl-defstruct (smv/gptel-ediff--view (:constructor smv/gptel-ediff--make-view))
-  queue file original proposed control revision before after config closing updating)
+  queue file original proposed control revision before after config closing updating
+  navigation-notice)
 
 (defun smv/gptel-ediff--fill (buffer text)
   "Replace preview BUFFER with TEXT, retaining its approximate line position."
@@ -139,13 +140,19 @@ If none exists, split one off the frame root."
       (user-error "The file has newer changes; refresh or reopen its review"))))
 
 (defun smv/gptel-ediff--headers (view)
-  "Display the file revision and decision throughout VIEW."
+  "Display the file position, navigation notice and revision throughout VIEW."
   (let* ((file (smv/gptel-ediff--view-file view))
-         (header (format "%s — revision %d — %s%s%s"
-                         (plist-get file :path) (plist-get file :revision) (plist-get file :status)
-                         (cond ((null (plist-get file :before)) " [new file]")
-                               ((null (plist-get file :after)) " [delete file]") (t ""))
-                         (if (plist-get file :external) " [includes external changes]" ""))))
+         (files (gptel-agent-review--queue-files (smv/gptel-ediff--view-queue view)))
+         (notice (smv/gptel-ediff--view-navigation-notice view))
+         (header (concat
+                  (propertize (format "File %d of %d" (1+ (cl-position file files)) (length files))
+                              'face 'bold)
+                  (when notice (propertize (concat " — " notice) 'face 'warning))
+                  (format " — %s — revision %d — %s%s%s"
+                          (plist-get file :path) (plist-get file :revision) (plist-get file :status)
+                          (cond ((null (plist-get file :before)) " [new file]")
+                                ((null (plist-get file :after)) " [delete file]") (t ""))
+                          (if (plist-get file :external) " [includes external changes]" "")))))
     (dolist (buffer (list (smv/gptel-ediff--view-control view)
                           (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-proposed view)))
       (when (buffer-live-p buffer)
@@ -210,11 +217,17 @@ If none exists, split one off the frame root."
     (smv/gptel-ediff--destroy view)))
 
 (defun smv/gptel-ediff--navigate (view offset)
-  "Switch from VIEW by OFFSET files in the live review list."
+  "Switch from VIEW by OFFSET files, announcing wraps in the live review list."
   (let* ((queue (smv/gptel-ediff--view-queue view))
          (files (gptel-agent-review--queue-files queue))
-         (index (cl-position (smv/gptel-ediff--view-file view) files)))
-    (smv/gptel-ediff-open queue (nth (mod (+ index offset) (length files)) files))))
+         (count (length files))
+         (index (+ (cl-position (smv/gptel-ediff--view-file view) files) offset))
+         (notice (cond ((>= index count) "Wrapped to first file")
+                       ((< index 0) "Wrapped to last file"))))
+    (if (= count 1)
+        (message "Only file in review")
+      (smv/gptel-ediff-open queue (nth (mod index count) files) notice)
+      (when notice (message "%s" notice)))))
 
 (defun smv/gptel-ediff--comment (view source)
   "Submit immediate feedback on the selected region of VIEW's SOURCE buffer."
@@ -245,8 +258,9 @@ If none exists, split one off the frame root."
                               (buffer-substring-no-properties beg end)))))
     (gptel-agent-review--ask (smv/gptel-ediff--view-queue view) file context)))
 
-(defun smv/gptel-ediff-open (queue file)
+(defun smv/gptel-ediff-open (queue file &optional navigation-notice)
   "Open FILE's cumulative diff from QUEUE and return immediately.
+Show NAVIGATION-NOTICE in the headers until another file is opened.
 Updates reuse the same buffers and control window; no recursive edit is used."
   (when (gptel-agent-review--sync queue (list file))
     (gptel-agent-review--refresh queue))
@@ -254,6 +268,7 @@ Updates reuse the same buffers and control window; no recursive edit is used."
   (let* ((path (plist-get file :path))
          (view (smv/gptel-ediff--make-view
                 :queue queue :file file :config (current-window-configuration)
+                :navigation-notice navigation-notice
                 :original (generate-new-buffer (format "*gptel-original: %s*" path))
                 :proposed (generate-new-buffer (format "*gptel-proposed: %s*" path))
                 :revision (plist-get file :revision)

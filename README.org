@@ -308,6 +308,12 @@ In the Ediff control buffer:
 | =A= | Ask in an aside; in A/B include the selected region or current line |
 | =C-]= | Refuse this file and close its Ediff |
 
+The Ediff headers show your position in the queue, such as =File 2 of 5=.
+When =N= wraps from the last file to the first, a highlighted
+=Wrapped to first file= notice stays until you open another file. =P= similarly
+announces wrapping to the last file. The file count updates as proposals arrive;
+moving between files does not accept them.
+
 =A= opens a =*Review aside: …*= chat below Ediff. Asking leaves the proposal's
 decision unchanged, so you can still accept it immediately. The aside starts
 with a snapshot of the conversation's history, model, system prompt and request
