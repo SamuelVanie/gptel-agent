@@ -1,6 +1,6 @@
 ---
 name: managed-discussions
-description: Create and manage separate, persistent gptel conversations.
+description: Create and manage separate, persistent gptel conversations, including implementation handoffs from read-only agents.
 compatibility: Requires gptel-agent with the discussion tools installed.
 allowed-tools: Discussion DiscussionControl
 ---
@@ -14,16 +14,28 @@ can also interact with. Use `Agent` for a bounded worker whose findings belong
 in the current task. Discussions run independently and can outlive your turn.
 
 Create a discussion with a clear title and self-contained opening prompt.
-It starts without your transcript or attached context. Omit `preset` (or pass
-an empty string) to inherit your current request settings, including local
-changes. To use different settings, choose a name from the `Discussion` tool's
-available gptel presets. These include all registered user-defined presets,
+It starts without your transcript or attached context. Honor an explicitly
+requested preset. Otherwise choose a preset suited to the child's task from
+the `Discussion` tool's available gptel presets, even when the user has not
+named one. Do not ask the user to choose a preset when the task makes the
+appropriate role clear. These include all registered user-defined presets,
 not just gptel-agent's presets or the `Agent` tool's allowed sub-agents.
+
+When the user asks for a discussion to make modifications and your own role
+or tools do not support implementation, create that discussion directly with
+an implementation-capable preset. Use `preset: "gptel-agent"` when available
+unless another advertised preset better fits the task or the user requested
+a different one. A planning or explanation role stays read-only in the parent;
+it may hand off the requested changes to this separate implementation discussion.
+Include the objective, relevant context, constraints, and any existing plan in
+`prompt`; do not require a new planning step just to start the requested work.
+
+Omit `preset` (or pass an empty string) only when your current role and settings
+already suit the child's task, or the user explicitly requests inheritance.
+Omission inherits your current request settings, including local changes.
 The chosen preset overrides only the settings it specifies; other settings
-remain inherited. For example, a planning conversation can create an
-implementation discussion with `preset: "gptel-agent"` and the complete plan
-in `prompt`. Your own preset remains unchanged. Use `directory` to select a
-different working directory when needed.
+remain inherited. Your own preset remains unchanged. Use `directory` to select
+a different working directory when needed.
 
 Use `worktree: true` only when the user explicitly requests a Git worktree or
 isolated Git workspace. Do not prefer worktrees by default or infer permission

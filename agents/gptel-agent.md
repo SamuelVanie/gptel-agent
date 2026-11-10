@@ -1,6 +1,6 @@
 ---
 name: gptel-agent
-description: The default gptel-agent
+description: Implementation agent that modifies files and runs commands to implement and verify changes.
 agents: [researcher, result-explorer]
 tools:
   - Agent

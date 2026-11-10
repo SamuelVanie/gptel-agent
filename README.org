@@ -629,8 +629,14 @@ to communicate with its parent. Preset parents, composition forms, and
 The =Discussion= tool advertises the names and descriptions of all presets
 registered with =gptel-make-preset=, including user-defined presets outside
 gptel-agent. This selection is independent of the =Agent= tool's sub-agent
-allowlist. For example, after loading =managed-discussions=, a =gptel-plan=
-conversation can hand off implementation with:
+allowlist. The discussion instructions tell the model to choose a preset suited
+to the child's task even when the user has not named one. When a read-only
+=gptel-plan= or =ask= conversation is asked to start an implementation discussion,
+it loads =managed-discussions= and directly selects an implementation-capable
+preset, using =gptel-agent= when available unless another preset fits better.
+An explicit user choice takes precedence. Inheritance is appropriate when the
+parent's role already suits the task or the user explicitly requests it.
+For example, a planning conversation can hand off implementation with:
 
 #+begin_src json
 {"title": "Implement the feature", "prompt": "Implement this self-contained plan: ...", "preset": "gptel-agent"}
