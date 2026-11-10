@@ -35,7 +35,21 @@ sibling worktree on a new branch at the source's HEAD; uncommitted and
 untracked files are not copied. The result includes its path, branch, source
 repository/directory and starting commit, also available through
 `DiscussionControl list/read`. Closing a discussion retains its worktree and
-branch for review, integration and manual cleanup.
+branch for review, integration and later cleanup.
+
+After the work is finished and integrated, use `DiscussionControl` with
+`action: "cleanup"` and its `discussion_id` to remove the generated worktree.
+Omit `delete_branch` (or use `false`) to keep the branch, or set
+`delete_branch: true` to delete it too. Cleanup closes an idle discussion and
+keeps its editable transcript. It also works after `close` or a startup failure.
+It refuses running or queued work, other discussions still using the worktree,
+live managed background processes, unsaved file edits and pending reviews.
+Resolve these first; do not close active work just to bypass cleanup checks.
+Dirty or locked worktrees, a switched branch and a detached HEAD are refused.
+Git removal and branch deletion are never forced. Branch deletion uses
+`git branch -d`: if it fails, the worktree is already removed and the branch is
+retained. Inspect the reported cleanup states, integrate the branch, then retry
+`cleanup` with `delete_branch: true`. Repeated successful calls are safe.
 
 Use `DiscussionControl` to list or read owned discussions, send a follow-up or
 steering message, or close a discussion while retaining its transcript. Do useful

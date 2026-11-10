@@ -4,6 +4,12 @@
 
 ** New features and UI changes
 
+- ~DiscussionControl cleanup~ removes a finished discussion's generated
+  worktree, keeping its transcript and branch. Optional ~delete_branch: true~
+  also attempts safe Git branch deletion. Cleanup refuses unfinished work and
+  never forces Git removal; status reports retain metadata and cleanup state,
+  including when branch deletion must be retried after integration.
+
 - ~Discussion~ accepts ~worktree: true~ to create a randomly named Git
   worktree and branch from the selected ~directory~, or the caller's directory.
   The child starts at the new worktree root. Creation and status results

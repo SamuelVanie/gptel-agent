@@ -231,5 +231,168 @@
           (should (equal (buffer-local-value 'default-directory (gptel-agent-discussion--chat-buffer chat))
                          (plist-get (gptel-agent-discussion--chat-worktree chat) :path))))))))
 
+(defun gptel-agent-worktree-test--cleanup (fsm chat &optional delete-branch)
+  "Call FSM's cleanup dispatcher for CHAT with schema-mapped DELETE-BRANCH."
+  (let ((tool (cl-find "DiscussionControl" (plist-get (gptel-fsm-info fsm) :tools)
+                       :key #'gptel-tool-name :test #'equal)) result)
+    (with-temp-buffer
+      (setq default-directory temporary-file-directory)
+      (apply (gptel-tool-function tool) (lambda (text) (setq result text))
+             (gptel--map-tool-args
+              tool (list :action "cleanup" :discussion_id (gptel-agent-discussion--chat-id chat)
+                         :delete_branch delete-branch))))
+    result))
+
+(cl-defmacro gptel-agent-worktree-test--with-finished-chat (&body body)
+  "Run BODY with a finished CHAT in a generated worktree PATH on BRANCH."
+  (declare (indent 0))
+  `(gptel-agent-worktree-test--with-repo
+     (gptel-agent-discussion-test--with-chat
+       (with-current-buffer parent (setq default-directory repo))
+       (gptel-agent-worktree-test--dispatch fsm '(:worktree t))
+       (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+       (let* ((path (plist-get (gptel-agent-discussion--chat-worktree chat) :path))
+              (branch (plist-get (gptel-agent-discussion--chat-worktree chat) :branch))
+              (child (gptel-agent-discussion--chat-buffer chat)))
+         (gptel-agent-workers-test--answer (gptel-agent-discussion--chat-fsm chat) "Finished work")
+         ,@body))))
+
+(ert-deftest gptel-agent-worktree-cleanup-keeps-branch-and-transcript-by-default ()
+  (dolist (delete-branch '(nil :json-false :null))
+    (gptel-agent-worktree-test--with-finished-chat
+      (let ((transcript (gptel-agent-discussion-test--buffer-text child))
+            (source-head (gptel-agent-worktree-test--git repo "rev-parse" "HEAD")))
+        (should (string-match-p "worktree_status: removed"
+                                (gptel-agent-worktree-test--cleanup fsm chat delete-branch)))
+        (should-not (file-exists-p path))
+        (should (eq (gptel-agent-discussion--chat-state chat) 'closed))
+        (should (equal (buffer-local-value 'default-directory child) repo))
+        (should (equal (gptel-agent-discussion-test--buffer-text child) transcript))
+        (should (equal (gptel-agent-worktree-test--git repo "rev-parse" branch) source-head))
+        (should (equal (gptel-agent-worktree-test--git repo "rev-parse" "HEAD") source-head))
+        (should-not (string-match-p (regexp-quote (directory-file-name path))
+                                    (gptel-agent-worktree-test--git repo "worktree" "list" "--porcelain")))
+        (dolist (action '("list" "read"))
+          (let ((result (gptel-agent-discussion-test--control fsm action chat)))
+            (should (string-match-p "worktree_status: removed" result))
+            (should (string-match-p "worktree_branch_status: retained" result))
+            (should (string-match-p (regexp-quote path) result))))
+        (should (string-prefix-p "Error:" (gptel-agent-discussion-test--control fsm "send" chat "Resume")))
+        ;; Retrying removal does not touch the filesystem again.
+        (cl-letf (((symbol-function 'gptel-agent-discussion--git)
+                   (lambda (&rest _) (ert-fail "Cleanup should already be complete"))))
+          (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat))))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-deletes-branch-through-backend-dispatch ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (gptel-agent-workers-test--tool
+     fsm "DiscussionControl" (list :action "cleanup" :discussion_id (gptel-agent-discussion--chat-id chat)
+                                    :delete_branch t))
+    (should-not (file-exists-p path))
+    (should (equal (gptel-agent-worktree-test--git repo "branch" "--list" branch) ""))
+    (should (string-match-p "worktree_branch_status: deleted" (gptel-agent-workers-test--data fsm)))
+    (cl-letf (((symbol-function 'gptel-agent-discussion--git)
+               (lambda (&rest _) (ert-fail "Cleanup should already be complete"))))
+      (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat t))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-retries-unmerged-branch-after-partial-success ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (with-temp-file (expand-file-name "done.txt" path) (insert "Finished work"))
+    (gptel-agent-worktree-test--git path "add" ".")
+    (gptel-agent-worktree-test--git path "commit" "--quiet" "-m" "Finished work")
+    (let ((result (gptel-agent-worktree-test--cleanup fsm chat t)))
+      (should (string-prefix-p "Error:" result))
+      (should (string-match-p "worktree_status: removed" result))
+      (should (string-match-p "worktree_branch_status: retained" result))
+      (should-not (file-exists-p path))
+      (should (eq (gptel-agent-discussion--chat-state chat) 'closed))
+      (should-not (equal (gptel-agent-worktree-test--git repo "branch" "--list" branch) "")))
+    (gptel-agent-worktree-test--git repo "merge" "--ff-only" branch)
+    (should (string-match-p "worktree_branch_status: deleted"
+                            (gptel-agent-worktree-test--cleanup fsm chat t)))
+    (should (equal (gptel-agent-worktree-test--git repo "branch" "--list" branch) ""))))
+
+(ert-deftest gptel-agent-worktree-cleanup-rejects-foreign-and-ordinary-discussions ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (gptel-agent-discussion-test--control fsm "send" chat "Continue")
+    (gptel-agent-discussion--flush child)
+    (should (string-match-p "Unknown discussion_id"
+                            (gptel-agent-worktree-test--cleanup (gptel-agent-discussion--chat-fsm chat) chat t)))
+    (should (file-directory-p path)))
+  (gptel-agent-discussion-test--with-chat
+    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+    (gptel-agent-workers-test--answer (gptel-agent-discussion--chat-fsm chat) "Finished")
+    (cl-letf (((symbol-function 'gptel-agent-discussion--git)
+               (lambda (&rest _) (ert-fail "Ordinary discussions have no worktree to clean"))))
+      (should (string-match-p "no generated worktree" (gptel-agent-worktree-test--cleanup fsm chat))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-rejects-invalid-flag-and-unfinished-work ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (should (string-match-p "delete_branch must be a boolean"
+                            (gptel-agent-worktree-test--cleanup fsm chat "true")))
+    (gptel-agent-discussion-test--control fsm "send" chat "Continue")
+    (should (string-match-p "queued discussion work" (gptel-agent-worktree-test--cleanup fsm chat)))
+    (gptel-agent-discussion--flush child)
+    (should (string-match-p "still running" (gptel-agent-worktree-test--cleanup fsm chat)))
+    (gptel-agent-workers-test--answer (gptel-agent-discussion--chat-fsm chat) "Finished again")
+    (setf (gptel-agent-discussion--chat-review chat) '(("file" 1)))
+    (should (string-match-p "pending file reviews" (gptel-agent-worktree-test--cleanup fsm chat)))
+    (setf (gptel-agent-discussion--chat-review chat) nil)
+    ;; Closing monitoring does not prevent direct user requests in that buffer.
+    (gptel-agent-discussion-test--control fsm "close" chat)
+    (with-current-buffer child (goto-char (point-max)) (insert "New user request") (gptel-send))
+    (should (string-match-p "Active or queued" (gptel-agent-worktree-test--cleanup fsm chat)))
+    (should (file-directory-p path))
+    (should-not (equal (gptel-agent-worktree-test--git repo "branch" "--list" branch) ""))))
+
+(ert-deftest gptel-agent-worktree-cleanup-refuses-dirty-locked-and-switched-worktrees ()
+  (dolist (kind '(tracked untracked locked switched detached))
+    (gptel-agent-worktree-test--with-finished-chat
+      (pcase kind
+        ('tracked (with-temp-file (expand-file-name "nested/tracked.txt" path) (insert "Uncommitted")))
+        ('untracked (with-temp-file (expand-file-name "untracked.txt" path) (insert "Untracked")))
+        ('locked (gptel-agent-worktree-test--git repo "worktree" "lock" path))
+        ('switched (gptel-agent-worktree-test--git path "checkout" "-b" "other-branch"))
+        ('detached (gptel-agent-worktree-test--git path "checkout" "--detach")))
+      (let ((result (gptel-agent-worktree-test--cleanup fsm chat t)))
+        (should (string-prefix-p "Error:" result))
+        (should (string-match-p "worktree_status: retained" result))
+        (should (string-match-p "worktree_branch_status: retained" result)))
+      (should (file-directory-p path))
+      (should (eq (gptel-agent-discussion--chat-state chat) 'idle))
+      (should-not (equal (gptel-agent-worktree-test--git repo "branch" "--list" branch) "")))))
+
+(ert-deftest gptel-agent-worktree-cleanup-refuses-unsaved-files-and-background-processes ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (with-temp-buffer
+      (setq buffer-file-name (expand-file-name "nested/tracked.txt" path))
+      (insert "Unsaved work")
+      (should (string-match-p "unsaved edits" (gptel-agent-worktree-test--cleanup fsm chat))))
+    (with-current-buffer child (gptel-agent--start-background-process "cat"))
+    (should (string-match-p "Stop background process" (gptel-agent-worktree-test--cleanup fsm chat)))
+    (with-current-buffer child (gptel-agent--process-cleanup))
+    (should (file-directory-p path))
+    (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat t)))))
+
+(ert-deftest gptel-agent-worktree-cleanup-refuses-other-discussions-sharing-workspace ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (gptel-agent-worktree-test--dispatch fsm (list :directory path))
+    (let ((other (car (buffer-local-value 'gptel-agent-discussion--children parent))))
+      (gptel-agent-workers-test--answer (gptel-agent-discussion--chat-fsm other) "Other discussion done")
+      (should (string-match-p "Close the other discussion" (gptel-agent-worktree-test--cleanup fsm chat)))
+      (gptel-agent-discussion-test--control fsm "close" other)
+      (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat t))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-supports-closed-killed-and-failed-discussions ()
+  (dolist (state '(closed killed failed cancelled))
+    (gptel-agent-worktree-test--with-finished-chat
+      (pcase state
+        ('closed (gptel-agent-discussion-test--control fsm "close" chat))
+        ('killed (kill-buffer child))
+        (_ (setf (gptel-agent-discussion--chat-state chat) state)))
+      (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat t)))
+      (should-not (file-exists-p path))
+      (should (equal (gptel-agent-worktree-test--git repo "branch" "--list" branch) "")))))
+
 (provide 'gptel-agent-worktree-test)
 ;;; gptel-agent-worktree-test.el ends here

@@ -650,8 +650,30 @@ The creation result and =DiscussionControl list/read= include the working
 directory, worktree path, branch at creation, source repository and directory,
 and starting commit. These details are also included in the child's opening
 context. Closing either conversation retains the worktree and branch for
-review, merging and manual cleanup. If child startup fails after checkout,
+review, merging and later cleanup. If child startup fails after checkout,
 the failed discussion retains these details so the workspace stays inspectable.
+
+When the work is finished and integrated, the managing agent can remove the
+generated worktree with =DiscussionControl cleanup=. The branch is kept by
+default; add =delete_branch: true= to attempt its deletion too:
+
+#+begin_src json
+{"action": "cleanup", "discussion_id": "discussion-1", "delete_branch": true}
+#+end_src
+
+Cleanup accepts an idle, failed, cancelled or closed discussion owned by the
+calling conversation. It closes monitoring, retains the editable transcript,
+and resets that buffer's directory to the source repository. Active or queued
+work, other discussions sharing the directory, managed background processes,
+unsaved file buffers and pending file reviews must be resolved first. Git
+refuses dirty or locked worktrees; a switched branch or detached HEAD also
+requires inspection. Cleanup never forces removal or branch deletion.
+
+Branch deletion uses =git branch -d= and applies only to the branch created for
+this discussion. If Git refuses deletion (for example, because the branch is
+unmerged), the worktree remains removed and the branch is retained. The result
+reports both states, also visible in =list/read=; retry =cleanup= after
+integration to delete the branch. Repeated successful cleanup calls are safe.
 
 **** Skill tool declarations
 
@@ -705,6 +727,7 @@ normal API usage. Reports go only to the child's immediate managing conversation
 | =wait= | Receive an explicit report for selected =discussion_ids=, up to 60 seconds; also shows already pending interactions |
 | =answer= | Answer a pending =AskUserQuestion= using its exact =request_id= |
 | =close= | Abort current work and end monitoring; keep the editable transcript |
+| =cleanup= | Remove a finished discussion's generated worktree; optionally delete its branch with =delete_branch: true= |
 
 =read= does not consume report delivery. Its =offset= is a zero-based character
 offset; =next_offset= identifies the next page. Reports and transcript

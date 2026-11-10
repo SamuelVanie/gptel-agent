@@ -369,9 +369,9 @@ and can be inspected with DiscussionControl read without waking the owner."
                         (lambda (callback title prompt &optional preset directory worktree)
                           (gptel-agent-discussion--dispatch-create
                            callback fsm config title prompt preset directory worktree)))
-                    (lambda (callback action &optional id message request-id ids offset)
+                    (lambda (callback action &optional id message request-id ids offset delete-branch)
                       (gptel-agent-discussion--control
-                       callback fsm action id message request-id ids offset))))
+                       callback fsm action id message request-id ids offset delete-branch))))
             (setq-local gptel-tools (cons tool (remq base gptel-tools))))))
       (when-let* ((chat (buffer-local-value 'gptel-agent-discussion--self buffer))
                   ((buffer-live-p (gptel-agent-discussion--chat-owner chat)))
@@ -691,11 +691,83 @@ are not copied.  Use `process-file' and host-local arguments for TRAMP."
           :source-directory directory :base-commit commit)))
 
 (defun gptel-agent-discussion--worktree-info (worktree)
-  "Format the creation metadata for WORKTREE."
-  (format "worktree: %s\nworktree_branch: %s\nworktree_repository: %s\nworktree_source_directory: %s\nworktree_base_commit: %s"
+  "Format WORKTREE's creation metadata and cleanup state."
+  (format "worktree: %s\nworktree_branch: %s\nworktree_repository: %s\nworktree_source_directory: %s\nworktree_base_commit: %s\nworktree_status: %s\nworktree_branch_status: %s"
           (plist-get worktree :path) (plist-get worktree :branch)
           (plist-get worktree :repository) (plist-get worktree :source-directory)
-          (plist-get worktree :base-commit)))
+          (plist-get worktree :base-commit)
+          (if (plist-get worktree :removed) "removed" "retained")
+          (if (plist-get worktree :branch-deleted) "deleted" "retained")))
+
+(defun gptel-agent-discussion--in-worktree-p (file path)
+  "Whether FILE is in PATH, without connecting to unrelated remote hosts."
+  (and (equal (file-remote-p file) (file-remote-p path))
+       (file-in-directory-p file path)))
+
+(defun gptel-agent-discussion--check-worktree-idle (chat path)
+  "Refuse cleanup of CHAT's PATH while Emacs still has unfinished work there."
+  (unless (memq (gptel-agent-discussion--chat-state chat) '(idle failed cancelled closed))
+    (user-error "Discussion is still running; wait for it to finish or close it first"))
+  (when (gptel-agent-discussion--chat-review chat)
+    (user-error "Resolve this discussion's pending file reviews before cleanup"))
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and buffer-file-name (buffer-modified-p)
+                 (gptel-agent-discussion--in-worktree-p buffer-file-name path))
+        (user-error "Save or discard unsaved edits in %s before cleanup" (buffer-name)))
+      (when (and (or gptel-agent-discussion--self
+                     gptel-agent-discussion--inbox
+                     (gptel-agent-discussion--active-p gptel-agent-discussion--fsm))
+                 (gptel-agent-discussion--in-worktree-p default-directory path))
+        (when (or (gptel-agent-discussion--active-p gptel-agent-discussion--fsm)
+                  gptel-agent-discussion--inbox)
+          (user-error "Active or queued discussion work in %s prevents cleanup" (buffer-name)))
+        (when (and gptel-agent-discussion--self
+                   (not (eq gptel-agent-discussion--self chat)))
+          (user-error "Close the other discussion in %s before cleanup" (buffer-name))))))
+  (dolist (process (process-list))
+    (when-let* ((job (process-get process 'gptel-agent-job)))
+      (when (and (process-live-p process)
+                 (gptel-agent-discussion--in-worktree-p (gptel-agent--job-directory job) path))
+        (user-error "Stop background process %s before cleanup" (gptel-agent--job-id job))))))
+
+(defun gptel-agent-discussion--cleanup-worktree (chat delete-branch)
+  "Remove CHAT's generated worktree, optionally its branch with DELETE-BRANCH.
+Never force Git removal or branch deletion.  Retain metadata and the transcript,
+including on partial failure, so branch deletion can be retried separately."
+  (unless (memq delete-branch '(nil t :json-false :null))
+    (user-error "delete_branch must be a boolean"))
+  (let* ((worktree (or (gptel-agent-discussion--chat-worktree chat)
+                       (user-error "This discussion has no generated worktree")))
+         (path (plist-get worktree :path))
+         (repository (plist-get worktree :repository))
+         (branch (plist-get worktree :branch)))
+    (condition-case err
+        (progn
+          (unless (plist-get worktree :removed)
+            (gptel-agent-discussion--check-worktree-idle chat path)
+            ;; A detached HEAD could become unreachable after removal.  A
+            ;; changed branch also warrants inspection instead of assuming the
+            ;; original workspace still belongs exclusively to this task.
+            (unless (equal (gptel-agent-discussion--git path "branch" "--show-current") branch)
+              (user-error "Worktree is no longer on its created branch %s; inspect it before cleanup" branch))
+            (gptel-agent-discussion--git
+             repository "worktree" "remove" "--" (file-local-name (directory-file-name path)))
+            (setf (gptel-agent-discussion--chat-worktree chat)
+                  (setq worktree (plist-put worktree :removed t)))
+            ;; Leave the editable transcript in an existing working directory.
+            (when (buffer-live-p (gptel-agent-discussion--chat-buffer chat))
+              (with-current-buffer (gptel-agent-discussion--chat-buffer chat)
+                (setq default-directory repository)))
+            (gptel-agent-discussion--close chat))
+          (when (and (eq delete-branch t) (not (plist-get worktree :branch-deleted)))
+            (gptel-agent-discussion--git repository "branch" "-d" "--" branch)
+            (setf (gptel-agent-discussion--chat-worktree chat)
+                  (setq worktree (plist-put worktree :branch-deleted t)))))
+      (error
+       (user-error "%s\n%s" (error-message-string err)
+                   (gptel-agent-discussion--status chat))))
+    (gptel-agent-discussion--status chat)))
 
 (defun gptel-agent-discussion--create (owner config title prompt preset directory &optional worktree)
   "Create an independent chat for OWNER using CONFIG, TITLE and PROMPT.
@@ -928,10 +1000,11 @@ SOURCE is `user' for direct user steering; otherwise it is the manager."
         (push waiter gptel-agent-discussion--waiters))))))
 
 (defun gptel-agent-discussion--control
-    (callback fsm action id message request-id ids offset)
+    (callback fsm action id message request-id ids offset &optional delete-branch)
   "Handle owned discussion ACTION from FSM and return a result to CALLBACK.
 ID selects a chat; MESSAGE is input, REQUEST-ID selects an interaction,
-IDS selects a wait set and OFFSET selects a transcript page."
+IDS selects a wait set and OFFSET selects a transcript page.
+DELETE-BRANCH optionally deletes the generated branch during cleanup."
   (let (result deferred)
     (condition-case err
         (let ((owner (plist-get (gptel-fsm-info fsm) :buffer)))
@@ -956,6 +1029,7 @@ IDS selects a wait set and OFFSET selects a transcript page."
                          ("read" (gptel-agent-discussion--read chat offset))
                          ("send" (gptel-agent-discussion--send chat message))
                          ("close" (gptel-agent-discussion--close chat))
+                         ("cleanup" (gptel-agent-discussion--cleanup-worktree chat delete-branch))
                          ("answer"
                           (gptel-agent-discussion--nonempty message "message")
                           (funcall (gptel-agent-discussion--interaction-callback
@@ -1093,14 +1167,15 @@ If a draft remains, send it explicitly with `gptel-send' instead."
 
 (gptel-make-tool
  :name "DiscussionControl"
- :description "Manage only discussions created by this conversation. list/read inspect without consuming reports; read pages the editable transcript with a zero-based character offset and shows pending questions, approvals, reviews and failures. send steers running work at a safe boundary or starts a follow-up when idle; ask the child to report back when you need an answer. Replies and attention alerts are not forwarded automatically. wait consumes the next explicit report for any selected IDs (60 second maximum), or shows already pending interactions; silent completion does not produce an event. answer resolves a pending question using its request_id. Tool approvals stay in the child discussion: only the user can approve or reject them there, and an echo-area notice identifies the buffer. close aborts the current turn and ends monitoring, preserving the ordinary chat buffer. User actions can resolve interactions first: stale IDs return errors. Unsent drafts defer automatic sending."
+ :description "Manage only discussions created by this conversation. list/read inspect without consuming reports; read pages the editable transcript with a zero-based character offset and shows pending questions, approvals, reviews and failures. send steers running work at a safe boundary or starts a follow-up when idle; ask the child to report back when you need an answer. Replies and attention alerts are not forwarded automatically. wait consumes the next explicit report for any selected IDs (60 second maximum), or shows already pending interactions; silent completion does not produce an event. answer resolves a pending question using its request_id. Tool approvals stay in the child discussion: only the user can approve or reject them there, and an echo-area notice identifies the buffer. close aborts the current turn and ends monitoring, preserving the ordinary chat buffer and worktree. cleanup removes a finished discussion's generated worktree and closes monitoring, retaining the transcript; delete_branch optionally deletes its created branch. Integrate finished work before cleanup. Active work, unsaved edits, pending reviews, dirty or locked worktrees and Git's unsafe branch deletions are refused; nothing is forced. A branch deletion failure leaves the worktree removed and branch retained; retry cleanup after integration. User actions can resolve interactions first: stale IDs return errors. Unsent drafts defer automatic sending."
  :function (lambda (callback &rest _) (funcall callback "Error: DiscussionControl needs a request-local dispatcher."))
- :args '((:name "action" :type string :enum ["list" "read" "send" "wait" "answer" "close"])
+ :args '((:name "action" :type string :enum ["list" "read" "send" "wait" "answer" "close" "cleanup"])
          (:name "discussion_id" :type string :optional t :description "Required except for list/wait.")
          (:name "message" :type string :optional t :description "Message for send or answer (include every question's answer).")
          (:name "request_id" :type string :optional t :description "Exact pending question ID for answer.")
          (:name "discussion_ids" :type array :items (:type string) :optional t :description "Optional wait selection; defaults to all owned discussions.")
-         (:name "offset" :type integer :optional t :description "Zero-based transcript character offset for read; defaults to 0."))
+         (:name "offset" :type integer :optional t :description "Zero-based transcript character offset for read; defaults to 0.")
+         (:name "delete_branch" :type boolean :optional t :description "Only for cleanup. Omit or use false to keep the created branch. True also attempts git branch -d after removing the worktree; unmerged or checked-out branches are retained with an error. Cleanup can be retried after integration. Never forces deletion."))
  :category "gptel-agent" :async t :include t)
 
 (add-hook 'gptel-prompt-transform-functions #'gptel-agent-discussion--localize t)
