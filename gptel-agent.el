@@ -339,13 +339,31 @@ Returns an alist of (agent-name . file-path)."
           gptel-agent-dirs)
     agent-files))
 
+(defun gptel-agent--skill-files (dir &optional ancestors)
+  "Return SKILL.md files below DIR, following directory symlinks.
+ANCESTORS contains the true names of parent directories, to avoid cycles."
+  (let ((truename (file-truename dir)))
+    (unless (member truename ancestors)
+      (let ((ancestors (cons truename ancestors))
+            files sub-files)
+        ;; Completion-based traversal can mistake symlinked files for
+        ;; directories on some Emacs builds (including Straight skill files).
+        (dolist (file (directory-files dir t directory-files-no-dot-files-regexp))
+          (cond
+           ((file-directory-p file)
+            (setq sub-files
+                  (nconc sub-files (gptel-agent--skill-files file ancestors))))
+           ((and (equal (file-name-nondirectory file) "SKILL.md")
+                 (file-regular-p file))
+            (push file files))))
+        (nconc sub-files (nreverse files))))))
+
 (defun gptel-agent--update-skills ()
   "Update the known skills list from `gptel-agent-skill-dirs'."
   (setq gptel-agent--skills nil)
   (mapc (lambda (dir)
           (when (file-directory-p dir)
-            (dolist (skill-file (directory-files-recursively
-                                 dir "SKILL\\.md$" nil nil t))
+            (dolist (skill-file (gptel-agent--skill-files dir))
               (pcase-let ((`(,name . ,skill-plist)
                            (gptel-agent--cached-read-skill-file skill-file nil)))
                 ;; validating skill definition

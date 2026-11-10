@@ -458,6 +458,74 @@
                      "SkillMutation")))))
 
 
+(ert-deftest gptel-agent-skills-discovery-follows-symlinked-files-and-directories ()
+  (let* ((root (make-temp-file "gptel-skills-links-" t))
+         (default-directory (file-name-as-directory root))
+         (source (expand-file-name "source/managed-discussions" root))
+         (build (expand-file-name "build/managed-discussions" root))
+         (gptel-agent--bundled-skill-dir (expand-file-name "build/" root))
+         (gptel-agent-skill-dirs nil)
+         (gptel-agent--skills nil)
+         (gptel-agent--skill-file-cache nil))
+    (unwind-protect
+        (progn
+          (make-directory source t)
+          (make-directory build t)
+          (with-temp-file (expand-file-name "SKILL.md" source)
+            (insert "---\nname: linked-skill\ndescription: Linked skill\n---\nInstructions"))
+          ;; Straight builds contain real directories with symlinked files.
+          (make-symbolic-link (expand-file-name "SKILL.md" source)
+                              (expand-file-name "SKILL.md" build))
+          (gptel-agent--update-skills)
+          (should (equal gptel-agent--skills
+                         `(("linked-skill" ,(file-name-as-directory build)
+                            :description "Linked skill"))))
+          ;; Some Emacs builds report file symlinks as directories during
+          ;; completion.  Discovery must use the actual file type instead.
+          (let ((complete (symbol-function 'file-name-all-completions)))
+            (cl-letf (((symbol-function 'file-name-all-completions)
+                       (lambda (prefix dir)
+                         (mapcar (lambda (name)
+                                   (if (and (not (directory-name-p name))
+                                            (file-symlink-p (expand-file-name name dir)))
+                                       (concat name "/")
+                                     name))
+                                 (funcall complete prefix dir)))))
+              (gptel-agent--update-skills)
+              (should (assoc "linked-skill" gptel-agent--skills))))
+          ;; User skill directories can themselves be symlinks.
+          (let* ((user-dir (expand-file-name "user" root))
+                 (linked-dir (expand-file-name "linked" user-dir)))
+            (make-directory user-dir)
+            (make-symbolic-link source linked-dir)
+            (setq gptel-agent-skill-dirs (list user-dir))
+            (gptel-agent--update-skills)
+            (should (equal (cadr (assoc "linked-skill" gptel-agent--skills))
+                           (file-name-as-directory linked-dir)))))
+      (delete-directory root t))))
+
+(ert-deftest gptel-agent-skills-discovery-skips-symlink-cycles-and-broken-links ()
+  (let* ((root (make-temp-file "gptel-skills-cycle-" t))
+         (default-directory (file-name-as-directory root))
+         (skill-dir (expand-file-name "skill" root))
+         (gptel-agent--bundled-skill-dir root)
+         (gptel-agent-skill-dirs nil)
+         (gptel-agent--skills nil)
+         (gptel-agent--skill-file-cache nil))
+    (unwind-protect
+        (progn
+          (make-directory skill-dir)
+          (with-temp-file (expand-file-name "SKILL.md" skill-dir)
+            (insert "---\nname: valid-skill\ndescription: Valid skill\n---\nInstructions"))
+          (make-symbolic-link root (expand-file-name "loop" skill-dir))
+          (make-symbolic-link (expand-file-name "missing" root)
+                              (expand-file-name "SKILL.md" root))
+          (gptel-agent--update-skills)
+          (should (equal gptel-agent--skills
+                         `(("valid-skill" ,(file-name-as-directory skill-dir)
+                            :description "Valid skill")))))
+      (delete-directory root t))))
+
 (ert-deftest gptel-agent-skills-bundled-discovery-and-user-override ()
   (gptel-agent-skills-test--with-chat ""
     (let ((gptel-agent-skill-dirs nil))
