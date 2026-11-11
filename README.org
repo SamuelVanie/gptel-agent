@@ -808,7 +808,7 @@ not supported.
 **** Manually invoked skills
 
 Add =disable-model-invocation: true= to a skill's =SKILL.md= frontmatter to
-use it as a reusable prompt with supporting files:
+hide it from automatic discovery:
 
 #+begin_src markdown
 ---
@@ -818,55 +818,28 @@ disable-model-invocation: true
 allowed-tools: Read Bash
 ---
 Read references/checklist.md, then review the current change.
-Use scripts/check.sh for the mechanical checks.
 #+end_src
 
-Place the skill directory under one of =gptel-agent-skill-dirs=, with the
-referenced files alongside =SKILL.md=, for example:
+Place it under one of =gptel-agent-skill-dirs=, like any other skill. While
+composing a message, run =M-x gptel-agent-use-skill= and choose its name with
+completion. Descriptions appear as annotations. The command refreshes discovery
+for the current directory and inserts ordinary text:
 
 #+begin_example
-~/.agents/skills/review-my-change/
-  SKILL.md
-  references/checklist.md
-  scripts/check.sh
+Use the Skill tool to load "review-my-change".
 #+end_example
 
-While composing a message, run =M-x gptel-agent-use-skill= and choose a skill
-with completion. Descriptions appear as completion annotations. The command
-discovers manual skills for the current buffer's directory on each invocation,
-independently of =gptel-agent-toggle-skill=. It adds a compact =[Skill: name]=
-attachment at point. The attachment contains a snapshot of the full instructions
-and base directory, with references to existing supporting files expanded into
-absolute paths. Only its label is displayed; the full text is sent to the model
-and retained in the conversation. Supporting file contents are read on demand.
+Add your task details and send normally. The model loads the instructions,
+supporting paths and =allowed-tools= through the existing =Skill= tool. Inserting
+or sending the request itself loads no instructions and grants no tools. You can
+edit, undo, copy or save the text normally, or type the request yourself. The
+=Skill= tool must be enabled in the conversation.
 
-Add your task details and call =gptel-send= normally. Selection alone does not
-send a request, execute scripts or grant tools. Undo the attachment before
-sending to cancel it. You can attach multiple skills to a message. Only
-attachments included in the submitted text activate; sending a region that
-excludes an attachment leaves it pending.
-
-Sending activates =allowed-tools= using the same resolver as the =Skill= tool:
-registered tools become available and pre-approved in =auto= confirmation mode.
-Always-confirm settings and per-call hooks still apply. Invalid declarations
-add a diagnostic to the instructions and grant none of that skill's tools.
-Grants persist across turns in this conversation and are not inherited as
-pre-approvals by child conversations. Request previews do not commit grants.
-As with model-invoked skills, grants are not restored across Emacs restarts;
-saved conversation text retains the instructions.
-
-For a shortcut, bind =gptel-agent-use-skill= to a key, or call
-=(gptel-agent-use-skill "review-my-change")= from an interactive wrapper.
-Directory boundaries are unchanged: supporting files outside the current
-project require per-operation approval, just as with existing
-model-invoked skills. =allowed-tools= does not bypass that boundary.
-
-Manual skills are absent from =gptel-agent-toggle-skill=, the model's available
-skills description, and the =Skill= tool's argument completion/schema. The
-=Skill= tool also rejects direct attempts to load them. Their instructions
-enter the model's context only when you attach and send them, then remain ordinary
-conversation text. Omit the flag or set it to the YAML boolean =false= for an
-ordinary model-invocable skill.
+These skills are omitted from the advertised skill list and
+=gptel-agent-toggle-skill=, but remain callable by name through =Skill=.
+The flag controls discovery, not access: there is no separate invocation or
+approval mechanism. Omit it or set it to the YAML boolean =false= to advertise
+the skill normally.
 
 **** Discussion lifecycle
 

@@ -9,13 +9,10 @@
   Approval precedes instruction discovery and file review hooks and does not
   authorize later calls. The agent-controlled directory-changing tool is removed.
 
-- Skills with ~disable-model-invocation: true~ are available through
-  ~gptel-agent-use-skill~, which completes manual skill names and attaches
-  instructions with resolved supporting file paths to a message, displayed
-  as ~[Skill: name]~. Sending with ~gptel-send~ applies ~allowed-tools~ just
-  like model invocation; selection and request previews grant no tools.
-  These skills are excluded from model discovery and ~gptel-agent-toggle-skill~,
-  and direct ~Skill~ calls reject them. Directory boundaries are unchanged.
+- Skills with ~disable-model-invocation: true~ are hidden from automatic
+  discovery. ~gptel-agent-use-skill~ completes their names and inserts a plain
+  request to load the chosen skill. The model uses the existing ~Skill~ tool
+  for instructions and ~allowed-tools~, just as for other skills.
 
 - ~Discussion~ accepts an optional ~model~ in gptel's ~Backend:model~ format.
   The tool advertises configured backend/model pairs and applies the selection
