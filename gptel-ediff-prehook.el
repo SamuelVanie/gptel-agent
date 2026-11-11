@@ -35,6 +35,9 @@
 (defvar-local smv/gptel-ediff-review-mode nil
   "Buffer-local flag enabling temporary gptel ediff review bindings.")
 
+(defvar-local smv/gptel-ediff--keymaps nil
+  "Emulation keymaps giving temporary review keys priority over modal editors.")
+
 
 (defvar smv/gptel-ediff-inhibit-lsp nil
   "Non-nil while configuring temporary gptel Ediff preview buffers.")
@@ -91,14 +94,17 @@ If none exists, split one off the frame root."
 (defun smv/gptel-ediff--buffer-local-set-key (key command)
   "Bind KEY to COMMAND in the current buffer without changing shared mode maps."
   (setq-local smv/gptel-ediff-review-mode t)
-  (unless (local-variable-p 'minor-mode-overriding-map-alist)
-    (setq-local minor-mode-overriding-map-alist
-                (copy-tree minor-mode-overriding-map-alist)))
+  ;; Meow and other modal editors use emulation maps, which take precedence
+  ;; over minor-mode-overriding-map-alist.  Promote only this buffer's review
+  ;; keys; leave all other keys and buffers under their usual editing modes.
+  (setq-local emulation-mode-map-alists
+              (cons 'smv/gptel-ediff--keymaps
+                    (remq 'smv/gptel-ediff--keymaps emulation-mode-map-alists)))
   (let ((map (or (cdr (assq 'smv/gptel-ediff-review-mode
-                            minor-mode-overriding-map-alist))
+                            smv/gptel-ediff--keymaps))
                  (let ((new-map (make-sparse-keymap)))
                    (push (cons 'smv/gptel-ediff-review-mode new-map)
-                         minor-mode-overriding-map-alist)
+                         smv/gptel-ediff--keymaps)
                    new-map))))
     (define-key map (kbd key) command)))
 

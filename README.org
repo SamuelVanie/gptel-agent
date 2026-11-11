@@ -339,11 +339,16 @@ tools are disabled: questions request explanations, not edits. Questions and
 answers stay in the aside and are never added to the original conversation.
 
 Each file has its own aside. Ask further questions with =A=, or type directly
-in the aside and send with =C-c RET=. An empty answer to the =A= prompt reopens
-the aside without sending. =C-c C-r= returns to the file's Ediff, =C-c C-q=
-hides the aside, and =C-c C-k= cancels only its current answer. Closing Ediff or
-finishing review keeps the aside available as a normal buffer. Killing the
-aside cancels its request without affecting the original agent. The inherited
+in the aside and send with =C-c RET=. To discuss a specific passage, mark it
+in either diff pane and press =A= there, just like =H= for a comment. The
+aside keeps the exact selection, its line range and the displayed revision.
+With no region, it uses the current line. Review keys take precedence over
+modal editing bindings (such as Meow's =A=) in these temporary review buffers.
+An empty answer to the =A= prompt reopens the aside without sending.
+=C-c C-r= returns to the file's Ediff, =C-c C-q= hides the aside, and =C-c C-k=
+cancels only its current answer. Closing Ediff or finishing review keeps the
+aside available as a normal buffer. Killing the aside cancels its request
+without affecting the original agent. The inherited
 conversation history is a snapshot; asking again with =A= includes the file
 revision you are then viewing.
 

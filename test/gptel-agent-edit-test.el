@@ -11,6 +11,25 @@
   (should (memq #'smv/gptel-ediff-tool-call
                 (default-value 'gptel-pre-tool-call-functions))))
 
+(ert-deftest gptel-ediff-review-keys-override-modal-keys-only-in-review-buffers ()
+  (let* ((modal-map (make-sparse-keymap))
+         (emulation-mode-map-alists (list (list (cons t modal-map))))
+         (original-maps emulation-mode-map-alists))
+    (define-key modal-map (kbd "A") #'ignore)
+    (define-key modal-map (kbd "b") #'backward-char)
+    (with-temp-buffer
+      (smv/gptel-ediff--buffer-local-set-key "A" #'forward-char)
+      (smv/gptel-ediff--buffer-local-set-key "H" #'beginning-of-line)
+      (should (eq (key-binding (kbd "A")) #'forward-char))
+      (should (eq (key-binding (kbd "H")) #'beginning-of-line))
+      (should (eq (key-binding (kbd "b")) #'backward-char))
+      (with-temp-buffer
+        (should (eq (key-binding (kbd "A")) #'ignore)))
+      (setq smv/gptel-ediff-review-mode nil)
+      (should (eq (key-binding (kbd "A")) #'ignore)))
+    (should (eq emulation-mode-map-alists original-maps))
+    (should (eq (lookup-key modal-map (kbd "A")) #'ignore))))
+
 (defmacro gptel-edit-test--with-files (files &rest body)
   "Create FILES in a temporary directory and run BODY there."
   (declare (indent 1))

@@ -101,28 +101,45 @@
         (should (eq 'accepted (plist-get (gptel-review-test--file 1) :status)))))))
 
 (ert-deftest gptel-aside-captures-selected-revision-before-minibuffer-updates ()
-  (dolist (side '(original proposed))
-    (gptel-aside-test--with-chat
-      (gptel-review-test--open 1)
-      (let* ((view (gptel-agent-review--queue-view gptel-agent-review--queue))
-             (buffer (if (eq side 'original) (smv/gptel-ediff--view-original view)
-                       (smv/gptel-ediff--view-proposed view))))
-        (cl-letf (((symbol-function 'read-string)
-                   (lambda (&rest _)
-                     (with-current-buffer owner
-                       (gptel-review-test--submit "Insert" '(:file_path "one" :line_number -1 :new_str "LATER-REVISION")))
-                     "Explain the selection")))
-          (with-current-buffer buffer
-            (goto-char (point-min))
-            (call-interactively (key-binding (kbd "A")))))
-        (let ((data (gptel-aside-test--data (car requests))))
-          (should (string-match-p "revision 1" data))
-          (should (string-match-p (if (eq side 'original) "original file" "proposed changes") data))
-          (should (string-match-p "line 1" data))
-          (should-not (string-match-p "LATER-REVISION" data)))
-        (should (= 2 (plist-get (gptel-review-test--file 1) :revision)))
-        (should (eq 'pending (plist-get (gptel-review-test--file 1) :status)))
-        (gptel-edit-test--key "Q")))))
+  ;; Modal editors such as Meow bind A in an emulation map, above minor modes.
+  (let* ((modal-map (make-sparse-keymap))
+         (emulation-mode-map-alists
+          (cons (list (cons t modal-map)) emulation-mode-map-alists)))
+    (define-key modal-map (kbd "A") #'ignore)
+    (dolist (side '(original proposed))
+      (gptel-aside-test--with-chat
+        (gptel-review-test--submit "Write" '(:file_path "one" :content "first\nsecond\nthird\n"))
+        (gptel-review-test--open 1)
+        (let* ((view (gptel-agent-review--queue-view gptel-agent-review--queue))
+               (buffer (if (eq side 'original) (smv/gptel-ediff--view-original view)
+                         (smv/gptel-ediff--view-proposed view))))
+          (cl-letf (((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       (with-current-buffer owner
+                         (gptel-review-test--submit "Insert" '(:file_path "one" :line_number -1 :new_str "LATER-REVISION")))
+                       "Explain the selection")))
+            (with-current-buffer buffer
+              (let ((transient-mark-mode t))
+                (goto-char (point-min))
+                ;; A region ending at the next line excludes that line.
+                (if (eq side 'original) (forward-char 2) (forward-line 2))
+                (set-mark (point))
+                (goto-char (point-min))
+                (activate-mark)
+                (call-interactively (key-binding (kbd "A"))))))
+          (should (= 1 (length requests)))
+          (let ((data (gptel-aside-test--data (car requests))))
+            (should (string-match-p "revision 2" data))
+            (should (string-match-p
+                     (regexp-quote (if (eq side 'original)
+                                       "Selected context (original file), line 1:\nol\n\nQuestion: Explain the selection"
+                                     "Selected context (proposed changes), lines 1-2:\nfirst\nsecond\n\n\nQuestion: Explain the selection"))
+                     data))
+            (should-not (string-match-p "LATER-REVISION" data)))
+          (should (= 3 (plist-get (gptel-review-test--file 1) :revision)))
+          (should-not outcomes)
+          (should (eq 'pending (plist-get (gptel-review-test--file 1) :status)))
+          (gptel-edit-test--key "Q"))))))
 
 (ert-deftest gptel-aside-followups-use-own-history-across-backends ()
   (dolist (backend (list (gptel-make-openai "aside-o" :key "unused" :models '(test) :stream t)
