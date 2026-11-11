@@ -152,6 +152,7 @@
           (insert "\n\n")
           (set-text-properties (- (point) 2) (point) nil)
           (gptel-mode 1)
+          (setq-local gptel-agent--child-chat-p t)
           (gptel-agent-review-aside-mode 1)
           (setq-local gptel-agent-review-aside--draft-start (point-marker))
           (setq-local header-line-format

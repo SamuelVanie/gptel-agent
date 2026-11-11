@@ -59,6 +59,7 @@
 (declare-function gptel-agent--cached-read-file "gptel-agent")
 (declare-function gptel-agent--cached-read-skill-file "gptel-agent")
 (declare-function gptel-agent-discussion--localize "gptel-agent-discussion")
+(declare-function gptel-agent-chat--localize "gptel-agent-chat")
 (declare-function gptel-agent--agent-plist "gptel-agent")
 (declare-function gptel-agent--agent-enabled-p "gptel-agent")
 (declare-function gptel-agent--skills-system-message "gptel-agent")
@@ -272,6 +273,12 @@ from the Agent overlay until the user kills them or closes the parent chat."
 
 (defvar-local gptel-agent--supervised-run nil
   "The `gptel-agent--run' owned by this sub-agent buffer.")
+
+(defvar-local gptel-agent--child-chat-p nil
+  "Non-nil in a generated worker, discussion or review aside.
+Keep this origin even after closing monitoring or changing major modes, so
+the buffer cannot become a main-chat messaging endpoint.")
+(put 'gptel-agent--child-chat-p 'permanent-local t)
 
 (defvar-local gptel-agent--sessions nil
   "Sub-agent conversations owned by this buffer, keyed by stable agent ID.")
@@ -1828,6 +1835,8 @@ anything.  Scoped expressions are deliberately unsupported."
                     (gptel-agent--localize-agent-tool fsm)
                     (when (fboundp 'gptel-agent-discussion--localize)
                       (gptel-agent-discussion--localize fsm))
+                    (when (fboundp 'gptel-agent-chat--localize)
+                      (gptel-agent-chat--localize fsm))
                     gptel-tools)))
             (let* ((tools
                     (gptel-agent--skill-merge-tools
@@ -3164,6 +3173,8 @@ The value must be nil (unlimited) or a non-negative integer."
     (gptel-agent--localize-agent-tool fsm)
     (when (fboundp 'gptel-agent-discussion--localize)
       (gptel-agent-discussion--localize fsm))
+    (when (fboundp 'gptel-agent-chat--localize)
+      (gptel-agent-chat--localize fsm))
     (plist-put info :tools gptel-tools)
     (when gptel-tools
       (setf (plist-get data :tools)
@@ -3305,7 +3316,8 @@ the child's current directory."
                            gptel-agent--sessions nil nil #'equal) session)
           (add-hook 'kill-buffer-hook #'gptel-agent--close-sessions nil t))
         (with-current-buffer child-buffer
-          (setq-local gptel-agent--supervised-run run)
+          (setq-local gptel-agent--supervised-run run
+                      gptel-agent--child-chat-p t)
           (add-hook 'kill-buffer-query-functions
                     #'gptel-agent--confirm-child-buffer-kill nil t)
           (add-hook 'kill-buffer-hook
@@ -3342,6 +3354,10 @@ the child's current directory."
                               gptel--preset nil)
                   (gptel-agent--apply-subagent-configuration
                    preset agent-plist))
+                ;; A custom preset may omit localizers.  Never carry a
+                ;; main-chat sender closure into a worker's request.
+                (setq-local gptel-tools (cl-remove "MainChat" gptel-tools
+                                                   :key #'gptel-tool-name :test #'equal))
                 (gptel-agent--reset-tool-call-counts)
                 (setf (gptel-agent--run-configuration run)
                       (if previous (gptel-agent--run-configuration previous)

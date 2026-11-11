@@ -822,7 +822,12 @@ new Git worktree from that directory and start the chat in its root."
             (add-hook 'gptel-prompt-transform-functions
                       #'gptel-agent-discussion--localize t t)
             (gptel-mode 1)
-            (setq-local gptel-agent-discussion--self chat)
+            (setq-local gptel-agent-discussion--self chat
+                        gptel-agent--child-chat-p t
+                        ;; Strip parent-only closures even if a custom preset
+                        ;; replaces the normal prompt transforms.
+                        gptel-tools (cl-remove "MainChat" gptel-tools
+                                               :key #'gptel-tool-name :test #'equal))
             (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
             (insert (gptel-prompt-prefix-string))
             (when worktree
@@ -962,7 +967,8 @@ SOURCE is `user' for direct user steering; otherwise it is the manager."
     (gptel-agent-discussion--clear-interactions chat)
     (when (buffer-live-p (gptel-agent-discussion--chat-buffer chat))
       (with-current-buffer (gptel-agent-discussion--chat-buffer chat)
-        (setq gptel-agent-discussion--self nil
+        (setq gptel-agent--child-chat-p t
+              gptel-agent-discussion--self nil
               gptel-agent-discussion--inbox nil
               gptel-agent-discussion--paused t)
         (gptel-abort (current-buffer))

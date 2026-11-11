@@ -602,6 +602,47 @@ gptel uses the term "preset" for such configurations.  A preset can specify the 
 
 =gptel-agent= is implemented as a preset for gptel and can be modified/extended easily.
 
+*** Messages between main chats
+
+When the user explicitly asks to find or message another main agent/chat,
+load =Skill(main-chat-messages)=. This enables the separate =MainChat= tool
+in the current turn; custom presets can also include it directly.
+
+| Action | Behavior |
+|--------+----------|
+| =list= | List other live main gptel buffers: stable =chat_id=, buffer name, directory and pending-message count |
+| =send= | Queue =message= for an exact =chat_id= from the list |
+
+Discovery returns at most 20 entries per page; pass =next_offset= as =offset=
+to continue. It never reads transcripts. Generated discussions, workers and
+review asides cannot use this tool or appear as recipients, including closed
+or detached discussions. =DiscussionControl= still sees only the calling
+conversation's own discussions. Main-chat IDs survive buffer renames, are
+not reused after killing a buffer, and last only for this Emacs session.
+
+A recipient receives messages at its next model-request boundary, after any
+pending tool results. Sending never starts a new model request, submits an
+unsent draft, or automatically replies. Idle, aborted and failed chats keep
+messages until their next user-started turn. Read-only recipients keep messages
+queued until a request boundary with a writable buffer. Messages are labeled as peer
+context, not user instructions or authorization; ordinary replies stay local.
+The recipient need not enable =MainChat= to receive messages, but its request
+must run =gptel-agent-chat--localize= (installed in the default prompt transforms).
+
+The tool and skill instruct the model to list/send only on explicit user
+requests, never for routine collaboration or automatic acknowledgements.
+This is a model instruction, not a natural-language authorization detector.
+Normal gptel confirmation settings apply: skill activation pre-approves the
+tool in =auto= mode; always-confirm mode and per-call hooks still take precedence.
+Enabling the tool on one turn does not authorize unsolicited later sends.
+
+Messages have no character limit and are delivered without truncation.
+=gptel-agent-chat-inbox-limit= defaults to 16 pending messages per recipient.
+Full inboxes reject new messages without discarding earlier messages.
+Inboxes live only in their buffers and disappear when those buffers
+are killed. There are no polling timers, background jobs, global transcript
+copies or automatic wakeups; buffer discovery runs only on explicit tool calls.
+
 *** Managed discussions
 
 The default =gptel-agent= preset discovers discussion management through the

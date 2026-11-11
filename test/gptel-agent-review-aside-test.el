@@ -74,6 +74,8 @@
         (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "Why this change?")))
           (gptel-edit-test--key "A"))
         (setq aside (cdar (gptel-agent-review--queue-asides gptel-agent-review--queue)))
+        (should (buffer-local-value 'gptel-agent--child-chat-p aside))
+        (should-not (gptel-agent-chat--main-p aside))
         (let* ((fsm (buffer-local-value 'gptel-agent-review-aside--fsm aside))
                (data (gptel-aside-test--data fsm)))
           (dolist (text '("Initial parent question" "Earlier parent answer" "Latest parent request"
