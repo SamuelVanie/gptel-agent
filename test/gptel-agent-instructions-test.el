@@ -53,7 +53,9 @@
 (defun gptel-agent-instructions-test--request (owner)
   (with-current-buffer owner
     (gptel-request "User task" :buffer owner :stream nil :callback #'ignore
-                   :transforms '(gptel-agent-instructions--transform gptel-agent-discussion--localize)
+                   :transforms '(gptel-agent-instructions--transform
+                                 gptel-agent--localize-repository-search
+                                 gptel-agent-discussion--localize)
                    :fsm (gptel-make-fsm :table gptel-send--transitions
                                         :handlers gptel-send--handlers))))
 
@@ -507,9 +509,17 @@
   (gptel-agent-instructions-test--with-project
     (setq fsm (gptel-agent-instructions-test--request parent))
     (gptel-agent-workers-test--tool fsm "Glob" (list :root_directory front :pattern "*.md"))
+    (let ((deadline (+ (float-time) 10)))
+      (while (and (eq (gptel-fsm-state fsm) 'TOOL) (< (float-time) deadline))
+        (accept-process-output nil 0.01))
+      (should-not (eq (gptel-fsm-state fsm) 'TOOL)))
     (should (string-match-p "FRONT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
     (should-not (string-match-p "BACK-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
     (gptel-agent-workers-test--tool fsm "Grep" (list :path (concat root "old.txt") :regex "old"))
+    (let ((deadline (+ (float-time) 10)))
+      (while (and (eq (gptel-fsm-state fsm) 'TOOL) (< (float-time) deadline))
+        (accept-process-output nil 0.01))
+      (should-not (eq (gptel-fsm-state fsm) 'TOOL)))
     (should-not (string-match-p "FRONT-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
     (should (= 2 (length (buffer-local-value 'gptel-agent-instructions--registry parent))))))
 

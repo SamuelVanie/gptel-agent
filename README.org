@@ -966,6 +966,40 @@ the parent agent can verify with =Read=.  Preview size is controlled by
 =gptel-agent-tool-result-preview-chars= and
 =gptel-agent-tool-result-preview-lines=.
 
+=Glob= and =Grep= run asynchronously. Directory enumeration and metadata reads
+use an isolated Python 3 subprocess when available, otherwise a clean batch
+Emacs subprocess. =Grep= prefers =rg=, then =grep -E=, then a separate batch
+Emacs process. Its request-local description and =regex= schema advertise the
+selected native dialect, like =ResultGrep=; an in-flight query never switches
+dialects. Backend changes are advertised before the next model request.
+
+Glob retains its case-insensitive Emacs basename wildcard syntax, typed
+symlinks, depth handling, and newest-first ordering. Both directory tools
+include hidden, ignored, dependency and build entries, exclude only =.git=
+directories, and do not traverse directory symlinks. Grep's =glob= uses the
+same basename matching as Glob. Grep is case-sensitive and returns quoted
+absolute filenames with line numbers. Searches currently require local paths;
+remote paths fail explicitly instead of running blocking TRAMP operations.
+
+Each call has a =gptel-agent-search-timeout= deadline (30 seconds), including
+traversal, and stops when its request is aborted or its owning buffer is killed.
+=gptel-agent-search-max-entries= bounds examined directory entries (20,000),
+=gptel-agent-search-traversal-max-bytes= bounds candidate metadata (4 MiB), and
+=gptel-agent-search-max-results= caps Glob entries or Grep matching lines
+globally (1,000). Both tools accept =max_entries= and =max_results= to lower
+these ceilings, plus =depth= to restrict traversal. Grep accepts 0–15 context
+lines; a limit can cut trailing context short. Output stops at
+=gptel-agent-tool-result-max-chars=; individual subprocess records are bounded
+to 64 KiB and error diagnostics to 2,048 characters. The Emacs grep fallback
+skips lines over 64 KiB and reports incomplete coverage.
+
+Limits and failures return explicit =incomplete= coverage with any collected
+results. Partial Glob results are sorted only within the collected subset,
+not necessarily the newest entries in the whole tree. No unbounded full result
+is saved. Narrow the directory, pattern or depth, or explicitly increase the
+configured ceiling before retrying. A zero-match response is conclusive only
+when coverage is =complete=.
+
 =ResultGrep= selects =rg= first, otherwise =grep -E=, otherwise a built-in
 Emacs reader. Its request-local description *and* =regex= argument schema name
 the selected backend and its native regexp dialect before the model writes a

@@ -53,6 +53,7 @@
 (require 'gptel-agent-directory)
 (require 'gptel-agent-process)
 (require 'gptel-agent-read)
+(require 'gptel-agent-search)
 
 (declare-function org-escape-code-in-region "org-src")
 (declare-function gptel-agent--cached-read-file "gptel-agent")
@@ -91,10 +92,11 @@ line/byte-column continuation when limited. Default: 400 KB."
 (defcustom gptel-agent-tool-result-max-chars 20000
   "Maximum characters returned directly by tools with persisted output.
 
-When Bash, Glob or Grep produces more output, the complete result is saved
+When Bash produces more output, the complete result is saved
 under the temporary directory and the tool returns only a bounded preview plus
 the saved file path.  Foreground Bash spills output while the command runs,
-retaining at most the larger of this limit and the preview character limit."
+retaining at most the larger of this limit and the preview character limit.
+Glob and Grep stop at this output limit and report incomplete coverage."
   :type 'natnum
   :group 'gptel-agent)
 
@@ -1567,123 +1569,6 @@ saved file directly."
                prefix temp-file query orig-size orig-lines preview max-lines
                gptel-agent-tool-result-preview-chars)))))
 
-(defun gptel-agent--glob (pattern &optional root-directory depth type)
-  "Find typed entries matching basename PATTERN under ROOT-DIRECTORY.
-DEPTH starts at 1.  TYPE is files (default), directories, or all.
-Include hidden entries, omit .git directories, and do not traverse symlinks."
-  (unless (and (stringp pattern) (not (string-empty-p pattern))
-               (not (string-match-p "/\\|\\*\\*" pattern)))
-    (error "Glob requires a nonempty basename pattern, without / or **"))
-  (unless (or (null depth) (and (integerp depth) (> depth 0)))
-    (error "Glob depth must be an integer >= 1"))
-  (setq type (or type "files"))
-  (unless (member type '("files" "directories" "all"))
-    (error "Glob type must be files, directories, or all"))
-  (let* ((root (gptel-agent-path-resolve (or root-directory ".") 'directory t))
-         (regexp (wildcard-to-regexp pattern))
-         (case-fold-search t) (pending (list (cons root 1))) entries)
-    (while pending
-      (pcase-let ((`(,directory . ,level) (pop pending)))
-        (dolist (path (directory-files directory t directory-files-no-dot-files-regexp t))
-          (let* ((name (file-name-nondirectory path))
-                 (kind (gptel-agent-path-type path))
-                 (link (file-symlink-p path)))
-            (unless (and (equal name ".git") (equal kind "directory"))
-              (when (and (equal kind "directory") (not link)
-                         (or (null depth) (< level depth)))
-                (push (cons path (1+ level)) pending))
-              (when (and (string-match-p regexp name)
-                         (or (equal type "all")
-                             (equal kind (if (equal type "files") "file" "directory"))))
-                (push (list path kind link (file-attribute-modification-time (file-attributes path))) entries)))))))
-    (setq entries (sort entries (lambda (a b)
-                                 (if (equal (nth 3 a) (nth 3 b)) (string< (car a) (car b))
-                                   (time-less-p (nth 3 b) (nth 3 a))))))
-    (with-temp-buffer
-      (dolist (entry entries)
-        (pcase-let ((`(,path ,kind ,link ,_) entry))
-          (insert (format "[%s%s] %S%s\n" kind (if link " symlink" "") path
-                          (if link (format " -> %S" link) "")))))
-      (when (null entries) (insert "No matching entries.\n"))
-      (gptel-agent--truncate-buffer "glob")
-      (buffer-string))))
-
-;;;; Read files or directories
-(defun gptel-agent--grep (regex path &optional glob context-lines)
-  "Search for REGEX in file or directory at PATH using ripgrep.
-
-REGEX is a PCRE-format regular expression to search for.
-PATH can be a file or directory to search in.
-
-Optional arguments:
-GLOB restricts the search to files matching the glob pattern.
-  Examples: \"*.el\", \"*.md\", \"*.rs\"
-CONTEXT-LINES specifies the number of lines of context to show
-  around each match (0-15 inclusive, defaults to 0).
-
-Returns a string containing matches grouped by file, with line numbers
-and optional context.  Results are limited to 1000 or fewer matches per
-file.  Results are sorted by modification time."
-  (unless (file-readable-p path)
-    (error "Error: File or directory %s is not readable" path))
-  (let* ((full-path (expand-file-name (substitute-in-file-name path)))
-         ;; Explicitly set remote to save ourselves multiple file-remote-p
-         ;; checks inside `executable-find'
-         (remote (file-remote-p default-directory))
-         (git-root (and (executable-find "git" remote)
-                        (locate-dominating-file full-path ".git")))
-         (grepper (cond
-                   (git-root "git")
-                   ((executable-find "rg" remote) "rg")
-                   ((executable-find "grep" remote) "grep")
-                   (t (error "Error: ripgrep/grep/git-grep not available, \
-this tool cannot be used")))))
-    (with-temp-buffer
-      (let* ((default-directory (or git-root default-directory))
-             (args
-              (cond
-               ((string= "git" grepper)
-                (let* ((rel-path (file-relative-name full-path git-root))
-                       (pathspecs
-                        (list (if (and glob (file-directory-p full-path))
-                                  (file-name-concat rel-path glob)
-                                rel-path))))
-                  (delq nil
-                        (nconc
-                         (list "grep"
-                               "--line-number"
-                               "--no-color"
-                               (and (natnump context-lines)
-                                    (format "-C%d" context-lines))
-                               "--max-count=1000"
-                               "--untracked"
-                               "-P" regex
-                               "--")
-                         pathspecs))))
-               ((string= "rg" grepper)
-                (delq nil (list "--sort=modified"
-                                (and (natnump context-lines)
-                                     (format "--context=%d" context-lines))
-                                (and glob (format "--glob=%s" glob))
-                                ;; "--files-with-matches"
-                                "--max-count=1000"
-                                "--heading" "--line-number" "-e" regex
-                                (file-local-name full-path))))
-               ((string= "grep" grepper)
-                (delq nil (list "--recursive"
-                                (and (natnump context-lines)
-                                     (format "--context=%d" context-lines))
-                                (and glob (format "--include=%s" glob))
-                                "--max-count=1000"
-                                "--line-number" "--regexp" regex
-                                (file-local-name full-path))))))
-             (exit-code (apply #'process-file grepper nil '(t t) nil args)))
-        (when (/= exit-code 0)
-          (goto-char (point-min))
-          (insert (format "Error: search failed with exit-code %d.  Tool output:\n\n" exit-code)))
-        (gptel-agent--truncate-buffer "grep")
-        (buffer-string)))))
-
 (defun gptel-agent--scoped-result-file ()
   "Return the current result explorer's enforced file scope.
 
@@ -2708,7 +2593,8 @@ ABRT after its children have stopped."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (gptel-agent--bash-cleanup)
-      (gptel-agent--searches-cleanup))
+      (gptel-agent--searches-cleanup)
+      (gptel-agent--repository-searches-cleanup))
     (dolist (gate (copy-sequence
                   (buffer-local-value 'gptel-agent--worker-requests buffer)))
       (unless (gptel-agent--workers-closed gate)
@@ -4561,17 +4447,15 @@ whether applied or staged; test on-disk changes and address review feedback."
 
 (gptel-make-tool
  :name "Glob"
- :description "Find entries recursively under root_directory using a case-insensitive basename glob
-such as *.java or * (no / or **). Every result is labelled file/directory/symlink.
-Default type=files; use type=all to inspect directories and hidden entries. Hidden entries
-are included except .git directories. Symlink directories are listed but never traversed.
-Results are sorted by modification time, newest first. depth=1 inspects immediate children.
-Results reflect disk contents; use Read for pending unapplied file review content."
+ :description "Find typed disk entries. The request-local schema advertises the traversal backend, basename glob syntax and resource limits."
  :function #'gptel-agent--glob
- :args '((:name "pattern" :type string :description "Nonempty basename glob; * matches all names.")
-         (:name "root_directory" :type string :optional t :description "Existing search directory; defaults to .")
+ :async t
+ :args '((:name "pattern" :type string :description "Nonempty case-insensitive basename glob; * matches all names, no / or **.")
+         (:name "root_directory" :type string :optional t :description "Existing local search directory; defaults to .")
          (:name "depth" :type integer :minimum 1 :optional t :description "Maximum depth; 1=immediate children. Omit for all depths.")
-         (:name "type" :type string :enum ["files" "directories" "all"] :optional t :description "Entry types to return; defaults to files."))
+         (:name "type" :type string :enum ["files" "directories" "all"] :optional t :description "Entry types to return; defaults to files.")
+         (:name "max_results" :type integer :minimum 1 :optional t :description "Lower the configured global result limit.")
+         (:name "max_entries" :type integer :minimum 1 :optional t :description "Lower the configured traversal entry limit, including nonmatches."))
  :category "gptel-agent" :include t)
 
 (gptel-make-tool
@@ -4608,33 +4492,18 @@ read reports start_line/start_column for continuation; columns count UTF-8 bytes
 
 (gptel-make-tool
  :name "Grep"
- :description "Search for text in file(s) at `path`.
-
-Use this tool to find relevant parts of files to read.
-
-Returns a list of matches prefixed by the line number, and grouped by file.  Can search an individual file (if providing a file path) or a directory.  Consider using this tool to find the right line range for the \"Read\" tool.
-
-When searching directories, optionally restrict the types of files in the search with a `glob`.  Can request context lines around each match using the `context_lines` parameters."
- :function #'gptel-agent--grep
- :args '(( :name "regex"
-           :description "Regular expression to search for in file contents."
-           :type string)
-         ( :name "path"
-           :description "File or directory to search in."
-           :type string)
-         ( :name "glob"
-           :description "Optional basename glob to filter files when path is a directory.
-Examples: *.md, *.rs"
-           :type string
-           :optional t)
-         ( :name "context_lines"
-           :description "Number of lines of context to retrieve around each match (0-15 inclusive).
-Optional, defaults to 0."
-           :optional t
-           :type integer
-           :maximum 15))
- :category "gptel-agent"
- :include t)
+ :description "Search disk files. The request-local schema advertises the selected native regexp dialect and resource limits before use."
+ :function (lambda (callback &rest _)
+             (funcall callback "Error: Grep requires a request-local backend contract."))
+ :async t
+ :args '((:name "regex" :type string :description "Native regular expression in the backend dialect advertised for this request.")
+         (:name "path" :type string :description "Existing local file or directory to search.")
+         (:name "glob" :type string :optional t :description "Optional case-insensitive basename glob for directory searches, e.g. *.el; no / or **.")
+         (:name "context_lines" :type integer :minimum 0 :maximum 15 :optional t :description "Context lines around each match, default 0; limits may cut context short.")
+         (:name "depth" :type integer :minimum 1 :optional t :description "Directory traversal depth; 1=immediate children. Omit for all depths.")
+         (:name "max_results" :type integer :minimum 1 :optional t :description "Lower the configured global matching-line limit across all files.")
+         (:name "max_entries" :type integer :minimum 1 :optional t :description "Lower the configured traversal entry limit, including nonmatches."))
+ :category "gptel-agent" :include t)
 
 (gptel-make-tool
  :name "ResultRead"
@@ -4846,6 +4715,7 @@ the global registry while this request is in flight."
                             (if (eq candidate base-tool) tool candidate))
                           gptel-tools))))
   (gptel-agent--localize-result-search fsm)
+  (gptel-agent--localize-repository-search fsm)
   (when-let* ((base-tool (cl-find "Process" gptel-tools
                                 :key #'gptel-tool-name :test #'equal)))
     (let ((tool (gptel--copy-tool base-tool)))

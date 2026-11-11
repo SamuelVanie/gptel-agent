@@ -4,6 +4,16 @@
 
 ** New features and UI changes
 
+- ~Glob~ and ~Grep~ now use asynchronous subprocesses with request-owned
+  cancellation, a shared traversal/search deadline, and global entry, match,
+  metadata and output limits. Grep advertises its native rg / grep -E / Emacs
+  regexp dialect before use, and refreshes it only between model requests.
+  Traversal prefers Python 3 and falls back to isolated batch Emacs. Glob keeps
+  its basename matching, hidden/dependency entries, symlink handling and sorted
+  output. Limited searches explicitly report incomplete coverage. Both tools
+  accept ~max_results~ and ~max_entries~; Grep also accepts ~depth~. Local paths
+  are required; blocking remote traversal is no longer attempted.
+
 - ~DiscussionControl cleanup~ removes a finished discussion's generated
   worktree, keeping its transcript and branch. Optional ~delete_branch: true~
   also attempts safe Git branch deletion. Cleanup refuses unfinished work and
