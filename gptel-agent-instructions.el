@@ -136,31 +136,52 @@ Internal symlinks work; remote paths and escapes from the boundary fail closed."
              gptel-agent-instructions--boundary path))
     dir))
 
+(defun gptel-agent-instructions--reference-directory (path)
+  "Return the scope of a Read or context reference to PATH.
+An AGENTS.md reference uses its containing directory, even when the file
+is a symlink to shared instructions outside the discovery boundary."
+  (if (and (stringp path) (equal (file-name-nondirectory path) "AGENTS.md"))
+      (progn
+        (when (file-remote-p path)
+          (error "Project instructions do not support remote targets: %s" path))
+        (gptel-agent-instructions--directory
+         (file-name-directory (expand-file-name path)) t))
+    (gptel-agent-instructions--directory path)))
+
 (defun gptel-agent-instructions--load (path)
   "Refresh instruction PATH from disk, replacing its private registry record.
+Symlinks may refer to local files outside the discovery boundary; their
+contents remain scoped to PATH's containing directory inside the boundary.
 Missing files remove old records.  Read failures replace stale text with an
 explicit error; no partial contents are ever treated as instructions."
   (let ((old (cdr (assoc path gptel-agent-instructions--registry))) record)
     (condition-case err
-        (when (or (file-exists-p path) (file-symlink-p path))
-          (when (file-symlink-p path)
-            (error "Symlinked instruction files are not supported; use a regular AGENTS.md"))
+        (progn
+          (when (file-remote-p path)
+            (error "Project instructions do not support remote sources: %s" path))
           (unless (gptel-agent-instructions--inside-p
-                   (file-truename path) gptel-agent-instructions--boundary)
-            (error "Instruction symlink escapes discovery boundary"))
-          (unless (and (file-regular-p path) (file-readable-p path))
-            (error "Instruction file is not a readable regular file"))
-          (when (> (file-attribute-size (file-attributes path))
-                   gptel-agent-project-instructions-max-bytes)
-            (error "Instruction file exceeds %d bytes" gptel-agent-project-instructions-max-bytes))
-          (let ((text (with-temp-buffer
-                        ;; Bound the read too, in case the file grew after stat.
-                        (insert-file-contents path nil 0 (1+ gptel-agent-project-instructions-max-bytes))
-                        (buffer-string))))
-            (when (> (string-bytes text) gptel-agent-project-instructions-max-bytes)
-              (error "Instruction file exceeds size limit"))
-            (setq record (list :path path :scope (file-name-directory path)
-                               :text text :version (secure-hash 'sha256 text)))))
+                   (file-truename (file-name-directory path))
+                   gptel-agent-instructions--boundary)
+            (error "Instruction source directory escapes discovery boundary"))
+          (when (or (file-exists-p path) (file-symlink-p path))
+            ;; Resolve only local filesystem links, without invoking a remote
+            ;; file handler if a link contains a TRAMP-style target name.
+            (let ((target (let (file-name-handler-alist) (file-truename path))))
+              (when (file-remote-p target)
+                (error "Project instructions do not support remote sources: %s" target))
+              (unless (and (file-regular-p target) (file-readable-p target))
+                (error "Instruction file is not a readable regular file"))
+              (when (> (file-attribute-size (file-attributes target))
+                       gptel-agent-project-instructions-max-bytes)
+                (error "Instruction file exceeds %d bytes" gptel-agent-project-instructions-max-bytes))
+              (let ((text (with-temp-buffer
+                            ;; Bound the read too, in case the file grew after stat.
+                            (insert-file-contents target nil 0 (1+ gptel-agent-project-instructions-max-bytes))
+                            (buffer-string))))
+                (when (> (string-bytes text) gptel-agent-project-instructions-max-bytes)
+                  (error "Instruction file exceeds size limit"))
+                (setq record (list :path path :scope (file-name-directory path)
+                                   :text text :version (secure-hash 'sha256 text)))))))
       (error
        (let ((reason (error-message-string err)))
          (setq record (list :path path :scope (file-name-directory path)
@@ -294,7 +315,7 @@ Used before every send and before saving a retained worker's conversation."
               (let ((context (or (plist-get info :agent-instructions-context)
                                  (when buffer-file-name (list buffer-file-name)))))
                 (setf (plist-get info :agent-instructions-targets)
-                      (or (mapcar #'gptel-agent-instructions--directory context)
+                      (or (mapcar #'gptel-agent-instructions--reference-directory context)
                           gptel-agent-instructions--targets
                           (list (gptel-agent-instructions--directory default-directory t))))))
             (setq records (gptel-agent-instructions--records
@@ -318,18 +339,21 @@ Used before every send and before saving a retained worker's conversation."
     (let ((path (plist-get args key)))
       (when (and (stringp path) (file-remote-p path))
         (error "Project instructions do not support remote targets: %s" path))))
-  (if (member name '("Glob" "Grep" "PathInfo" "Mkdir" "Rmdir"))
-      (let ((path (pcase name
-                    ("Glob" (or (plist-get args :root_directory) "."))
-                    ((or "Mkdir" "Rmdir") (plist-get args :directory_path))
-                    (_ (plist-get args :path)))))
-        (list (gptel-agent-instructions--directory
-               path (or (member name '("Glob" "Mkdir" "Rmdir")) (file-directory-p path)))))
+  (cond
+   ((equal name "Read")
+    (list (gptel-agent-instructions--reference-directory (plist-get args :file_path))))
+   ((member name '("Glob" "Grep" "PathInfo" "Mkdir" "Rmdir"))
+    (let ((path (pcase name
+                  ("Glob" (or (plist-get args :root_directory) "."))
+                  ((or "Mkdir" "Rmdir") (plist-get args :directory_path))
+                  (_ (plist-get args :path)))))
+      (list (gptel-agent-instructions--directory
+             path (or (member name '("Glob" "Mkdir" "Rmdir")) (file-directory-p path))))))
+   (t
     (delete-dups
      (mapcar #'gptel-agent-instructions--directory
              (pcase name
-               ("Read" (list (plist-get args :file_path)))
-               ((or "Edit" "Insert" "Write") (gptel-agent-edit-targets name args)))))))
+               ((or "Edit" "Insert" "Write") (gptel-agent-edit-targets name args))))))))
 
 (defun gptel-agent-instructions--signature (records directory)
   "Return supplied RECORDS' path/version pairs applicable to DIRECTORY."
@@ -368,7 +392,9 @@ Used before every send and before saving a retained worker's conversation."
 (defun gptel-agent-instructions--read-ack (args)
   "Return an acknowledgement for a managed Read of AGENTS.md in ARGS."
   (let* ((path (expand-file-name (plist-get args :file_path)))
-         (target (file-truename path)))
+         (target (if (equal (file-name-nondirectory path) "AGENTS.md")
+                     path
+                   (file-truename path))))
     (when (or (equal (file-name-nondirectory path) "AGENTS.md")
               (equal (file-name-nondirectory target) "AGENTS.md"))
       (let* ((dir (gptel-agent-instructions--directory

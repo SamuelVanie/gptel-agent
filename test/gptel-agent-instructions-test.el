@@ -12,6 +12,17 @@
   (make-directory (file-name-directory path) t)
   (with-temp-file path (insert text)))
 
+(cl-defmacro gptel-agent-instructions-test--with-shared-file (&body body)
+  (declare (indent 0))
+  `(let* ((shared-directory (file-name-as-directory
+                            (file-truename (make-temp-file "agent-shared-instructions-" t))))
+          (shared-file (expand-file-name "rules.md" shared-directory)))
+     (unwind-protect
+         (progn
+           (gptel-agent-instructions-test--write shared-file "SHARED-INSTRUCTION")
+           ,@body)
+       (delete-directory shared-directory t))))
+
 (cl-defmacro gptel-agent-instructions-test--with-project (&body body)
   (declare (indent 0))
   `(let* ((root (file-name-as-directory (file-truename (make-temp-file "agent-instructions-" t))))
@@ -463,7 +474,7 @@
       (should (string-match-p "ROOT-INSTRUCTION" (gptel--json-encode submitted)))
       (should-not (string-match-p "REENABLED-INSTRUCTION" (gptel--json-encode submitted))))))
 
-(ert-deftest gptel-agent-instructions-remote-and-symlink-policy-no-implicit-reads ()
+(ert-deftest gptel-agent-instructions-remote-policy-no-implicit-reads ()
   (gptel-agent-instructions-test--with-project
     (with-current-buffer parent
       (gptel-agent-instructions--initialize)
@@ -475,13 +486,134 @@
                        (apply truename file args)))))
           (should-error (gptel-agent-instructions--tool-targets
                          "Edit" '(:mode "batch" :root_directory "/ssh:example:/tmp/" :operations [(:operation "delete" :file_path "a")]))))
-        (should-not remote-access))
+        (should-not remote-access)))))
+
+(ert-deftest gptel-agent-instructions-internal-symlink-keeps-source-scope ()
+  (gptel-agent-instructions-test--with-project
+    (with-current-buffer parent
+      (gptel-agent-instructions--initialize)
       (delete-file (concat root "AGENTS.md"))
       (make-symbolic-link (concat front "AGENTS.md") (concat root "AGENTS.md"))
+      (let ((record (gptel-agent-instructions--load (concat root "AGENTS.md"))))
+        (should-not (plist-get record :error))
+        (should (equal (plist-get record :text) "FRONT-INSTRUCTION"))
+        (should (equal (plist-get record :path) (concat root "AGENTS.md")))
+        (should (equal (plist-get record :scope) root))))))
+
+(ert-deftest gptel-agent-instructions-shared-symlinks-startup-read-and-context ()
+  (gptel-agent-instructions-test--with-shared-file
+    ;; Two independent projects share one file, using absolute and relative links.
+    (dolist (relative '(nil t))
+      (gptel-agent-instructions-test--with-project
+        (make-symbolic-link (if relative (file-relative-name shared-file root) shared-file)
+                            (concat root "AGENTS.md") t)
+        ;; A nested link chain still has its own, more specific scope.
+        (make-symbolic-link "../AGENTS.md" (concat front "AGENTS.md") t)
+        ;; Measure the target contents, not the longer symlink target name.
+        (let ((gptel-agent-project-instructions-max-bytes (length "SHARED-INSTRUCTION")))
+          (setq fsm (gptel-agent-instructions-test--request parent)))
+        (let ((record (car (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))))
+          (should (equal (plist-get record :text) "SHARED-INSTRUCTION"))
+          (should (equal (plist-get record :path) (concat root "AGENTS.md")))
+          (should (equal (plist-get record :scope) root)))
+        (gptel-agent-workers-test--tool
+         fsm "Read" (list :file_path (concat front "AGENTS.md") :offset 1 :limit 1))
+        (let ((records (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+              (payload (gptel-agent-instructions-test--payload fsm)))
+          (should (equal (mapcar (lambda (r) (plist-get r :scope)) records) (list root front)))
+          (should (equal (mapcar (lambda (r) (plist-get r :path)) records)
+                         (list (concat root "AGENTS.md") (concat front "AGENTS.md"))))
+          (should (= 2 (gptel-agent-workers-test--count "SHARED-INSTRUCTION" payload)))
+          (should (string-match-p "Loaded project instruction source" payload)))
+        (with-current-buffer parent
+          (setq gptel-use-context t gptel-context (list (list (concat front "AGENTS.md")))))
+        (setq fsm (gptel-agent-instructions-test--request parent))
+        (should (equal (mapcar (lambda (r) (plist-get r :scope))
+                              (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+                       (list root front)))
+        ;; Reading the shared instructions does not expand ordinary tool access.
+        (make-symbolic-link shared-file (concat root "ordinary.md"))
+        (with-current-buffer parent
+          (should-error (gptel-agent-instructions--tool-targets
+                         "Read" (list :file_path shared-file)))
+          (should-error (gptel-agent-instructions--tool-targets
+                         "Read" (list :file_path (concat root "ordinary.md"))))
+          (should-error (gptel-agent-instructions--tool-targets
+                         "Write" (list :file_path (concat root "AGENTS.md") :content "overwrite"))))
+        (gptel-agent-workers-test--tool fsm "Read" (list :file_path (concat back "AGENTS.md")))
+        (should (equal (mapcar (lambda (r) (plist-get r :scope))
+                              (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+                       (list root back)))))))
+
+(ert-deftest gptel-agent-instructions-shared-symlink-refresh-and-retarget ()
+  (gptel-agent-instructions-test--with-shared-file
+    (gptel-agent-instructions-test--with-project
+      (make-symbolic-link shared-file (concat root "AGENTS.md") t)
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (let ((snapshot (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+            (replacement (expand-file-name "replacement.md" shared-directory))
+            (args (list :file_path (concat root "new.txt") :content "new")))
+        ;; Replacing the shared file on save must refresh the next outgoing call.
+        (gptel-agent-instructions-test--write replacement "SHARED-REPLACED")
+        (rename-file replacement shared-file t)
+        (gptel--handle-wait fsm)
+        (should (string-match-p "SHARED-REPLACED" (gptel-agent-instructions-test--payload fsm)))
+        (should (equal (plist-get (car snapshot) :text) "SHARED-INSTRUCTION"))
+        ;; A change after the request blocks an edit until the model sees it.
+        (gptel-agent-instructions-test--write shared-file "SHARED-CHANGED")
+        (gptel-agent-workers-test--tool fsm "Write" args)
+        (should-not (file-exists-p (concat root "new.txt")))
+        (should (string-match-p "SHARED-CHANGED" (gptel-agent-instructions-test--payload fsm)))
+        (gptel-agent-instructions-test--write replacement "SHARED-RETARGETED")
+        (make-symbolic-link replacement (concat root "AGENTS.md") t)
+        (gptel-agent-workers-test--tool fsm "Write" args)
+        (should-not (file-exists-p (concat root "new.txt")))
+        (should (string-match-p "SHARED-RETARGETED" (gptel-agent-instructions-test--payload fsm)))
+        (should-not (string-match-p "SHARED-CHANGED" (gptel-agent-instructions-test--payload fsm)))
+        (gptel-agent-workers-test--tool fsm "Write" args)
+        (should (file-exists-p (concat root "new.txt")))))))
+
+(ert-deftest gptel-agent-instructions-unavailable-symlink-targets-block-writes ()
+  (gptel-agent-instructions-test--with-shared-file
+    (dolist (failure '(missing directory cycle oversized unreadable))
+      (gptel-agent-instructions-test--with-project
+        (make-symbolic-link shared-file (concat root "AGENTS.md") t)
+        (setq fsm (gptel-agent-instructions-test--request parent))
+        (pcase failure
+          ('missing (make-symbolic-link (concat shared-directory "missing.md") (concat root "AGENTS.md") t))
+          ('directory (make-symbolic-link shared-directory (concat root "AGENTS.md") t))
+          ('cycle (make-symbolic-link "AGENTS.md" (concat root "AGENTS.md") t)))
+        (let ((gptel-agent-project-instructions-max-bytes
+               (if (eq failure 'oversized) 4 gptel-agent-project-instructions-max-bytes))
+              (readable (symbol-function 'file-readable-p)))
+          (cl-letf (((symbol-function 'display-warning) #'ignore)
+                    ((symbol-function 'file-readable-p)
+                     (lambda (path) (and (not (eq failure 'unreadable)) (funcall readable path)))))
+            (gptel-agent-workers-test--tool
+             fsm "Write" (list :file_path (concat root "new.txt") :content "new"))))
+        (should-not (file-exists-p (concat root "new.txt")))
+        (should (string-match-p "UNAVAILABLE" (gptel-agent-instructions-test--payload fsm)))
+        (should-not (string-match-p "SHARED-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+        ;; Repairing the link restores the scoped contents on the next call.
+        (make-symbolic-link shared-file (concat root "AGENTS.md") t)
+        (gptel--handle-wait fsm)
+        (should (string-match-p "SHARED-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))))))
+
+(ert-deftest gptel-agent-instructions-symlink-remote-target-never-connects ()
+  (gptel-agent-instructions-test--with-project
+    (make-symbolic-link "/ssh:example:/tmp/rules.md" (concat root "remote-link"))
+    (make-symbolic-link "remote-link" (concat root "AGENTS.md") t)
+    (let ((file-name-handler-alist
+           (cons (cons "\\`/ssh:" (lambda (operation &rest _)
+                                    (if (eq operation 'file-remote-p) "/ssh:example:"
+                                      (ert-fail (format "Unexpected remote access: %s" operation)))))
+                 file-name-handler-alist)))
       (cl-letf (((symbol-function 'display-warning) #'ignore))
-        (let ((record (gptel-agent-instructions--load (concat root "AGENTS.md"))))
-          (should (plist-get record :error))
-          (should-not (plist-get record :text)))))))
+        (setq fsm (gptel-agent-instructions-test--request parent))
+        (gptel-agent-workers-test--tool fsm "Read" (list :file_path (concat root "AGENTS.md")))))
+    (let ((record (car (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))))
+      (should (string-match-p "remote sources" (plist-get record :error)))
+      (should-not (plist-get record :text)))))
 
 (ert-deftest gptel-agent-instructions-cached-provider-state-cannot-retain-old-block ()
   (gptel-agent-instructions-test--with-project

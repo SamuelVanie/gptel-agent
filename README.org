@@ -206,16 +206,36 @@ Internal workers restricted to a single result file do not perform project
 instruction discovery, even when their parent enables it.
 New workers and discussions inherit the effective boolean preference only.
 
-The first implementation supports local files within the conversation's current
+Managed file operations support local files within the conversation's current
 discovery boundary. File/directory symlinks inside that boundary resolve to their
 canonical target scopes. Escaping symlinks, remote targets, and targets outside
-the boundary report an error before managed file operations. Use
+the boundary report an error before ordinary managed file operations. Use
 =ChangeDirectory= to request permission to move into the target project, or
 change the chat directory yourself with =M-x cd=.
-=AGENTS.md= itself must be a regular, non-symlinked file. Unreadable instructions
-and files exceeding =gptel-agent-project-instructions-max-bytes= (128 KiB by
-default) produce visible diagnostics and block mutations in their scopes;
-stale or truncated contents are not silently used.
+
+=AGENTS.md= may be a symlink to a readable regular local file, including a
+shared file outside the project. Absolute and relative links are supported.
+The source and scope remain the project's =AGENTS.md= path and its containing
+directory, so a link at the project root applies to that project and a nested
+link applies only to its subtree. The shared target's directory does not become
+an instruction scope or expand access for ordinary file operations. Managed
+=Read= calls and attached context using the project's =AGENTS.md= path retain
+this local scope.
+
+For example, to share one rules file between two projects that do not already
+have an =AGENTS.md=:
+
+#+begin_src sh
+ln -s "$HOME/shared-rules/AGENTS.md" /path/to/project-a/AGENTS.md
+ln -s "$HOME/shared-rules/AGENTS.md" /path/to/project-b/AGENTS.md
+#+end_src
+
+Saved changes to the shared file and changes to the symlink target are refreshed
+by the normal instruction checks. Broken or cyclic links, unreadable or non-file
+targets, remote targets, and files exceeding
+=gptel-agent-project-instructions-max-bytes= (128 KiB by default) produce visible
+diagnostics and block mutations in their scopes; stale or truncated contents are
+not silently used.
 
 The per-call payload adapter covers OpenAI Chat Completions and compatible
 =:messages= backends, OpenAI Responses, Anthropic, Gemini, and Ollama. It preserves
