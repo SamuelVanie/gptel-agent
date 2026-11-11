@@ -810,6 +810,69 @@ agent configuration: agent-definition =pre= and =post= evaluation and hooks
 remain unchanged. Automatic unloading and persistence across Emacs restarts are
 not supported.
 
+**** Manually invoked skills
+
+Add =disable-model-invocation: true= to a skill's =SKILL.md= frontmatter to
+use it as a reusable prompt with supporting files:
+
+#+begin_src markdown
+---
+name: review-my-change
+description: Review a change using my team's checklist
+disable-model-invocation: true
+allowed-tools: Read Bash
+---
+Read references/checklist.md, then review the current change.
+Use scripts/check.sh for the mechanical checks.
+#+end_src
+
+Place the skill directory under one of =gptel-agent-skill-dirs=, with the
+referenced files alongside =SKILL.md=, for example:
+
+#+begin_example
+~/.agents/skills/review-my-change/
+  SKILL.md
+  references/checklist.md
+  scripts/check.sh
+#+end_example
+
+While composing a message, run =M-x gptel-agent-use-skill= and choose a skill
+with completion. Descriptions appear as completion annotations. The command
+discovers manual skills for the current buffer's directory on each invocation,
+independently of =gptel-agent-toggle-skill=. It adds a compact =[Skill: name]=
+attachment at point. The attachment contains a snapshot of the full instructions
+and base directory, with references to existing supporting files expanded into
+absolute paths. Only its label is displayed; the full text is sent to the model
+and retained in the conversation. Supporting file contents are read on demand.
+
+Add your task details and call =gptel-send= normally. Selection alone does not
+send a request, execute scripts or grant tools. Undo the attachment before
+sending to cancel it. You can attach multiple skills to a message. Only
+attachments included in the submitted text activate; sending a region that
+excludes an attachment leaves it pending.
+
+Sending activates =allowed-tools= using the same resolver as the =Skill= tool:
+registered tools become available and pre-approved in =auto= confirmation mode.
+Always-confirm settings and per-call hooks still apply. Invalid declarations
+add a diagnostic to the instructions and grant none of that skill's tools.
+Grants persist across turns in this conversation and are not inherited as
+pre-approvals by child conversations. Request previews do not commit grants.
+As with model-invoked skills, grants are not restored across Emacs restarts;
+saved conversation text retains the instructions.
+
+For a shortcut, bind =gptel-agent-use-skill= to a key, or call
+=(gptel-agent-use-skill "review-my-change")= from an interactive wrapper.
+Directory boundaries are unchanged: supporting files outside the current
+project can still require =ChangeDirectory= approval, just as with existing
+model-invoked skills. =allowed-tools= does not bypass that boundary.
+
+Manual skills are absent from =gptel-agent-toggle-skill=, the model's available
+skills description, and the =Skill= tool's argument completion/schema. The
+=Skill= tool also rejects direct attempts to load them. Their instructions
+enter the model's context only when you attach and send them, then remain ordinary
+conversation text. Omit the flag or set it to the YAML boolean =false= for an
+ordinary model-invocable skill.
+
 **** Discussion lifecycle
 
 Discussions run independently and survive the parent's completed turn. Ordinary

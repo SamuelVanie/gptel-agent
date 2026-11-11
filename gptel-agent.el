@@ -179,12 +179,13 @@ Alist mapping agent names to a plist of agent properties.")
 
 The key is the name.  The value is a cons (LOCATION . SKILL-PLIST).
 LOCATION is the path to the skill's directory.  SKILL-PLIST contains
-its discovery metadata (:description), without declarations or body.")
+its discovery metadata (:description and :disable-model-invocation),
+without tool declarations or body.")
 
 (defvar gptel-agent--enabled-skills nil
   "List of currently enabled skill names.
 
-When nil, all discovered skills are considered enabled.
+When nil, all discovered model-invocable skills are considered enabled.
 Use `gptel-agent-toggle-skill' to manage this list interactively.")
 
 (defvar-local gptel-agent--enabled-agents nil
@@ -256,8 +257,8 @@ or AGENT-FILE has changed since it was cached."
 
 (defun gptel-agent--cached-read-skill-file (file &optional full)
   "Read FILE as skill data, including its body when FULL is non-nil.
-Only name and description are retained during discovery.  In particular,
-agent preset keys such as pre and post are never evaluated for skills."
+Only name, description and disable-model-invocation are retained during
+discovery.  Agent preset keys such as pre and post are never evaluated."
   (require 'yaml)
   (let* ((file (expand-file-name file))
          (mtime (gptel-agent--file-mtime file))
@@ -271,7 +272,10 @@ agent preset keys such as pre and post are never evaluated for skills."
                                   header :object-type 'plist
                                   :object-key-type 'keyword :sequence-type 'list)))
                (name (or (plist-get data :name) (file-name-base file)))
-               (metadata (list :description (plist-get data :description)))
+               (metadata (append
+                          (list :description (plist-get data :description))
+                          (when (eq (plist-get data :disable-model-invocation) t)
+                            (list :disable-model-invocation t))))
                (parsed
                 (cons name
                       (if (not full) metadata
@@ -391,21 +395,31 @@ ANCESTORS contains the true names of parent directories, to avoid cycles."
                  finally return (nconc (nreverse absolute-dirs) (nreverse relative-dirs))))
   gptel-agent--skills)
 
+(defun gptel-agent--manual-skill-p (skill)
+  "Return non-nil if discovery entry SKILL is restricted to user invocation."
+  (eq (plist-get (cddr skill) :disable-model-invocation) t))
+
+(defun gptel-agent--model-skills (skills &optional include-disabled)
+  "Return model-invocable entries from SKILLS.
+Honor `gptel-agent--enabled-skills' unless INCLUDE-DISABLED is non-nil."
+  (cl-remove-if-not
+   (lambda (skill)
+     (and (not (gptel-agent--manual-skill-p skill))
+          (or include-disabled (null gptel-agent--enabled-skills)
+              (member (car skill) gptel-agent--enabled-skills))))
+   skills))
+
 (defun gptel-agent--skills-system-message (agent-skills)
   "Parse AGENT-SKILLS and return the message describing known skills.
 
 Only skills whose names are in `gptel-agent--enabled-skills' are
-included.  When `gptel-agent--enabled-skills' is nil, all skills are
-included.
+included.  When `gptel-agent--enabled-skills' is nil, all model-invocable
+skills are included.  Manual skills are always excluded.
 
 AGENT-SKILLS is a alist of skill names and associated plist as value
  (See `gptel-agent--skills').  The plist is expected to have
 :description as a key."
-  (let ((skills (if gptel-agent--enabled-skills
-                    (cl-remove-if-not
-                     (lambda (s) (member (car s) gptel-agent--enabled-skills))
-                     agent-skills)
-                  agent-skills)))
+  (let ((skills (gptel-agent--model-skills agent-skills)))
     (concat "Load a skill to get detailed instructions for a specific task."
             "Skills provide specialized knowledge and step-by-step guidance."
             "Use this when a task matches an available skill's description."
@@ -500,13 +514,14 @@ their original schema and registry snapshot."
   "Toggle which skills are enabled for the Skill tool.
 
 Prompts for skills to enable.  Skills not selected will be disabled.
+Skills with disable-model-invocation are excluded.
 The Skill tool's description and enum are updated immediately without
 requiring `gptel-agent-update'."
   (interactive)
   (unless gptel-agent--skills
     (gptel-agent--update-skills))
-  (let* ((all-skills (mapcar #'car gptel-agent--skills))
-         (current (or gptel-agent--enabled-skills all-skills))
+  (let* ((all-skills (mapcar #'car (gptel-agent--model-skills gptel-agent--skills t)))
+         (current (mapcar #'car (gptel-agent--model-skills gptel-agent--skills)))
          (selected
           (completing-read-multiple
            "Enable skills: "
@@ -516,6 +531,51 @@ requiring `gptel-agent-update'."
     (gptel-agent--update-skill-tool)
     (message "Skills updated: %s enabled."
              (length gptel-agent--enabled-skills))))
+
+;;;###autoload
+(defun gptel-agent-use-skill (&optional skill)
+  "Attach a manually invoked SKILL to the message at point.
+With no SKILL, offer completion over skills whose frontmatter contains
+disable-model-invocation: true, with descriptions as annotations.
+Discover skills for the current directory, independently of the Skill
+tool's enabled list.  The attachment displays as [Skill: NAME]; its full
+instructions and resolved supporting file paths are included in the message.
+
+Send with `gptel-send' when ready.  Sending activates allowed-tools just
+like model invocation through Skill.  Selection alone grants no tools;
+undo the attachment before sending to cancel it.  Tool pre-approvals persist
+in this conversation, but are not inherited by other conversations."
+  (interactive)
+  (barf-if-buffer-read-only)
+  (let* ((gptel-agent--skills nil)
+         (skills (cl-remove-if-not #'gptel-agent--manual-skill-p
+                                   (gptel-agent--update-skills)))
+         (completion-extra-properties
+          (list :annotation-function
+                (lambda (name)
+                  (concat "  " (plist-get (cddr (assoc name skills)) :description))))))
+    (unless skills
+      (user-error "No skills with disable-model-invocation: true found"))
+    (setq skill (or skill (completing-read "Use skill: " skills nil t)))
+    (let* ((entry (assoc skill skills))
+           (dir (cadr entry))
+           (data (and dir (cdr (gptel-agent--cached-read-skill-file
+                               (expand-file-name "SKILL.md" dir) t)))))
+      (unless (eq (plist-get data :disable-model-invocation) t)
+        (user-error "Skill %s is not a manually invoked skill" skill))
+      (unless (plist-get data :system)
+        (user-error "Could not load body of skill %s" skill))
+      (let* ((text (gptel-agent--format-skill skill dir data))
+             (use (list :name skill :buffer (current-buffer) :data data
+                        :activated nil :diagnostic nil)))
+        (atomic-change-group
+          (unless (bolp) (insert "\n"))
+          (insert (propertize (concat (string-trim-right text) "\n")
+                              'gptel-agent-skill-use use
+                              'display (format "[Skill: %s]\n" skill)
+                              'help-echo "Skill attached; send normally to activate it. Undo to remove."
+                              'rear-nonsticky t))
+          (insert "\n"))))))
 
 ;;; Sub-agent definition parsers for Markdown and Org
 

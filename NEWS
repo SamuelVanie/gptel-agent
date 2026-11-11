@@ -4,6 +4,14 @@
 
 ** New features and UI changes
 
+- Skills with ~disable-model-invocation: true~ are available through
+  ~gptel-agent-use-skill~, which completes manual skill names and attaches
+  instructions with resolved supporting file paths to a message, displayed
+  as ~[Skill: name]~. Sending with ~gptel-send~ applies ~allowed-tools~ just
+  like model invocation; selection and request previews grant no tools.
+  These skills are excluded from model discovery and ~gptel-agent-toggle-skill~,
+  and direct ~Skill~ calls reject them. Directory boundaries are unchanged.
+
 - ~Discussion~ accepts an optional ~model~ in gptel's ~Backend:model~ format.
   The tool advertises configured backend/model pairs and applies the selection
   after the preset and its hooks, overriding both backend and model. Omission

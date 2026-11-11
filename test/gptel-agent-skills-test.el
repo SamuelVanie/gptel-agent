@@ -564,4 +564,367 @@
     (should (gptel-agent-skills-test--tool fsm "DiscussionControl"))
     (should (string-match-p "self-contained opening prompt" (cdar requests)))))
 
+(ert-deftest gptel-agent-skills-manual-frontmatter-is-data ()
+  (let* ((root (make-temp-file "gptel-manual-skill-" t))
+         (gptel-agent--skill-file-cache nil))
+    (unwind-protect
+        (dolist (value '("true" "false" "null" "\"false\"" "\"arbitrary\""))
+          (let ((file (make-temp-file (expand-file-name "skill-" root) nil ".md")))
+            (with-temp-file file
+              (insert "---\nname: manual\ndescription: Manual workflow\n"
+                      "disable-model-invocation: " value "\n"
+                      "allowed-tools: Read Bash\n---\nPrivate instructions\n"))
+            (dolist (full '(nil t))
+              (let ((data (cdr (gptel-agent--cached-read-skill-file file full))))
+                (should (eq (plist-get data :disable-model-invocation)
+                            (equal value "true")))
+                (unless full
+                  (should-not (plist-member data :system))
+                  (should-not (plist-member data :allowed-tools)))))))
+      (delete-directory root t))))
+
+(ert-deftest gptel-agent-skills-manual-excluded-from-discovery-and-toggle ()
+  (let* ((gptel-agent--skills
+          '(("manual" "/unused/manual/" :description "Private description"
+             :disable-model-invocation t)
+            ("automatic" "/unused/automatic/" :description "Public description")))
+         ;; A stale saved selection must never re-expose a manual skill.
+         (gptel-agent--enabled-skills '("manual" "automatic" "missing"))
+         (tool (gptel-agent--skill-copy-tool (gptel-get-tool "Skill")))
+         (gptel--known-tools `(("test" ("Skill" . ,tool)))))
+    (gptel-agent--update-skill-tool)
+    (should (equal (plist-get (car (gptel-tool-args tool)) :enum) ["automatic"]))
+    (should (string-match-p "Public description" (gptel-tool-description tool)))
+    (should-not (string-match-p "manual\\|Private description\\|missing"
+                                (gptel-tool-description tool)))
+    (cl-letf (((symbol-function 'completing-read-multiple)
+               (lambda (_prompt candidates _predicate require-match initial &rest _)
+                 (should (equal candidates '("automatic")))
+                 (should require-match)
+                 (should (equal initial "automatic"))
+                 '("automatic"))))
+      (gptel-agent-toggle-skill))
+    (setq gptel-agent--skills (list (car gptel-agent--skills))
+          gptel-agent--enabled-skills nil)
+    (gptel-agent--update-skill-tool)
+    (should (equal (plist-get (car (gptel-tool-args tool)) :enum) []))
+    (should-not (string-match-p "Private description" (gptel-tool-description tool)))))
+
+(ert-deftest gptel-agent-skills-manual-rejected-by-request-and-direct-tool ()
+  (gptel-agent-skills-test--with-chat
+      "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+    (let* ((gptel-agent-skill-dirs (list root))
+           (gptel-agent--bundled-skill-dir root)
+           (gptel-agent--enabled-skills '("test-skill")))
+      (gptel-agent--update-skills)
+      (gptel-agent-workers-test--answer fsm "Ready")
+      (with-current-buffer parent
+        (goto-char (point-max)) (insert "Next request") (gptel-send)
+        (setq fsm (caar requests)))
+      (let ((tool (gptel-agent-skills-test--tool fsm "Skill")))
+        (should (equal (plist-get (car (gptel-tool-args tool)) :enum) []))
+        (should-not (string-match-p "Test capability" (gptel-tool-description tool))))
+      (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+      ;; Even a guessed name is rejected before reading its instructions.
+      (cl-letf (((symbol-function 'gptel-agent--cached-read-skill-file)
+                 (lambda (&rest _) (ert-fail "Manual body read by model"))))
+        (should (string-match-p "only be invoked by the user"
+                                (gptel-agent--get-skill "test-skill")))
+        (gptel-agent-skills-test--load fsm))
+      (should (string-match-p "only be invoked by the user" (cdar requests)))
+      (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+      (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+      (should-not (buffer-local-value 'gptel-agent--skill-tools parent)))))
+
+(ert-deftest gptel-agent-skills-manual-flag-checked-with-stale-discovery ()
+  (gptel-agent-skills-test--with-chat "allowed-tools: SkillMutation\n"
+    (gptel-agent--cached-read-skill-file file t)
+    ;; Change the file after creating the request and populating both caches.
+    (with-temp-file file
+      (insert "---\nname: test-skill\ndescription: Test capability\n"
+              "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+              "---\nSKILL-WORKFLOW-INSTRUCTIONS\n"))
+    (set-file-times file (time-add (current-time) 2))
+    (gptel-agent-skills-test--load fsm)
+    (should (string-match-p "only be invoked by the user" (cdar requests)))
+    (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+    (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (should-not (buffer-local-value 'gptel-agent--skill-tools parent))))
+
+(ert-deftest gptel-agent-skills-manual-attachment-completes-and-sends-with-references ()
+  (gptel-agent-skills-test--with-chat
+      "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+    (let* ((gptel-agent-skill-dirs '(".skills"))
+           (gptel-agent--bundled-skill-dir (expand-file-name "no-bundled" root))
+           (dir (expand-file-name ".skills/manual/" root))
+           (reference (expand-file-name "references/style.md" dir))
+           (script (expand-file-name "scripts/check.sh" dir))
+           (gptel-agent--enabled-skills '("another-skill")))
+      (make-directory (file-name-directory reference) t)
+      (make-directory (file-name-directory script) t)
+      (with-temp-file reference (insert "REFERENCE-CONTENTS-READ-ON-DEMAND"))
+      (with-temp-file script (insert "echo SCRIPT-CONTENTS-READ-ON-DEMAND"))
+      (with-temp-file (expand-file-name "SKILL.md" dir)
+        (insert "---\nname: manual\ndescription: Manual workflow\n"
+                "disable-model-invocation: true\nallowed-tools: SkillMutation\n---\n"
+                "MANUAL-INSTRUCTIONS: Read references/style.md; run scripts/check.sh.\n"))
+      (gptel-agent-workers-test--answer fsm "Ready")
+      (with-current-buffer parent
+        (setq default-directory (file-name-as-directory root))
+        (goto-char (point-max))
+        (insert "Apply this workflow:")
+        (let ((before (buffer-string))
+              (request-count (length requests))
+              (discovery gptel-agent--skills))
+          (buffer-enable-undo)
+          (undo-boundary)
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (_prompt candidates _predicate require-match &rest _)
+                       (should (equal (mapcar #'car candidates) '("manual")))
+                       (should require-match)
+                       (should (equal (funcall (plist-get completion-extra-properties
+                                                         :annotation-function) "manual")
+                                      "  Manual workflow"))
+                       "manual")))
+            (call-interactively #'gptel-agent-use-skill))
+          (should (= (length requests) request-count))
+          (should (eq discovery gptel-agent--skills))
+          (should-not gptel-agent--skill-tools)
+          (should (string-match-p (regexp-quote reference) (buffer-string)))
+          (should (string-match-p (regexp-quote script) (buffer-string)))
+          (should-not (string-match-p "CONTENTS-READ-ON-DEMAND" (buffer-string)))
+          (save-excursion
+            (goto-char (point-min))
+            (search-forward "## Skill: manual")
+            (should (equal (get-text-property (1- (point)) 'display)
+                           "[Skill: manual]\n")))
+          (undo-boundary)
+          (undo)
+          (should (equal before (buffer-string)))
+          (gptel-agent-use-skill "manual")
+          (insert "Use this for the current change.")
+          (gptel-send)
+          (setq fsm (caar requests))))
+      (should (string-match-p "MANUAL-INSTRUCTIONS" (cdar requests)))
+      (should (string-match-p (regexp-quote reference) (cdar requests)))
+      (should (string-match-p (regexp-quote script) (cdar requests)))
+      (should (gptel-agent-skills-test--tool fsm "SkillMutation"))
+      (should-not (gptel-tool-confirm (gptel-agent-skills-test--tool fsm "SkillMutation")))
+      (gptel-agent-workers-test--tool fsm "SkillMutation" nil)
+      (should (= executions 1)))))
+
+(ert-deftest gptel-agent-skills-manual-selection-errors-leave-message-unchanged ()
+  (gptel-agent-skills-test--with-chat ""
+    (let ((gptel-agent-skill-dirs (list root))
+          (gptel-agent--bundled-skill-dir root))
+      (with-temp-buffer
+        (insert "Existing draft")
+        (should-error (gptel-agent-use-skill) :type 'user-error)
+        (should (equal (buffer-string) "Existing draft"))
+        (with-temp-file file
+          (insert "---\nname: test-skill\ndescription: Manual\n"
+                  "disable-model-invocation: true\n---\nInstructions"))
+        (should-error (gptel-agent-use-skill "missing") :type 'user-error)
+        (should (equal (buffer-string) "Existing draft"))
+        (setq buffer-read-only t)
+        (should-error (gptel-agent-use-skill "test-skill") :type 'buffer-read-only)))))
+
+(defun gptel-agent-skills-test--attach (buffer root)
+  "Attach the manual test skill from ROOT in BUFFER, without sending."
+  (with-current-buffer buffer
+    (let ((gptel-agent-skill-dirs (list root))
+          (gptel-agent--bundled-skill-dir root))
+      (goto-char (point-max))
+      (gptel-agent-use-skill "test-skill"))))
+
+(defun gptel-agent-skills-test--send (buffer)
+  "Send the message at the end of BUFFER."
+  (with-current-buffer buffer
+    (goto-char (point-max))
+    (gptel-send)))
+
+(ert-deftest gptel-agent-skills-manual-activation-all-providers-and-followup ()
+  (dolist (backend (list (gptel-make-openai "m-oai" :key "unused" :models '(test))
+                         (gptel-make-openai-responses "m-responses" :key "unused" :models '(test))
+                         (gptel-make-anthropic "m-anthropic" :key "unused" :models '(test))
+                         (gptel-make-gemini "m-gemini" :key "unused" :models '(test))))
+    (let ((gptel-agent-workers-test--backend backend))
+      (gptel-agent-skills-test--with-chat
+          "disable-model-invocation: true\nallowed-tools: SkillMutation Discussion DiscussionControl Agent\n"
+        (gptel-agent-workers-test--answer fsm "Ready")
+        ;; Manual use works even without the model's Skill tool configured.
+        (with-current-buffer parent (setq-local gptel-tools nil))
+        (gptel-agent-skills-test--attach parent root)
+        (should-not (buffer-local-value 'gptel-agent--skill-tools parent))
+        (gptel-agent-skills-test--send parent)
+        (setq fsm (caar requests))
+        (dolist (name '("SkillMutation" "Discussion" "DiscussionControl" "Agent" "AgentControl"))
+          (should (member name (gptel-agent-skills-test--wire-names fsm))))
+        (should (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+        (should-not (member "Skill" (gptel-agent-skills-test--wire-names fsm)))
+        (gptel-agent-workers-test--tool fsm "SkillMutation" nil)
+        (should (= executions 1))
+        (gptel-agent-workers-test--tool
+         fsm "Discussion" '(:title "Manual skill child" :prompt "Independent"))
+        (let* ((chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+               (child (gptel-agent-discussion--chat-buffer chat))
+               (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+          (should-not (buffer-local-value 'gptel-agent--skill-tools child))
+          (should (gptel-tool-confirm (gptel-agent-skills-test--tool child-fsm "SkillMutation")))
+          (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS"
+                                      (gptel-agent-workers-test--data child-fsm))))
+        (let ((previous fsm))
+          (gptel-agent-workers-test--answer fsm "Done")
+          (with-current-buffer parent (goto-char (point-max)) (insert "Continue"))
+          (gptel-agent-skills-test--send parent)
+          (setq fsm (caar requests))
+          (should (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+          (should-not (eq (gptel-tool-function (gptel-agent-skills-test--tool previous "Discussion"))
+                          (gptel-tool-function (gptel-agent-skills-test--tool fsm "Discussion"))))
+          (gptel-agent-workers-test--tool fsm "SkillMutation" nil)
+          (should (= executions 2)))))))
+
+(ert-deftest gptel-agent-skills-manual-confirmation-and-hooks-match-model-use ()
+  (dolist (mode '(always confirm block allow))
+    (gptel-agent-skills-test--with-chat
+        "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+      (gptel-agent-workers-test--answer fsm "Ready")
+      (gptel-agent-skills-test--attach parent root)
+      (with-current-buffer parent
+        (setq-local gptel-confirm-tool-calls (if (memq mode '(always allow)) t 'auto))
+        (unless (eq mode 'always)
+          (setq-local gptel-pre-tool-call-functions
+                      (list (lambda (_call)
+                              (if (eq mode 'block)
+                                  (list :block "Blocked by test hook")
+                                (list :confirm (eq mode 'confirm))))))))
+      (gptel-agent-skills-test--send parent)
+      (setq fsm (caar requests))
+      (gptel-agent-workers-test--tool fsm "SkillMutation" nil)
+      (should (= executions (if (eq mode 'allow) 1 0)))
+      (should (gptel-tool-confirm (gptel-get-tool "SkillMutation")))
+      (should (eq (gptel-fsm-state fsm) (if (memq mode '(always confirm)) 'TOOL 'WAIT))))))
+
+(ert-deftest gptel-agent-skills-manual-invalid-declaration-is-atomic ()
+  (gptel-agent-skills-test--with-chat
+      "disable-model-invocation: true\nallowed-tools: SkillMutation MissingTool\n"
+    (gptel-agent-workers-test--answer fsm "Ready")
+    (gptel-agent-skills-test--attach parent root)
+    (gptel-agent-skills-test--send parent)
+    (setq fsm (caar requests))
+    (should (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+    (should (string-match-p "Unknown allowed-tools name" (cdar requests)))
+    (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (should-not (buffer-local-value 'gptel-agent--skill-tools parent))
+    (gptel-agent-workers-test--answer fsm "Done")
+    (with-current-buffer parent (goto-char (point-max)) (insert "Continue"))
+    (gptel-agent-skills-test--send parent)
+    (should (string-match-p "Unknown allowed-tools name" (cdar requests)))
+    (should-not (buffer-local-value 'gptel-agent--skill-tools parent))))
+
+(ert-deftest gptel-agent-skills-manual-preview-and-failed-transform-do-not-commit ()
+  (gptel-agent-skills-test--with-chat
+      "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+    (gptel-agent-workers-test--answer fsm "Ready")
+    (gptel-agent-skills-test--attach parent root)
+    (with-current-buffer parent
+      (let ((preview (gptel-request nil :dry-run t
+                      :transforms '(gptel-agent--localize-skill-tool))))
+        (should (gptel-agent-skills-test--tool preview "SkillMutation"))
+        (should-not gptel-agent--skill-tools))
+      (should-error
+       (gptel-request nil :transforms
+                      (list #'gptel-agent--localize-skill-tool
+                            (lambda (_) (error "Failed after skill preparation")))))
+      (should-not gptel-agent--skill-tools))
+    (gptel-agent-skills-test--send parent)
+    (setq fsm (caar requests))
+    (should (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (gptel-agent-workers-test--tool fsm "SkillMutation" nil)
+    (should (= executions 1))))
+
+(ert-deftest gptel-agent-skills-manual-undo-and-copy-do-not-grant-tools ()
+  (gptel-agent-skills-test--with-chat
+      "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+    (gptel-agent-workers-test--answer fsm "Ready")
+    (with-current-buffer parent (buffer-enable-undo) (undo-boundary))
+    (gptel-agent-skills-test--attach parent root)
+    (let ((text (with-current-buffer parent (buffer-string))))
+      ;; Even a propertized copy cannot activate another chat's attachment.
+      (with-temp-buffer
+        (setq-local gptel-tools (list (gptel-get-tool "Skill")))
+        (insert text)
+        (gptel-agent--localize-skill-tool
+         (gptel-make-fsm :info (list :buffer (current-buffer) :data (current-buffer))))
+        (should-not (cl-find "SkillMutation" gptel-tools :key #'gptel-tool-name :test #'equal))
+        (should-not gptel-agent--skill-tools)))
+    (with-current-buffer parent
+      (undo-boundary) (undo)
+      (goto-char (point-max)) (insert "Send without that skill"))
+    (gptel-agent-skills-test--send parent)
+    (setq fsm (caar requests))
+    (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+    (should-not (buffer-local-value 'gptel-agent--skill-tools parent))))
+
+(ert-deftest gptel-agent-skills-manual-omitted-region-remains-pending ()
+  (gptel-agent-skills-test--with-chat
+      "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+    (gptel-agent-workers-test--answer fsm "Ready")
+    (gptel-agent-skills-test--attach parent root)
+    (with-current-buffer parent
+      (let ((start (point)) (transient-mark-mode t))
+        (insert "Send only this message")
+        (push-mark start t t)
+        (gptel-send)
+        (deactivate-mark)))
+    (setq fsm (caar requests))
+    (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+    (should-not (buffer-local-value 'gptel-agent--skill-tools parent))
+    (gptel-agent-workers-test--answer fsm "Done")
+    ;; A history limit can also omit an attachment even without a region.
+    (with-current-buffer parent
+      (setq-local gptel--num-messages-to-send 0)
+      (goto-char (point-max)) (insert "Another message without the skill"))
+    (gptel-agent-skills-test--send parent)
+    (setq fsm (caar requests))
+    (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+    (should-not (buffer-local-value 'gptel-agent--skill-tools parent))
+    (gptel-agent-workers-test--answer fsm "Done")
+    (with-current-buffer parent (setq-local gptel--num-messages-to-send nil))
+    (with-current-buffer parent (goto-char (point-max)) (insert "Now include the skill"))
+    (gptel-agent-skills-test--send parent)
+    (setq fsm (caar requests))
+    (should (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (should (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))))
+
+(ert-deftest gptel-agent-skills-manual-multiple-attachments-in-org ()
+  (require 'gptel-org)
+  (gptel-agent-skills-test--with-chat
+      "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
+    (gptel-agent-workers-test--answer fsm "Ready")
+    (with-current-buffer parent
+      ;; Keep the fixture's request configuration while exercising Org parsing.
+      (setq-local major-mode 'org-mode gptel-org-branching-context nil)
+      (goto-char (point-max)) (insert "\n* Current task\n"))
+    (gptel-agent-skills-test--attach parent root)
+    (let ((second (expand-file-name "second" root)))
+      (make-directory second)
+      (with-temp-file (expand-file-name "SKILL.md" second)
+        (insert "---\nname: second\ndescription: Other workflow\n"
+                "disable-model-invocation: true\nallowed-tools: Read\n---\nSECOND-INSTRUCTIONS"))
+      (with-current-buffer parent
+        (let ((gptel-agent-skill-dirs (list root)) (gptel-agent--bundled-skill-dir root))
+          (gptel-agent-use-skill "second"))))
+    (gptel-agent-skills-test--send parent)
+    (setq fsm (caar requests))
+    (dolist (name '("SkillMutation" "Read"))
+      (should (gptel-agent-skills-test--tool fsm name)))
+    (dolist (text '("SKILL-WORKFLOW-INSTRUCTIONS" "SECOND-INSTRUCTIONS"))
+      (should (string-match-p text (cdar requests))))
+    (gptel-agent-workers-test--tool fsm "SkillMutation" nil)
+    (should (= executions 1))))
+
 (provide 'gptel-agent-skills-test)
