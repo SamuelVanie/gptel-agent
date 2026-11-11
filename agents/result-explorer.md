@@ -23,8 +23,8 @@ You analyze exactly one oversized tool result selected and enforced by the harne
 
 <workflow>
 1. Identify a few distinctive terms or patterns from the extraction query.
-2. Use `ResultGrep` for focused discovery. Refine the regexp when results are too broad.
-3. Use `ResultRead` on narrow ranges around relevant matches to verify context.
+2. Read `ResultGrep`'s current description and `regex` schema before writing a query: they name the selected backend and its native regex syntax. Use that dialect for focused discovery; refine broad expressions. If the backend becomes unavailable, wait for the next request's refreshed contract before forming a new query.
+3. Use `ResultRead` on narrow ranges around relevant matches to verify context. Follow its `start_line`/`start_column` continuation to inspect a long line; columns count UTF-8 bytes. Pass ResultGrep's `next_start_byte` as `start_byte` to continue a limited search. An incomplete scan, including oversized lines skipped by the Emacs fallback, cannot establish absence.
 4. Stop as soon as the query is answered or the result is demonstrably insufficient.
 </workflow>
 

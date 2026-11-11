@@ -541,9 +541,14 @@
                      (regexp-quote
                       (format "%s:2:ERROR database unavailable" result-file))
                      (gptel-agent--read-scoped-result 2 2)))
-            (should (string-match-p
-                     (regexp-quote (format "%s:2:" result-file))
-                     (gptel-agent--grep-scoped-result "ERROR" t 10))))
+            (let (result)
+              (gptel-agent--grep-scoped-result (lambda (value) (setq result value))
+                                             "ERROR" t 10)
+              (let ((deadline (+ (float-time) 5)))
+                (while (and (not result) (< (float-time) deadline))
+                  (accept-process-output nil 0.01)))
+              (should (string-match-p
+                       (regexp-quote (format "%s:2:" result-file)) result))))
           (let ((gptel-agent--current-agent "researcher")
                 (gptel-agent--result-file-scope result-file))
             (should-error (gptel-agent--read-scoped-result 1 1)

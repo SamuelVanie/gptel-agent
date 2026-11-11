@@ -12,6 +12,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'gptel-agent-edit)
+(require 'gptel-agent-read)
 (require 'gptel-agent-history)
 (require 'tabulated-list)
 
@@ -294,14 +295,12 @@ can inspect the new revision before accepting or restoring it."
       (when (and (null start) (null end)
                  (> (string-bytes text) (* 1024 gptel-agent-read-file-size-threshold)))
         (error "Staged file is too large; specify a line range"))
-      (list :confirm nil :result
-            (with-temp-buffer
-              (insert text)
-              (goto-char (point-min))
-              (forward-line (1- (or start 1)))
-              (let ((beg (point)))
-                (if end (forward-line (1+ (- end (or start 1)))) (goto-char (point-max)))
-                (buffer-substring-no-properties beg (point))))))))
+      (let ((page (gptel-agent--read-string-range
+                   text start end (plist-get args :start_column)
+                   (* 1024 gptel-agent-read-file-size-threshold))))
+        (list :confirm nil :result
+              (concat (plist-get page :text)
+                      (gptel-agent--read-continuation page "Read")))))))
 
 (defvar gptel-agent-review-mode-map
   (let ((map (make-sparse-keymap)))

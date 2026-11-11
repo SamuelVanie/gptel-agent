@@ -966,6 +966,61 @@ the parent agent can verify with =Read=.  Preview size is controlled by
 =gptel-agent-tool-result-preview-chars= and
 =gptel-agent-tool-result-preview-lines=.
 
+=ResultGrep= selects =rg= first, otherwise =grep -E=, otherwise a built-in
+Emacs reader. Its request-local description *and* =regex= argument schema name
+the selected backend and its native regexp dialect before the model writes a
+query. Ripgrep uses its default Rust regex engine with Unicode enabled (no
+PCRE2); =grep -E= uses extended regular expressions in the C locale; the
+fallback uses Emacs regular expressions and its standard case table. There is
+no regex translation. For example, alternation is =ERROR|WARN= with the two
+external backends and =ERROR\|WARN= with Emacs. Case-insensitive matching follows
+the advertised engine, including Unicode folding for ripgrep/Emacs and ASCII
+folding for grep. All backends search individual lines and report nonempty,
+non-overlapping matches. Patterns are limited to 4096 UTF-8 bytes and cannot
+contain literal newline or NUL characters.
+
+The selected executable is captured with that request's schema. If it becomes
+unavailable, the tool reports that failure without trying another dialect.
+Backend selection and both the schema and dispatcher refresh before the next
+model request, including subsequent tool rounds. Other in-flight requests keep
+their own contracts.
+
+Search runs asynchronously, retains at most 100 numeric match records, an
+8 KiB external output record and 2 KiB of diagnostics, and caps rendered evidence
+at =gptel-agent-tool-result-preview-chars= (plus a short coverage notice).
+Subprocess chunks are discarded as they arrive; oversized match records stop
+collection with an incomplete result. Narrow a regexp such as =.*= if it emits
+an enormous match. External engines manage their own internal memory; these
+limits bound Emacs's retained data, not the executable's allocations.
+
+The Emacs fallback reads 64 KiB per timer slice and joins chunk boundaries
+within a line. It retains at most 64 KiB of line bytes and skips larger lines,
+including their entire remainder, without allocating them. Such results always
+report incomplete coverage and identify the first skipped line/byte offset;
+use =ResultRead= to inspect it. Search has a 30-second deadline, including
+evidence extraction. Match limits, output limits, failures, file changes and
+timeouts are reported separately from completion; a partial scan never claims
+a complete absence of matches. Cancelling the owning request or killing its
+buffer disposes processes/timers without delivering obsolete results.
+
+Evidence uses exact one-based line and *UTF-8 byte* columns (tabs occupy one
+byte), with a zero-based match byte offset and the excerpt's starting column.
+Pass =next_start_byte= back as =start_byte= to continue a limited search.
+Skipped oversized fallback lines remain uncovered even if later matches are
+reported; the continuation does not silently advance past that gap.
+
+=Read= and =ResultRead= also read UTF-8 in bounded 64 KiB chunks. The
+=gptel-agent-read-file-size-threshold= limit (400 KiB by default) now bounds
+ranged =Read= output as well as whole-file reads, including open-ended ranges
+and single enormous lines. =ResultRead= retains at most the preview budget in
+input bytes and returns at most that many excerpt characters, plus its notice;
+its existing maximum of 200 lines still applies. A limited read reports
+=start_line= and =start_column= for continuation; columns are one-based UTF-8
+bytes, and generated continuations never split a character. Staged-file reads
+obey the same output limit without copying the entire staged text into a new
+buffer. Selecting late lines still requires scanning preceding bytes, in
+bounded chunks. These readers do not auto-detect other text encodings.
+
 Foreground Bash enforces this limit while output arrives, rather than waiting
 for the command to exit. It retains at most the larger of the result and preview
 character limits (20000 characters with the defaults), plus the current incoming

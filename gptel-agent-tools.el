@@ -52,6 +52,7 @@
 (require 'gptel-agent-instructions)
 (require 'gptel-agent-directory)
 (require 'gptel-agent-process)
+(require 'gptel-agent-read)
 
 (declare-function org-escape-code-in-region "org-src")
 (declare-function gptel-agent--cached-read-file "gptel-agent")
@@ -82,7 +83,8 @@
   "Maximum file size in KB above which the \"Read\" tool refuses to read
 the entire file and requires a line range.
 
-Default: 400 KB."
+Every ranged call also returns at most this many UTF-8 bytes, with a
+line/byte-column continuation when limited. Default: 400 KB."
   :type 'integer
   :group 'gptel-agent)
 
@@ -1607,67 +1609,6 @@ Include hidden entries, omit .git directories, and do not traverse symlinks."
       (buffer-string))))
 
 ;;;; Read files or directories
-(defun gptel-agent--read-file-lines (filename start-line end-line)
-  "Return lines START-LINE to END-LINE fom FILENAME."
-  (setq filename (gptel-agent-path-resolve filename 'file t))
-  (unless (file-readable-p filename)
-    (error "Error: File %s is not readable" filename))
-
-  (when (file-directory-p filename)
-    (error "Error: Cannot read directory %s as file" filename))
-
-  (when (file-symlink-p filename)
-    (setq filename (file-truename filename)))
-
-  (if (and (not start-line) (not end-line)) ;read full file
-      (if (> (file-attribute-size (file-attributes filename))
-             (* gptel-agent-read-file-size-threshold 1024))
-          (error "Error: File is too large (> %d KB).Please specify a line range to read"
-                 gptel-agent-read-file-size-threshold)
-        (with-temp-buffer
-          (insert-file-contents filename)
-          (buffer-string)))
-    ;; Default nil start-line to 1, nil end-line to end of file
-    (unless start-line (setq start-line 1))
-    (cl-decf start-line)
-    (let* ((file-size (nth 7 (file-attributes filename)))
-           (chunk-size (min file-size (* gptel-agent-read-file-size-threshold 1024)))
-           (byte-offset 0) (line-offset start-line))
-      (with-temp-buffer
-        ;; Go to start-line
-        (while (and (> start-line 0)
-                    (< byte-offset file-size))
-          (insert-file-contents
-           filename nil byte-offset (+ byte-offset chunk-size))
-          (setq byte-offset (+ byte-offset chunk-size))
-          (setq start-line (forward-line start-line))
-          (when (eobp)
-            (if (/= (line-beginning-position) (line-end-position))
-                ;; forward-line counted 1 extra line
-                (cl-incf start-line))
-            (delete-region (point-min) (line-beginning-position))))
-
-        (delete-region (point-min) (point))
-
-        (unless end-line (setq end-line most-positive-fixnum))
-        (setq line-offset (- end-line line-offset))
-        ;; Go to end-line, forward by line-offset
-        (cl-block nil
-          (while (> line-offset 0)
-            (setq line-offset (forward-line line-offset))
-            (when (and (eobp) (/= (line-beginning-position) (line-end-position)))
-              ;; forward-line counted 1 extra line
-              (cl-incf line-offset))
-            (if (= line-offset 0)
-                (delete-region (point) (point-max))
-              (if (>= byte-offset file-size)
-                  (cl-return)
-                (insert-file-contents
-                 filename nil byte-offset (+ byte-offset chunk-size))
-                (setq byte-offset (+ byte-offset chunk-size))))))
-
-        (buffer-string)))))
-
 (defun gptel-agent--grep (regex path &optional glob context-lines)
   "Search for REGEX in file or directory at PATH using ripgrep.
 
@@ -1756,101 +1697,43 @@ Signal an error outside a properly contracted `result-explorer' run."
     (error "Result explorer has no valid registered file scope"))
   gptel-agent--result-file-scope)
 
-(defun gptel-agent--read-scoped-result (start-line end-line)
-  "Read and number START-LINE through END-LINE from the scoped result file."
-  (unless (and (natnump start-line) (> start-line 0)
-               (natnump end-line) (>= end-line start-line))
+(defun gptel-agent--read-scoped-result (start-line end-line &optional start-column)
+  "Read a bounded numbered range from the registered result file.
+START-COLUMN is a one-based UTF-8 byte column on START-LINE."
+  (unless (and (integerp start-line) (> start-line 0)
+               (integerp end-line) (>= end-line start-line))
     (error "START-LINE and END-LINE must define a positive ordered range"))
   (when (> (1+ (- end-line start-line)) 200)
     (error "ResultRead accepts at most 200 lines per call"))
   (let* ((file (gptel-agent--scoped-result-file))
-         (content (gptel-agent--read-file-lines file start-line end-line))
-         (limit gptel-agent-tool-result-preview-chars)
-         (line-number start-line)
-         (used 0)
-         entries stopped)
-    (with-temp-buffer
-      (insert content)
-      (goto-char (point-min))
-      (while (and (< (point) (point-max)) (not stopped))
-        (let* ((line-end (line-end-position))
-               (line (buffer-substring-no-properties (point) line-end))
-               (line (if (> (length line) 2000)
-                         (concat (substring line 0 2000)
-                                 " [line truncated by ResultRead]")
-                       line))
-               (entry (format "%s:%d:%s" file line-number line)))
-          (if (> (+ used (length entry) 1) limit)
-              (setq stopped t)
-            (push entry entries)
-            (cl-incf used (1+ (length entry)))
-            (cl-incf line-number)
-            (forward-line 1)))))
-    (concat
-     (if entries
-         (mapconcat #'identity (nreverse entries) "\n")
-       (format "%s:%d: [no content at this range]" file start-line))
-     (when stopped
-       (format "\n[ResultRead preview limit reached before line %d; request a narrower/later range.]"
-               line-number)))))
-
-(defun gptel-agent--grep-scoped-result
-    (regex &optional case-sensitive max-results)
-  "Search REGEX only inside the scoped result file.
-
-Return bounded match windows with exact file, line and column evidence.
-CASE-SENSITIVE defaults to nil.  MAX-RESULTS defaults to 50 and is capped at
-100.  REGEX uses Emacs regular-expression syntax."
-  (when (or (not (stringp regex)) (string-empty-p regex))
-    (error "REGEX must not be empty"))
-  (let* ((file (gptel-agent--scoped-result-file))
-         (case-fold-search (not (eq case-sensitive t)))
-         (max-results (if (natnump max-results)
-                          (min 100 (max 1 max-results))
-                        50))
-         (limit gptel-agent-tool-result-preview-chars)
-         (used 0)
-         (count 0)
-         entries stopped)
-    (with-temp-buffer
-      (insert-file-contents file)
-      (goto-char (point-min))
-      (condition-case err
-          (while (and (< count max-results)
-                      (not stopped)
-                      (re-search-forward regex nil t))
-            (let* ((match-start (match-beginning 0))
-                   (match-end (match-end 0))
-                   (line (line-number-at-pos match-start))
-                   (column (save-excursion
-                             (goto-char match-start)
-                             (1+ (current-column))))
-                   (snippet-start (max (point-min) (- match-start 160)))
-                   (snippet-end (min (point-max) (+ match-start 400)))
-                   (snippet
-                    (buffer-substring-no-properties snippet-start snippet-end))
-                   (snippet (string-replace "\t" "\\t" snippet))
-                   (snippet (string-replace "\r" "\\r" snippet))
-                   (snippet (string-replace "\n" "\\n" snippet))
-                   (entry (format "%s:%d:%d: %s" file line column snippet)))
-              (if (> (+ used (length entry) 1) limit)
-                  (setq stopped t)
-                (push entry entries)
-                (cl-incf used (1+ (length entry)))
-                (cl-incf count))
-              (when (= match-start match-end)
-                (if (< (point) (point-max))
-                    (forward-char 1)
-                  (goto-char (point-max))))))
-        (invalid-regexp
-         (error "Invalid ResultGrep regexp: %s" (error-message-string err)))))
-    (concat
-     (if entries
-         (mapconcat #'identity (nreverse entries) "\n")
-       (format "No matches for %S in %s" regex file))
-     (when (or stopped (= count max-results))
-       (format "\n[ResultGrep stopped after %d matches; refine the regexp or request a different search.]"
-               count)))))
+         (limit (max 4 gptel-agent-tool-result-preview-chars))
+         (page (gptel-agent--read-range
+                (gptel-agent-path-resolve file 'file t)
+                start-line end-line start-column limit))
+         (text (plist-get page :text))
+         (line start-line) (column (or start-column 1))
+         (pos 0) (used 0) entries stopped)
+    (while (and (< pos (length text)) (not stopped))
+      (let* ((newline (string-match "\n" text pos))
+             (end (or newline (length text)))
+             (prefix (format "%s:%d:%s" file line
+                             (if (= column 1) "" (format "[from byte column %d] " column))))
+             (room (max 0 (- limit used (length prefix) 1)))
+             (take (min end (+ pos room)))
+             (part (substring text pos take)))
+        (when (> room 0)
+          (push (concat prefix part) entries)
+          (cl-incf used (+ (length prefix) (length part) 1)))
+        (if (or (< take end) (= room 0))
+            (setq stopped t page (list :limited t :line line
+                                      :column (+ column (string-bytes part))))
+          (if newline (setq line (1+ line) column 1)
+            (cl-incf column (string-bytes part)))
+          (setq pos (if newline (1+ newline) end)))))
+    (concat (if entries (mapconcat #'identity (nreverse entries) "\n")
+              (if (plist-get page :limited) "[No excerpt fits the preview budget.]"
+                (format "%s:%d: [no content at this range]" file start-line)))
+            (gptel-agent--read-continuation page "ResultRead"))))
 
 ;;; Todo-write tool (task tracking)
 (defvar-local gptel-agent--todos nil)
@@ -2823,7 +2706,9 @@ ABRT after its children have stopped."
   "Around advice for `gptel-abort' that also cancels BUFFER's children."
   ;; Parked requests have no transport in `gptel--request-alist'.
   (when (buffer-live-p buffer)
-    (with-current-buffer buffer (gptel-agent--bash-cleanup))
+    (with-current-buffer buffer
+      (gptel-agent--bash-cleanup)
+      (gptel-agent--searches-cleanup))
     (dolist (gate (copy-sequence
                   (buffer-local-value 'gptel-agent--worker-requests buffer)))
       (unless (gptel-agent--workers-closed gate)
@@ -4700,7 +4585,9 @@ Consider using the \"Grep\" tool to find the right range to read first.
 Reads the whole file if the line range is not provided.
 While file review is pending, reads the latest staged content, including new files.
 
-Files over %d KB in size can only be read by specifying a line range."
+UTF-8 text is read in bounded chunks. Files over %d KB require a line range.
+Ranged output has the same byte budget, even for one enormous line. A limited
+read reports start_line/start_column for continuation; columns count UTF-8 bytes."
                       gptel-agent-read-file-size-threshold)
  :function #'gptel-agent--read-file-lines
  :args '(( :name "file_path"
@@ -4713,7 +4600,9 @@ Files over %d KB in size can only be read by specifying a line range."
          ( :name "end_line"
            :type integer
            :description "The line up to which to read, defaults to the end of the file."
-           :optional t))
+           :optional t)
+         (:name "start_column" :type integer :minimum 1 :optional t
+          :description "1-based UTF-8 byte column on start_line; use the reported continuation, default 1."))
  :category "gptel-agent"
  :include t)
 
@@ -4749,7 +4638,7 @@ Optional, defaults to 0."
 
 (gptel-make-tool
  :name "ResultRead"
- :description "Read an exact line range from the one saved tool-result file assigned to this result-explorer run. The file path is enforced by the harness and returned with every numbered line for verification."
+ :description "Read an exact line range from the one saved tool-result file assigned to this result-explorer run. The file path is enforced by the harness and returned with every numbered line for verification. Reads UTF-8 in bounded chunks, including enormous lines; limited output reports a line/byte-column continuation."
  :function #'gptel-agent--read-scoped-result
  :args '(( :name "start_line"
            :type integer
@@ -4758,27 +4647,33 @@ Optional, defaults to 0."
          ( :name "end_line"
            :type integer
            :minimum 1
-           :description "Last line to read (inclusive), at most 200 lines after start_line."))
+           :description "Last line to read (inclusive), at most 200 lines total.")
+         (:name "start_column" :type integer :minimum 1 :optional t
+          :description "1-based UTF-8 byte column on start_line, default 1; use the reported continuation."))
  :category "gptel-agent-result-explorer"
  :include nil)
 
 (gptel-make-tool
  :name "ResultGrep"
- :description "Search only the one saved tool-result file assigned to this result-explorer run. Returns bounded excerpts with enforced file path, line, and column evidence. Uses Emacs regexp syntax."
- :function #'gptel-agent--grep-scoped-result
+ :description "Search the assigned saved result. The request-local schema advertises the selected native regex backend before use."
+ :function (lambda (callback &rest _)
+             (funcall callback "Error: ResultGrep requires a request-local backend contract."))
+ :async t
  :args '(( :name "regex"
            :type string
-           :description "Focused Emacs regular expression to search for in the assigned result.")
+           :description "Native regular expression in the backend dialect advertised for this request.")
          ( :name "case_sensitive"
            :type boolean
            :optional t
-           :description "Whether matching is case-sensitive; defaults to false.")
+           :description "Whether matching is case-sensitive; defaults to false. Folding follows the advertised backend.")
          ( :name "max_results"
            :type integer
            :minimum 1
            :maximum 100
            :optional t
-           :description "Maximum matches to return; defaults to 50."))
+           :description "Maximum matches to return; defaults to 50.")
+         (:name "start_byte" :type integer :minimum 0 :optional t
+          :description "Zero-based file byte offset for continuation; use next_start_byte from an incomplete result, default 0."))
  :category "gptel-agent-result-explorer"
  :include nil)
 
@@ -4950,6 +4845,7 @@ the global registry while this request is in flight."
                   (mapcar (lambda (candidate)
                             (if (eq candidate base-tool) tool candidate))
                           gptel-tools))))
+  (gptel-agent--localize-result-search fsm)
   (when-let* ((base-tool (cl-find "Process" gptel-tools
                                 :key #'gptel-tool-name :test #'equal)))
     (let ((tool (gptel--copy-tool base-tool)))
