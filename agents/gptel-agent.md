@@ -7,7 +7,6 @@ tools:
   - AgentControl
   - AskUserQuestion
   - TodoWrite
-  - ChangeDirectory
   - Glob
   - PathInfo
   - Grep
@@ -83,7 +82,7 @@ Treat a negative or inconclusive report as a completed delegation outcome. Do no
 </delegation_policy>
 
 <tool_policy>
-- Use `ChangeDirectory(directory, reason)` to request permission to work in another directory, including after an outside-boundary error. Call it alone and wait for approval and refreshed project instructions before retrying. Do not bypass a boundary error with `Bash` or `Eval`.
+- Call file tools directly with the target path for one-time operations outside the current project. The tool asks for approval of that operation and keeps your working directory unchanged. Each outside call requires its own approval. If new project instructions defer a mutation, review them and submit a fresh operation. Do not bypass an approval with `Bash` or `Eval`.
 - File discovery: `Glob` (`root_directory`, optional `type=files|directories|all`). Use `PathInfo` to inspect an exact path and its on-disk type.
 - `Glob` includes hidden files and directories, except `.git` directories.
 - Content search: `Grep`.

@@ -271,9 +271,11 @@
       (make-symbolic-link front (concat root "alias"))
       (should (equal (gptel-agent-instructions--directory (concat root "alias/new.txt")) front))
       (should-error (gptel-agent-instructions--directory "/ssh:example:/tmp/new"))
-      (should-error (gptel-agent-instructions--directory (expand-file-name "../outside" root)))
+      (should (equal (gptel-agent-instructions--directory (expand-file-name "../outside/file" root))
+                     (expand-file-name "../outside/" root)))
       (make-symbolic-link temporary-file-directory (concat root "escape"))
-      (should-error (gptel-agent-instructions--directory (concat root "escape/new")))
+      (should (equal (gptel-agent-instructions--directory (concat root "escape/new"))
+                     (file-truename temporary-file-directory)))
       (let ((gptel-agent-project-instructions-max-bytes 4))
         (cl-letf (((symbol-function 'display-warning) #'ignore))
           (should (plist-get (gptel-agent-instructions--load (concat root "AGENTS.md")) :error)))))
@@ -534,11 +536,11 @@
         ;; Reading the shared instructions does not expand ordinary tool access.
         (make-symbolic-link shared-file (concat root "ordinary.md"))
         (with-current-buffer parent
-          (should-error (gptel-agent-instructions--tool-targets
+          (should (gptel-agent-access--outside-p
                          "Read" (list :file_path shared-file)))
-          (should-error (gptel-agent-instructions--tool-targets
+          (should (gptel-agent-access--outside-p
                          "Read" (list :file_path (concat root "ordinary.md"))))
-          (should-error (gptel-agent-instructions--tool-targets
+          (should (gptel-agent-access--outside-p
                          "Write" (list :file_path (concat root "AGENTS.md") :content "overwrite"))))
         (gptel-agent-workers-test--tool fsm "Read" (list :file_path (concat back "AGENTS.md")))
         (should (equal (mapcar (lambda (r) (plist-get r :scope))

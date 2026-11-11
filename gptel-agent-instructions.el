@@ -21,6 +21,7 @@
 (require 'gptel-agent-edit)
 
 (defvar gptel-agent--result-file-scope)
+(declare-function gptel-agent-access--check-paths "gptel-agent-access")
 
 (defcustom gptel-agent-use-project-instructions t
   "Whether gptel conversations discover scoped AGENTS.md instructions.
@@ -124,16 +125,12 @@ fresh instructions and the old managed prompt block can be removed."
 
 (defun gptel-agent-instructions--directory (path &optional directory)
   "Resolve PATH to a canonical scope, treating it as a DIRECTORY if non-nil.
-Internal symlinks work; remote paths and escapes from the boundary fail closed."
+Outside scopes are permitted after file-call approval; remote paths fail."
   (unless (stringp path) (error "Instruction target must be a file path"))
   (when (file-remote-p path) (error "Project instructions do not support remote targets: %s" path))
   (gptel-agent-instructions--initialize)
   (let* ((path (file-truename (expand-file-name path)))
          (dir (file-name-as-directory (if directory path (file-name-directory path)))))
-    (unless (and (gptel-agent-instructions--inside-p path gptel-agent-instructions--boundary)
-                 (gptel-agent-instructions--inside-p dir gptel-agent-instructions--boundary))
-      (error "Instruction target is outside this conversation's boundary (%s): %s. Use ChangeDirectory to request the user's approval to work in that project, then retry after reviewing its instructions"
-             gptel-agent-instructions--boundary path))
     dir))
 
 (defun gptel-agent-instructions--reference-directory (path)
@@ -151,7 +148,7 @@ is a symlink to shared instructions outside the discovery boundary."
 (defun gptel-agent-instructions--load (path)
   "Refresh instruction PATH from disk, replacing its private registry record.
 Symlinks may refer to local files outside the discovery boundary; their
-contents remain scoped to PATH's containing directory inside the boundary.
+contents remain scoped to PATH's containing directory.
 Missing files remove old records.  Read failures replace stale text with an
 explicit error; no partial contents are ever treated as instructions."
   (let ((old (cdr (assoc path gptel-agent-instructions--registry))) record)
@@ -159,10 +156,6 @@ explicit error; no partial contents are ever treated as instructions."
         (progn
           (when (file-remote-p path)
             (error "Project instructions do not support remote sources: %s" path))
-          (unless (gptel-agent-instructions--inside-p
-                   (file-truename (file-name-directory path))
-                   gptel-agent-instructions--boundary)
-            (error "Instruction source directory escapes discovery boundary"))
           (when (or (file-exists-p path) (file-symlink-p path))
             ;; Resolve only local filesystem links, without invoking a remote
             ;; file handler if a link contains a TRAMP-style target name.
@@ -200,10 +193,23 @@ explicit error; no partial contents are ever treated as instructions."
 
 (defun gptel-agent-instructions--discover (directory)
   "Refresh DIRECTORY's chain and return records in root-to-leaf order."
-  (let ((dir directory) paths)
-    (while (and dir (gptel-agent-instructions--inside-p dir gptel-agent-instructions--boundary))
+  (let* ((dir directory)
+         ;; Outside access never changes the conversation's discovery boundary.
+         ;; Discover the approved target's own project, or its nearest existing
+         ;; directory when it has no project (including newly created paths).
+         (boundary
+          (if (gptel-agent-instructions--inside-p directory gptel-agent-instructions--boundary)
+              gptel-agent-instructions--boundary
+            (let ((existing directory))
+              (while (not (file-directory-p existing))
+                (setq existing (file-name-directory (directory-file-name existing))))
+              (let* ((project (project-current nil existing))
+                     (root (and project (file-name-as-directory (file-truename (project-root project))))))
+                (if (and root (gptel-agent-instructions--inside-p directory root)) root existing)))))
+         paths)
+    (while (and dir (gptel-agent-instructions--inside-p dir boundary))
       (push (expand-file-name "AGENTS.md" dir) paths)
-      (setq dir (unless (equal dir gptel-agent-instructions--boundary)
+      (setq dir (unless (equal dir boundary)
                   (file-name-directory (directory-file-name dir)))))
     (delq nil (mapcar #'gptel-agent-instructions--load paths))))
 
@@ -420,6 +426,7 @@ Used before every send and before saving a retained worker's conversation."
           (let (directories mutation-directories calls failures)
             (dolist (call (plist-get info :tool-use))
               (when (and (not (plist-get call :result))
+                         (not (plist-get call :agent-access-pending))
                          (member (plist-get call :name) gptel-agent-instructions--file-tools))
                 (push call calls)
                 (condition-case err
@@ -469,6 +476,8 @@ Used before every send and before saving a retained worker's conversation."
   "Guard NAME/ARGS even when another pre-tool hook changed the proposal."
   (when-let* ((fsm gptel-agent-instructions--request))
     (with-current-buffer (plist-get (gptel-fsm-info fsm) :buffer)
+      (when (fboundp 'gptel-agent-access--check-paths)
+        (gptel-agent-access--check-paths (gptel-agent-edit-targets name args)))
       (when (gptel-agent-instructions--enabled-p fsm)
         (gptel-agent-instructions--guard-directories
          fsm (gptel-agent-instructions--tool-targets name args))))))
@@ -477,6 +486,8 @@ Used before every send and before saving a retained worker's conversation."
   "Check saved instruction versions again before applying CHANGES."
   (when-let* ((fsm gptel-agent-instructions--request))
     (with-current-buffer (plist-get (gptel-fsm-info fsm) :buffer)
+      (when (fboundp 'gptel-agent-access--check-paths)
+        (gptel-agent-access--check-paths (mapcar (lambda (c) (plist-get c :path)) changes)))
       (when (gptel-agent-instructions--enabled-p fsm)
         (gptel-agent-instructions--guard-directories
          fsm (delete-dups (mapcar (lambda (c) (gptel-agent-instructions--directory (plist-get c :path)))
@@ -495,24 +506,29 @@ Used before every send and before saving a retained worker's conversation."
                         (function (gptel-tool-function tool)) (name (gptel-tool-name tool)))
                    (setf (gptel-tool-function copy)
                          (lambda (&rest values)
-                           (if (not (gptel-agent-instructions--live-p fsm))
-                               "Cancelled: instruction request no longer has a live owner."
-                             (with-current-buffer (plist-get (gptel-fsm-info fsm) :buffer)
-                               (let ((gptel-agent-instructions--request fsm) args result)
-                                 (cl-mapc (lambda (spec value)
-                                            (setq args (plist-put args (intern (concat ":" (plist-get spec :name))) value)))
-                                          (gptel-tool-args tool) values)
-                                 (when (gptel-agent-instructions--enabled-p fsm)
-                                   (gptel-agent-instructions--initialize fsm)
-                                   (let ((dirs (gptel-agent-instructions--tool-targets name args)))
-                                     (gptel-agent-instructions--select
-                                      fsm (delete-dups
-                                           (append (plist-get (gptel-fsm-info fsm) :agent-instructions-targets) dirs)))
-                                     (setq result (gptel-agent-instructions--check fsm dirs))
-                                     (unless (member name gptel-agent-instructions--mutating-tools)
-                                       (setq result (and (equal name "Read")
-                                                         (gptel-agent-instructions--read-ack args))))))
-                                 (or result (apply function values)))))))
+                           (let ((callback (and (gptel-tool-async tool) (pop values))))
+                             (if (not (gptel-agent-instructions--live-p fsm))
+                                 (if callback (funcall callback "Cancelled: instruction request no longer has a live owner.")
+                                   "Cancelled: instruction request no longer has a live owner.")
+                               (with-current-buffer (plist-get (gptel-fsm-info fsm) :buffer)
+                                 (let ((gptel-agent-instructions--request fsm) args result)
+                                   (cl-mapc (lambda (spec value)
+                                              (setq args (plist-put args (intern (concat ":" (plist-get spec :name))) value)))
+                                            (gptel-tool-args tool) values)
+                                   (when (gptel-agent-instructions--enabled-p fsm)
+                                     (gptel-agent-instructions--initialize fsm)
+                                     (let ((dirs (gptel-agent-instructions--tool-targets name args)))
+                                       (gptel-agent-instructions--select
+                                        fsm (delete-dups
+                                             (append (plist-get (gptel-fsm-info fsm) :agent-instructions-targets) dirs)))
+                                       (setq result (gptel-agent-instructions--check fsm dirs))
+                                       (unless (member name gptel-agent-instructions--mutating-tools)
+                                         (setq result (and (equal name "Read")
+                                                           (gptel-agent-instructions--read-ack args))))))
+                                   (if callback
+                                       (if result (funcall callback result)
+                                         (apply function callback values))
+                                     (or result (apply function values)))))))))
                    (push (gptel-tool-function copy) (plist-get info :agent-instructions-wrapped))
                    copy)))
              (plist-get info :tools))))))

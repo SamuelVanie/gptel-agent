@@ -123,23 +123,17 @@ discovers project instructions in its own directory. Omitting =directory=
 inherits the parent's directory for a new child. An =Agent= follow-up using
 =agent_id= keeps the worker's current directory unless =directory= is supplied.
 
-Agents can request a move with =ChangeDirectory(directory, reason)=, for example
-=ChangeDirectory("../other-project", "Read the shared API implementation")=.
-The approval shows the agent/chat, current directory, absolute destination and
-reason. Use the normal tool approval controls (=C-c C-c= to approve,
-=C-c C-k= to cancel). This tool always requires approval, even with ordinary
-tool confirmations disabled or skill pre-approvals enabled. Cancelling leaves
-the directory unchanged. The destination must already exist and be local.
+For a one-time operation outside the current project boundary, agents call the
+file tool directly with an absolute or relative target path. The normal tool
+approval controls (=C-c C-c= to approve, =C-c C-k= to cancel) authorize only
+that call. Outside calls require approval even with ordinary confirmations
+disabled or skill pre-approvals enabled. The chat's working directory stays
+unchanged, and subsequent outside calls ask again. Changed arguments, redirected
+symlinks, cancellation of the request, or a manual directory change invalidate
+pending approvals. File review hooks run only after outside access is approved.
 
-Call =ChangeDirectory= alone; a batch combining it with other tools is deferred
-without running any of them. After approval, the next model call receives the
-new project's instructions before the agent retries its read or write. To move
-back, request another change. A stale approval after cancellation, a manual
-directory change, or a destination change cannot move the agent.
-
-A =cd= inside =Bash= affects only that shell invocation. =ChangeDirectory= is
-an approval workflow for moving the conversation, not an operating-system
-sandbox for arbitrary shell commands or Elisp evaluation.
+A =cd= inside =Bash= affects only that shell invocation. File-tool approval is
+not an operating-system sandbox for arbitrary shell commands or Elisp evaluation.
 
 *** Scoped project instructions
 
@@ -206,12 +200,13 @@ Internal workers restricted to a single result file do not perform project
 instruction discovery, even when their parent enables it.
 New workers and discussions inherit the effective boolean preference only.
 
-Managed file operations support local files within the conversation's current
-discovery boundary. File/directory symlinks inside that boundary resolve to their
-canonical target scopes. Escaping symlinks, remote targets, and targets outside
-the boundary report an error before ordinary managed file operations. Use
-=ChangeDirectory= to request permission to move into the target project, or
-change the chat directory yourself with =M-x cd=.
+Managed file operations support local files. Targets outside the conversation's
+current discovery boundary, including escaping symlinks, require approval for
+each operation. Remote targets remain unsupported. Approved targets discover
+their own scoped instructions without moving the chat or widening its boundary.
+If an outside mutation needs new or updated instructions, it defers before
+staging; the next model call receives those instructions and must propose a
+fresh operation, which asks for its own approval.
 
 =AGENTS.md= may be a symlink to a readable regular local file, including a
 shared file outside the project. Absolute and relative links are supported.
@@ -863,7 +858,7 @@ saved conversation text retains the instructions.
 For a shortcut, bind =gptel-agent-use-skill= to a key, or call
 =(gptel-agent-use-skill "review-my-change")= from an interactive wrapper.
 Directory boundaries are unchanged: supporting files outside the current
-project can still require =ChangeDirectory= approval, just as with existing
+project require per-operation approval, just as with existing
 model-invoked skills. =allowed-tools= does not bypass that boundary.
 
 Manual skills are absent from =gptel-agent-toggle-skill=, the model's available

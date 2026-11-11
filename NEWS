@@ -4,6 +4,11 @@
 
 ** New features and UI changes
 
+- File tools now request ordinary tool approval for each operation outside the
+  current project boundary, without changing the chat's working directory.
+  Approval precedes instruction discovery and file review hooks and does not
+  authorize later calls. The agent-controlled directory-changing tool is removed.
+
 - Skills with ~disable-model-invocation: true~ are available through
   ~gptel-agent-use-skill~, which completes manual skill names and attaches
   instructions with resolved supporting file paths to a message, displayed

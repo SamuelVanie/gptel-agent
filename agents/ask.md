@@ -10,7 +10,6 @@ tools:
   - Agent
   - AgentControl
   - AskUserQuestion
-  - ChangeDirectory
   - Glob
   - PathInfo
   - Grep

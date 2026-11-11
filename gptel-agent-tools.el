@@ -31,7 +31,6 @@
 ;;                 YouTube URLs get the video description and transcript.
 ;;
 ;; Filesystem:
-;; - "ChangeDirectory" : Request approval to change the working directory.
 ;; - "Mkdir"  : Create a new directory.
 ;; - "Glob"   : Find files matching a glob pattern
 ;; - "Grep"   : Grep for text in file(s).
@@ -50,7 +49,7 @@
 (require 'cl-lib)
 (require 'gptel-agent-edit)
 (require 'gptel-agent-instructions)
-(require 'gptel-agent-directory)
+(require 'gptel-agent-access)
 (require 'gptel-agent-process)
 (require 'gptel-agent-read)
 (require 'gptel-agent-search)
@@ -4230,8 +4229,8 @@ The preference for dedicated tools is not a ban on Bash file operations.
 - Quote file paths with spaces using double quotes.
 - Chain dependent commands with && (or ; if failures are OK)
 - Use absolute paths instead of cd when possible. Shell cd affects only this \
-invocation; to change the conversation's working directory, request approval \
-with ChangeDirectory. Agent and Discussion accept directory for a child's workspace.
+invocation. File tools request per-operation approval for outside paths without \
+changing the conversation's directory. Agent and Discussion accept directory for a child's workspace.
 - For parallel commands, make multiple `Bash` calls in one message
 - Prefer foreground Bash (background=false, the default) for tests, builds and \
 commands whose result you need before proceeding. It waits for completion.
