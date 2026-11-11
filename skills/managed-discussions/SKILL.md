@@ -37,6 +37,16 @@ The chosen preset overrides only the settings it specifies; other settings
 remain inherited. Your own preset remains unchanged. Use `directory` to select
 a different working directory when needed.
 
+Honor an explicitly requested model with the optional `model` argument. Select
+its exact `Backend:model` entry from the tool's available gptel models, as in
+gptel's model menu; the backend is part of the choice, including when several
+backends offer the same model name. The preset is applied first, then this
+choice overrides both its backend and model. Omit `model` (or leave it empty)
+to keep the preset's model/backend, or the inherited pair if the preset does
+not specify them. Unknown choices fail without creating a discussion or
+worktree. This option is for discussions only; `Agent` workers continue to use
+their configured sub-agent settings.
+
 Use `worktree: true` only when the user explicitly requests a Git worktree or
 isolated Git workspace. Do not prefer worktrees by default or infer permission
 from a general coding or delegation request. Otherwise omit `worktree` or pass

@@ -4,6 +4,13 @@
 
 ** New features and UI changes
 
+- ~Discussion~ accepts an optional ~model~ in gptel's ~Backend:model~ format.
+  The tool advertises configured backend/model pairs and applies the selection
+  after the preset and its hooks, overriding both backend and model. Omission
+  preserves preset/inherited settings; unknown choices fail before creating
+  a chat or worktree. Status results now include the backend and model.
+  Sub-agent model configuration is unchanged.
+
 - ~Glob~ and ~Grep~ now use asynchronous subprocesses with request-owned
   cancellation, a shared traversal/search deadline, and global entry, match,
   metadata and output limits. Grep advertises its native rg / grep -E / Emacs

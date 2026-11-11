@@ -672,6 +672,138 @@
        (should-not (string-match-p "later-preset" (plist-get argument :description)))
        (should (equal base-args (gptel-tool-args (gptel-get-tool "Discussion"))))))))
 
+(ert-deftest gptel-agent-discussion-advertises-models-per-request ()
+  (let ((gptel--known-backends nil)
+        (base-args (copy-tree (gptel-tool-args (gptel-get-tool "Discussion")))))
+    (gptel-make-openai "First" :key "unused" :models '(shared model:version))
+    (gptel-make-anthropic "Second" :key "unused" :models '(shared))
+    (gptel-agent-discussion-test--with-chat
+     (let* ((tool (cl-find "Discussion" (plist-get (gptel-fsm-info fsm) :tools)
+                          :key #'gptel-tool-name :test #'equal))
+            (argument (cl-find "model" (gptel-tool-args tool)
+                               :key (lambda (arg) (plist-get arg :name)) :test #'equal))
+            (description (plist-get argument :description)))
+       (should (plist-get argument :optional))
+       (dolist (choice '("First:shared" "First:model:version" "Second:shared"))
+         (should (string-match-p (regexp-quote choice) description)))
+       (gptel-make-openai "Later" :key "unused" :models '(new-model))
+       (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+       (let* ((child-fsm (gptel-agent-discussion--chat-fsm chat))
+              (child-tool (cl-find "Discussion" (plist-get (gptel-fsm-info child-fsm) :tools)
+                                   :key #'gptel-tool-name :test #'equal))
+              (child-argument (cl-find "model" (gptel-tool-args child-tool)
+                                       :key (lambda (arg) (plist-get arg :name)) :test #'equal)))
+         (should (string-match-p "Later:new-model" (plist-get child-argument :description)))
+         (should (= 1 (gptel-agent-workers-test--count
+                       "Available gptel models (backend:model):\n"
+                       (plist-get child-argument :description)))))
+       (should-not (string-match-p "Later:new-model" (plist-get argument :description)))
+       (should (equal base-args (gptel-tool-args (gptel-get-tool "Discussion")))))
+     ;; The backend qualifier disambiguates identical names without a preset.
+     (dolist (backend '("First" "Second"))
+       (gptel-agent-workers-test--tool
+        fsm "Discussion" (list :title "Select model" :prompt "Fresh"
+                                :model (concat backend ":shared")))
+       (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+       (let ((info (gptel-fsm-info (gptel-agent-discussion--chat-fsm chat))))
+         (should (eq (plist-get info :backend) (gptel-get-backend backend)))
+         (should (eq (plist-get info :model) 'shared)))))))
+
+(ert-deftest gptel-agent-discussion-model-overrides-preset-and-hooks ()
+  (let* ((gptel--known-backends nil)
+         (gptel--known-presets nil)
+         (selected-model (make-symbol "shared:version"))
+         (preset-backend (gptel-make-openai "Preset" :key "unused"
+                                           :models '(preset-model post-model)))
+         hook-ran)
+    ;; A backend can use its own model symbol with metadata.  Looking up by
+    ;; name and then interning it would silently lose that symbol's identity.
+    (put selected-model :capabilities '(tool))
+    (gptel-make-preset 'discussion-model-base
+      :backend "Preset" :model 'preset-model :system "MODEL-PRESET" :temperature 0.25)
+    (gptel-make-preset 'discussion-model-preset
+      :parents 'discussion-model-base
+      :post (lambda () (setq hook-ran t) (setq-local gptel-model 'post-model)))
+    (dolist (make-backend '(gptel-make-openai gptel-make-openai-responses
+                           gptel-make-anthropic gptel-make-gemini))
+      (let ((selected-backend (funcall make-backend "Selected" :key "unused"
+                                       :models (list selected-model))))
+        (gptel-agent-discussion-test--with-chat
+         (setq hook-ran nil)
+         (gptel-agent-workers-test--tool
+          fsm "Discussion" '(:title "Override" :prompt "Fresh"
+                                     :preset "discussion-model-preset"
+                                     :model "Selected:shared:version"))
+         (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+         (should hook-ran)
+         (let* ((child (gptel-agent-discussion--chat-buffer chat))
+                (child-fsm (gptel-agent-discussion--chat-fsm chat))
+                (info (gptel-fsm-info child-fsm)))
+           (should (eq (gptel-agent-discussion--chat-state chat) 'running))
+           (should (eq (buffer-local-value 'gptel-backend child) selected-backend))
+           (should (eq (buffer-local-value 'gptel-model child) selected-model))
+           (should (eq (plist-get info :backend) selected-backend))
+           (should (eq (plist-get info :model) selected-model))
+           (should (equal (buffer-local-value 'gptel-system-prompt child) "MODEL-PRESET"))
+           (should (= (buffer-local-value 'gptel-temperature child) 0.25))
+           (should (string-match-p "backend: Selected\nmodel: shared:version"
+                                   (gptel-agent-discussion--status chat)))
+           (should (eq (buffer-local-value 'gptel-model parent) 'test))
+           (should (eq (buffer-local-value 'gptel-backend parent)
+                       (plist-get (gptel-fsm-info fsm) :backend)))
+           (should-not (eq (buffer-local-value 'gptel-backend parent) selected-backend))
+           (should-not (eq selected-backend preset-backend))
+           ;; Later user turns keep the chosen pair too.
+           (gptel-agent-workers-test--answer child-fsm "Ready")
+           (with-current-buffer child
+             (goto-char (point-max)) (insert "Follow up") (gptel-send))
+           (let ((next-info (gptel-fsm-info (gptel-agent-discussion--chat-fsm chat))))
+             (should (eq (plist-get next-info :backend) selected-backend))
+             (should (eq (plist-get next-info :model) selected-model)))))))))
+
+(ert-deftest gptel-agent-discussion-omitted-model-keeps-inheritance-or-preset ()
+  (let* ((gptel--known-backends nil)
+         (gptel--known-presets nil)
+         (backend (gptel-make-openai "Preset" :key "unused" :models '(preset-model))))
+    (gptel-make-preset 'discussion-model-preset :backend "Preset" :model 'preset-model)
+    (gptel-agent-discussion-test--with-chat
+     (dolist (preset '(nil "discussion-model-preset"))
+       (dolist (model '(nil "" :null))
+         (gptel-agent-workers-test--tool
+          fsm "Discussion" (append '(:title "Defaults" :prompt "Fresh")
+                                   (and preset (list :preset preset))
+                                   (and model (list :model model))))
+         (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+         (let ((info (gptel-fsm-info (gptel-agent-discussion--chat-fsm chat))))
+           (should (eq (plist-get info :backend)
+                       (if preset backend (plist-get (gptel-fsm-info fsm) :backend))))
+           (should (eq (plist-get info :model) (if preset 'preset-model 'test)))))))))
+
+(ert-deftest gptel-agent-discussion-invalid-model-has-no-creation-side-effects ()
+  (let ((gptel--known-backends nil))
+    (gptel-make-openai "First" :key "unused" :models '(shared))
+    (gptel-make-openai "Second" :key "unused" :models '(shared))
+    (gptel-agent-discussion-test--with-chat
+     (let ((tool (cl-find "Discussion" (plist-get (gptel-fsm-info fsm) :tools)
+                          :key #'gptel-tool-name :test #'equal))
+           (buffers (buffer-list))
+           (counter gptel-agent-discussion--counter)
+           result)
+       (cl-letf (((symbol-function 'gptel-agent-discussion--make-worktree)
+                  (lambda (&rest _) (ert-fail "Invalid model must not create a worktree"))))
+         (dolist (model '("Missing:shared" "First:missing" "shared" " " 42 t))
+           ;; Use the schema mapping and invoke from outside the owner buffer,
+           ;; as happens when a tool call is approved asynchronously.
+           (with-temp-buffer
+             (apply (gptel-tool-function tool) (lambda (text) (setq result text))
+                    (gptel--map-tool-args
+                     tool (list :title "Invalid" :prompt "Fresh" :worktree t :model model))))
+           (should (string-prefix-p "Error:" result))
+           (should (string-match-p "backend:model" result))
+           (should-not (buffer-local-value 'gptel-agent-discussion--children parent))
+           (should (= counter gptel-agent-discussion--counter))
+           (should (equal buffers (buffer-list)))))))))
+
 (ert-deftest gptel-agent-discussion-planner-can-select-implementation-preset ()
   (gptel-agent-test--with-main-presets
     (gptel-agent-discussion-test--with-chat

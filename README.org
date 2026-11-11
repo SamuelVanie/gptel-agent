@@ -681,7 +681,8 @@ turns. Custom presets can still list both tools explicitly.
 =Discussion= creates a separate, ordinary gptel buffer with a title and opening
 prompt. It inherits the creating request's model, backend, system prompt, active
 tools (including tools activated by skills) and confirmation settings; an
-optional existing =preset= can override them.
+optional existing =preset= can override them. An optional =model= choice then
+overrides both backend and model, including values specified by the preset.
 It starts without the parent's transcript or attached context. An optional
 =directory= selects its working directory, including another project; relative
 paths resolve against the creating chat's directory. Skill instructions and pre-approvals
@@ -716,6 +717,24 @@ For example, a planning conversation can hand off implementation with:
 The child uses =gptel-agent='s system prompt and tools; the parent remains a
 planning conversation. Pass your own registered preset name in the same way.
 Unknown names return an error without creating a discussion.
+
+To select a model as well, pass =model= using the exact =Backend:model= entry
+advertised by =Discussion=, matching gptel's model menu. For example, with a
+backend named =MyBackend= offering =my-model=:
+
+#+begin_src json
+{"title": "Implement the feature", "prompt": "Implement this self-contained plan: ...", "preset": "gptel-agent", "model": "MyBackend:my-model"}
+#+end_src
+
+All registered backends and their configured models are available. The backend
+qualifier distinguishes models with the same name on different backends. The
+preset, including its parents and hooks, is applied first; =model= then selects
+both the backend and model for this discussion and its subsequent turns.
+Omitting =model= (or passing an empty string) keeps the preset's or inherited
+pair. Unknown choices fail before creating a buffer or worktree. Creation and
+=DiscussionControl list/read= results include the child's current backend and
+model. This option does not change the parent or the =Agent= tool's configuration;
+sub-agents continue to use =gptel-agent-preset= and their per-agent settings.
 
 Pass =worktree: true= to start the discussion in a new Git worktree. The tool
 instructs models to use this option only when the user explicitly requests a Git
