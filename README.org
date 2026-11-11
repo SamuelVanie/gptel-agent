@@ -562,8 +562,13 @@ Each job retains the most recent =gptel-agent-process-output-limit= characters
 (default 200000). Older output is discarded and a read reports any missing
 range. Redirect output to a file in the command if you need a complete durable
 log. Completed jobs retain their status and output until =remove= or chat
-cleanup. Ordinary foreground Bash output keeps its existing full-result
-persistence behavior.
+cleanup. Foreground Bash keeps a bounded prefix in memory and spills oversized
+output to a temporary file as it arrives. Its complete log remains available
+through the result-explorer handoff after completion.
+
+Foreground commands belong to their calling buffer and request. Cancelling the
+request or killing that buffer stops their process groups and removes unfinished
+logs. Background jobs retain the separate lifecycle described below.
 
 Jobs belong to the originating conversation buffer, including jobs started by
 its sub-agents. They survive later turns, request cancellation and sub-agent
@@ -960,6 +965,16 @@ harness to that registered file, and its report cites file line evidence that
 the parent agent can verify with =Read=.  Preview size is controlled by
 =gptel-agent-tool-result-preview-chars= and
 =gptel-agent-tool-result-preview-lines=.
+
+Foreground Bash enforces this limit while output arrives, rather than waiting
+for the command to exit. It retains at most the larger of the result and preview
+character limits (20000 characters with the defaults), plus the current incoming
+chunk, with undo disabled. Oversized output is appended to disk and is never
+read back in full to construct the response. Small commands need no log file.
+Saved Bash logs contain the decoded stdout and stderr; a failed command's exit
+status appears in the tool response. Completed oversized logs remain in the
+temporary directory for inspection and consume disk space proportional to their
+output. A log write failure stops the command and returns a tool error.
 
 #+html: </details>
 #+html: <details><summary>

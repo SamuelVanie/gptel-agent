@@ -91,7 +91,8 @@ Default: 400 KB."
 
 When Bash, Glob or Grep produces more output, the complete result is saved
 under the temporary directory and the tool returns only a bounded preview plus
-the saved file path."
+the saved file path.  Foreground Bash spills output while the command runs,
+retaining at most the larger of this limit and the preview character limit."
   :type 'natnum
   :group 'gptel-agent)
 
@@ -659,13 +660,186 @@ ARG-VALUES is the list of arguments for the tool call."
      inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
     (gptel-agent--confirm-overlay from (point) t)))
 
-(defun gptel-agent--execute-bash (callback command query &optional background)
+(cl-defstruct (gptel-agent--bash (:constructor gptel-agent--make-bash))
+  process buffer source callback query limit preview-chars preview-lines
+  (chars 0) (newlines 0) file fsm post-hook done)
+
+(defvar-local gptel-agent--bash-jobs nil
+  "Foreground Bash calls owned by this buffer.")
+(put 'gptel-agent--bash-jobs 'permanent-local t)
+
+(defun gptel-agent--bash-dispose (job &optional keep-file)
+  "Release JOB and stop its process group, retaining its log only if KEEP-FILE."
+  (unless (gptel-agent--bash-done job)
+    ;; Invalidate callbacks before signalling a process or killing a buffer.
+    (setf (gptel-agent--bash-done job) t)
+    (when (buffer-live-p (gptel-agent--bash-source job))
+      (with-current-buffer (gptel-agent--bash-source job)
+        (setq gptel-agent--bash-jobs (delq job gptel-agent--bash-jobs))))
+    (when-let* ((fsm (gptel-agent--bash-fsm job)))
+      (setf (plist-get (gptel-fsm-info fsm) :post)
+            (remq (gptel-agent--bash-post-hook job)
+                  (plist-get (gptel-fsm-info fsm) :post))))
+    (unwind-protect
+        (when-let* ((process (gptel-agent--bash-process job)))
+          (set-process-filter process #'ignore)
+          (set-process-sentinel process #'ignore)
+          (process-put process 'gptel-agent-bash nil)
+          (unwind-protect
+              (when (process-live-p process) (kill-process process))
+            (delete-process process)))
+      (when (buffer-live-p (gptel-agent--bash-buffer job))
+        (kill-buffer (gptel-agent--bash-buffer job)))
+      (when-let* ((file (gptel-agent--bash-file job))
+                  ((not keep-file)))
+        (when (file-exists-p file) (delete-file file))))))
+
+(defun gptel-agent--bash-cleanup ()
+  "Cancel foreground Bash calls belonging to the current buffer."
+  (dolist (job (copy-sequence gptel-agent--bash-jobs))
+    (condition-case err
+        (gptel-agent--bash-dispose job)
+      (error (message "Could not clean up Bash: %s" (error-message-string err))))))
+(put 'gptel-agent--bash-cleanup 'permanent-local-hook t)
+
+(defun gptel-agent--bash-spill (job)
+  "Create JOB's log and write its retained output before appending new chunks."
+  (unless (gptel-agent--bash-file job)
+    (with-current-buffer (gptel-agent--bash-buffer job)
+      (let ((directory (gptel-agent--tool-results-directory))
+            (coding-system-for-write 'utf-8-unix)
+            (write-region-inhibit-fsync t))
+        (make-directory directory t)
+        (setf (gptel-agent--bash-file job)
+              (make-temp-file (expand-file-name "bash-" directory) nil ".txt"))
+        (write-region (point-min) (point-max)
+                      (gptel-agent--bash-file job) nil 'silent)))))
+
+(defun gptel-agent--bash-filter (job process output)
+  "Spool OUTPUT for JOB, keeping only a bounded prefix in PROCESS's buffer."
+  (unless (gptel-agent--bash-done job)
+    (condition-case err
+        (with-current-buffer (gptel-agent--bash-buffer job)
+          (cl-incf (gptel-agent--bash-chars job) (length output))
+          (cl-incf (gptel-agent--bash-newlines job) (cl-count ?\n output))
+          (when (> (gptel-agent--bash-chars job) (gptel-agent--bash-limit job))
+            (gptel-agent--bash-spill job))
+          (when-let* ((file (gptel-agent--bash-file job)))
+            (let ((coding-system-for-write 'utf-8-unix)
+                  (write-region-inhibit-fsync t))
+              (write-region output nil file t 'silent)))
+          (let ((remaining (- (max (gptel-agent--bash-limit job)
+                                   (gptel-agent--bash-preview-chars job))
+                              (buffer-size))))
+            (when (> remaining 0)
+              (goto-char (point-max))
+              (insert (substring output 0 (min remaining (length output)))))))
+      (error
+       ;; A full/unwritable disk must fail the tool once, not grow a fallback
+       ;; buffer or leave the request waiting for a result forever.
+       (gptel-agent--bash-finish
+        job process (format "Error: Could not capture Bash output: %s"
+                            (error-message-string err)))))))
+
+(defun gptel-agent--bash-result (job process)
+  "Format JOB's result without reading its full log back into memory."
+  (let* ((exit-code (process-exit-status process))
+         (prefix (unless (and (eq (process-status process) 'exit) (zerop exit-code))
+                   (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n"
+                           exit-code)))
+         (chars (gptel-agent--bash-chars job)))
+    (with-current-buffer (gptel-agent--bash-buffer job)
+      (if (<= (+ chars (length prefix)) (gptel-agent--bash-limit job))
+          (concat prefix (buffer-string))
+        (gptel-agent--bash-spill job)
+        (let* ((file (gptel-agent--bash-file job))
+               (lines (1+ (gptel-agent--bash-newlines job)))
+               (preview
+                (save-excursion
+                  (goto-char (point-min))
+                  (forward-line (gptel-agent--bash-preview-lines job))
+                  (buffer-substring-no-properties
+                   (point-min) (min (point) (+ (point-min)
+                                              (gptel-agent--bash-preview-chars job))))))
+               (result
+                (concat prefix
+                        (gptel-agent--tool-result-preview
+                         "bash" file (gptel-agent--bash-query job) chars lines preview
+                         (gptel-agent--bash-preview-lines job)
+                         (gptel-agent--bash-preview-chars job)))))
+          (puthash file (list :query (gptel-agent--bash-query job) :tool "bash"
+                              :chars chars :lines lines)
+                   gptel-agent--saved-tool-results)
+          result)))))
+
+(defun gptel-agent--bash-finish (job process &optional failure)
+  "Finish JOB after PROCESS exits, or stop it with capture FAILURE."
+  (unless (gptel-agent--bash-done job)
+    (let ((source (gptel-agent--bash-source job))
+          (callback (gptel-agent--bash-callback job))
+          (fsm (gptel-agent--bash-fsm job)) result keep-file)
+      (unwind-protect
+          (when (and (buffer-live-p source)
+                     (or (null fsm) (eq (gptel-fsm-state fsm) 'TOOL)))
+            (setq result
+                  (or failure
+                      (condition-case err
+                          (prog1 (gptel-agent--bash-result job process)
+                            (setq keep-file (gptel-agent--bash-file job)))
+                        (error (format "Error: Could not finish Bash output: %s"
+                                       (error-message-string err)))))))
+        (gptel-agent--bash-dispose job keep-file))
+      ;; Release buffers and request hooks before a callback can start more work.
+      (when result
+        (with-current-buffer source (funcall callback result))))))
+
+(defun gptel-agent--start-foreground-bash (callback command query fsm)
+  "Run COMMAND for CALLBACK and QUERY, owned by this buffer and optional FSM."
+  (let* ((job (gptel-agent--make-bash
+               :source (current-buffer) :callback callback :query query :fsm fsm
+               :limit gptel-agent-tool-result-max-chars
+               :preview-chars gptel-agent-tool-result-preview-chars
+               :preview-lines gptel-agent-tool-result-preview-lines
+               :buffer (generate-new-buffer " *gptel-agent-bash*")))
+         (cleanup (lambda (&rest _) (gptel-agent--bash-dispose job))))
+    (with-current-buffer (gptel-agent--bash-buffer job)
+      (buffer-disable-undo)
+      ;; Logs are local even when the command runs through a remote file handler.
+      (setq-local default-directory temporary-file-directory))
+    (setf (gptel-agent--bash-post-hook job) cleanup)
+    (condition-case err
+        (let ((process
+               (make-process
+                :name "gptel-agent-bash" :buffer (gptel-agent--bash-buffer job)
+                :command (list "bash" "-c" command)
+                :connection-type 'pipe :file-handler t :noquery t
+                :filter (apply-partially #'gptel-agent--bash-filter job)
+                :sentinel (lambda (process _event)
+                            (when (memq (process-status process) '(exit signal))
+                              (gptel-agent--bash-finish job process))))))
+          (unless (processp process)
+            (error "This directory does not support asynchronous processes"))
+          (setf (gptel-agent--bash-process job) process)
+          (process-put process 'gptel-agent-bash job)
+          (push job gptel-agent--bash-jobs)
+          (add-hook 'kill-buffer-hook #'gptel-agent--bash-cleanup nil t)
+          (when fsm
+            (setf (plist-get (gptel-fsm-info fsm) :post)
+                  (cons cleanup (plist-get (gptel-fsm-info fsm) :post))))
+          process)
+      (error
+       (gptel-agent--bash-dispose job)
+       (signal (car err) (cdr err))))))
+
+(defun gptel-agent--execute-bash (callback command query &optional background fsm)
   "Execute COMMAND asynchronously in bash and call CALLBACK with output.
 
 CALLBACK is called with the command output string when the process finishes.
 COMMAND is the bash command string to execute.  QUERY states what should be
 extracted from the result if it is too large to return directly.
-When BACKGROUND is t, return a session-owned job ID immediately."
+When BACKGROUND is t, return a session-owned job ID immediately.
+Otherwise spill oversized output incrementally to disk.  Optional FSM owns
+foreground execution so cancelling the request also stops its commands."
   (unless (and (stringp query)
                (not (string-empty-p (string-trim query))))
     (error "QUERY must state what should be extracted from Bash output"))
@@ -678,35 +852,7 @@ When BACKGROUND is t, return a session-owned job ID immediately."
                  (concat (gptel-agent--process-summary job)
                          "Use Process wait (until=exit) for completion, or read with view=tail for recent output.\n"))
         process)
-    (let* ((source (current-buffer))
-           (output-buffer (generate-new-buffer " *gptel-agent-bash*"))
-           (proc (make-process
-                  :name "gptel-agent-bash"
-                  :buffer output-buffer
-                  :command (list "bash" "-c" command)
-                  :connection-type 'pipe
-                  :file-handler t
-                  :sentinel
-                  (lambda (process _event)
-                    (when (memq (process-status process) '(exit signal))
-                      (let* ((exit-code (process-exit-status process))
-                             (raw-output
-                              (with-current-buffer (process-buffer process)
-                                (buffer-string)))
-                             (output
-                              (if (zerop exit-code)
-                                  raw-output
-                                (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n%s"
-                                        exit-code raw-output))))
-                        (kill-buffer (process-buffer process))
-                        (with-temp-buffer
-                          (insert output)
-                          (gptel-agent--truncate-buffer "bash" nil query)
-                          (let ((result (buffer-string)))
-                            (when (buffer-live-p source)
-                              (with-current-buffer source
-                                (funcall callback result)))))))))))
-      proc)))
+    (gptel-agent--start-foreground-bash callback command query fsm)))
 
 ;;; Web tools
 
@@ -1381,6 +1527,19 @@ exact file/query pair as a valid result-explorer scope contract."
     "cite this file and line numbers so you can verify its evidence with `Read'.]")
    prefix file query))
 
+(defun gptel-agent--tool-result-preview
+    (prefix file query chars lines preview max-lines max-chars)
+  "Describe persisted PREFIX output FILE and its bounded PREVIEW.
+CHARS and LINES describe the complete result.  MAX-LINES and MAX-CHARS
+describe the preview limits.  QUERY supplies the optional explorer contract."
+  (concat
+   (format "%s results too large (%d chars, %d lines) for the context window.\nFull result: %s\n\nPreview (up to %d lines and %d chars):\n\n%s"
+           prefix chars lines file max-lines max-chars preview)
+   (if query
+       (gptel-agent--result-explorer-handoff prefix file query)
+     (format "\n\n[Use `Read' with file_path=%S and a narrow line range to inspect the full result.]"
+             file))))
+
 (defun gptel-agent--truncate-buffer (prefix &optional max-lines query)
   "Persist and truncate the current buffer when it exceeds the result limit.
 
@@ -1402,15 +1561,9 @@ saved file directly."
                    (+ (point-min) gptel-agent-tool-result-preview-chars))))
            (preview (buffer-substring-no-properties (point-min) preview-end)))
       (erase-buffer)
-      (insert (format "%s results too large (%d chars, %d lines) for the context window.\nFull result: %s\n\nPreview (up to %d lines and %d chars):\n\n%s"
-                      prefix orig-size orig-lines temp-file max-lines
-                      gptel-agent-tool-result-preview-chars preview))
-      (if query
-          (insert (gptel-agent--result-explorer-handoff
-                   prefix temp-file query))
-        (insert (format
-                 "\n\n[Use `Read' with file_path=%S and a narrow line range to inspect the full result.]"
-                 temp-file))))))
+      (insert (gptel-agent--tool-result-preview
+               prefix temp-file query orig-size orig-lines preview max-lines
+               gptel-agent-tool-result-preview-chars)))))
 
 (defun gptel-agent--glob (pattern &optional root-directory depth type)
   "Find typed entries matching basename PATTERN under ROOT-DIRECTORY.
@@ -2670,6 +2823,7 @@ ABRT after its children have stopped."
   "Around advice for `gptel-abort' that also cancels BUFFER's children."
   ;; Parked requests have no transport in `gptel--request-alist'.
   (when (buffer-live-p buffer)
+    (with-current-buffer buffer (gptel-agent--bash-cleanup))
     (dolist (gate (copy-sequence
                   (buffer-local-value 'gptel-agent--worker-requests buffer)))
       (unless (gptel-agent--workers-closed gate)
@@ -4224,8 +4378,10 @@ Use PathInfo for file types and Glob with type=all for directory contents.
 
 The command will be executed in the current working directory. Foreground output is
 returned as a string. Outputs over `gptel-agent-tool-result-max-chars' are
-saved in full and replaced with a bounded preview plus a required scoped
-`result-explorer' handoff."
+spooled to disk as they arrive, retaining only a bounded prefix in memory.
+The result includes a bounded preview plus a required scoped `result-explorer'
+handoff to the full log. Cancelling the request or closing its buffer stops
+foreground commands and removes their unfinished logs."
  :args '(( :name "command"
            :type string
            :description "The Bash command to execute.  \
@@ -4784,6 +4940,16 @@ The clone captures FSM and a snapshot of the allowed agent registry.  Its
 schema and dispatcher therefore cannot change when another project updates
 the global registry while this request is in flight."
   (gptel-agent--localize-ask-tool fsm)
+  (when-let* ((base-tool (cl-find "Bash" gptel-tools
+                                :key #'gptel-tool-name :test #'equal)))
+    (let ((tool (gptel--copy-tool base-tool)))
+      (setf (gptel-tool-function tool)
+            (lambda (callback command query &optional background)
+              (gptel-agent--execute-bash callback command query background fsm)))
+      (setq-local gptel-tools
+                  (mapcar (lambda (candidate)
+                            (if (eq candidate base-tool) tool candidate))
+                          gptel-tools))))
   (when-let* ((base-tool (cl-find "Process" gptel-tools
                                 :key #'gptel-tool-name :test #'equal)))
     (let ((tool (gptel--copy-tool base-tool)))
