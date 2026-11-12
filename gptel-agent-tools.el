@@ -1913,11 +1913,10 @@ they are supplied by the request-local Skill dispatcher for allowed-tools."
 
 (defconst gptel-agent--subagent-completion-contract
   "Completion contract:
-- Perform the assigned task; do not optimize for producing a positive answer.
-- A negative or inconclusive finding is a valid result.  Never repeat a substantially identical failed action just to manufacture an answer.
-- If the target cannot be verified or a required tool/source is unavailable, stop and report what was attempted, the precise limitation, and what evidence would be needed next.
-- Distinguish confirmed facts from inference.  End with high, medium, or low confidence and a short reason.
-- For independent delegated work, use Agent with background:true and continue useful work before AgentControl wait. Process automatic worker reports as evidence. Use AgentControl send for corrections to active work, or Agent with agent_id for completed-worker follow-ups. Your turn remains open until all descendants finish and their reports have reached you; synthesize them before your final answer."
+- Answer the assigned question with verifiable evidence; distinguish facts from inference.
+- A negative or inconclusive finding is a valid result. Report attempts, coverage limits, and the missing evidence/next check; do not repeat failed actions to manufacture certainty.
+- If delegation is available and appropriate, use Agent with background:true for independent work, continue useful work, then AgentControl wait as needed. Synthesize all descendant reports before finishing.
+- End with high, medium, or low confidence and a short evidence-based reason."
   "Reliability contract appended to every delegated task.")
 
 (defun gptel-agent--prepare-task-prompt (prompt)
