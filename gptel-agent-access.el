@@ -1,11 +1,12 @@
-;;; gptel-agent-access.el --- Per-call approval for outside paths -*- lexical-binding: t; -*-
+;;; gptel-agent-access.el --- Approval for outside paths -*- lexical-binding: t; -*-
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
 ;; Outside file operations use the ordinary tool approval callback.  Hold their
 ;; pre-tool hooks too: review hooks can read, stage and apply files themselves.
-;; Approval belongs to one call, never to a directory or a later request.
+;; Approval belongs to one call unless the user explicitly grants outside
+;; access to its owning conversation, until revoked or its directory changes.
 
 ;;; Code:
 
@@ -14,6 +15,44 @@
 (defvar gptel-agent-access--approved nil
   "Exact canonical paths authorized while executing one outside operation.")
 
+(defvar gptel-agent-access--remember nil
+  "Non-nil while the user accepts calls and grants future outside access.")
+
+(defvar-local gptel-agent-access--grant nil
+  "Working directory and its canonical path when outside access was granted.
+This conversation-only grant is neither inherited nor saved to disk.")
+
+(defun gptel-agent-access--granted-p (&rest _)
+  "Whether this conversation still has a valid outside-access grant.
+Also refresh the grant after instruction boundary initialization."
+  (when gptel-agent-access--grant
+    (unless (and (equal (car gptel-agent-access--grant) default-directory)
+                 (equal (cdr gptel-agent-access--grant)
+                        (file-truename default-directory)))
+      (setq gptel-agent-access--grant nil)))
+  (and gptel-agent-access--grant t))
+
+;;;###autoload
+(defun gptel-agent-allow-outside-access (&optional calls ov)
+  "Accept pending CALLS and allow future outside paths in their owning chats.
+OV is the native tool approval overlay.  Only a valid outside file-call
+approval can grant access.  Each grant lasts until its chat buffer closes,
+its working directory changes, or `gptel-agent-revoke-outside-access' runs.
+Ordinary tool confirmations and file reviews still apply."
+  (interactive (pcase-let ((`(,calls . ,ov)
+                           (get-char-property-and-overlay (point) 'gptel-tool)))
+                 (list calls ov)))
+  (unless calls (user-error "No pending tool calls at point"))
+  (let ((gptel-agent-access--remember t))
+    (gptel--accept-tool-calls calls ov)))
+
+;;;###autoload
+(defun gptel-agent-revoke-outside-access ()
+  "Require outside file-call approvals again in the current conversation."
+  (interactive)
+  (setq gptel-agent-access--grant nil)
+  (message "Outside file operations in %s require approval again" (buffer-name)))
+
 (defun gptel-agent-access--check-paths (paths)
   "Require approval for outside PATHS before preparation or application."
   (unless (bound-and-true-p gptel-agent--result-file-scope)
@@ -21,6 +60,7 @@
     (dolist (path paths)
       (setq path (file-truename path))
       (unless (or (gptel-agent-instructions--inside-p path gptel-agent-instructions--boundary)
+                  (gptel-agent-access--granted-p)
                   (member path gptel-agent-access--approved))
         (error "Outside file operation requires approval; submit a fresh tool call: %s" path)))))
 
@@ -52,14 +92,17 @@
      (_ (list (plist-get args :path))))))
 
 (defun gptel-agent-access--outside-p (name args)
-  "Whether NAME/ARGS targets a path outside this conversation's boundary."
+  "Whether NAME/ARGS requires outside access approval in this conversation."
   (when (and (member name gptel-agent-instructions--file-tools)
              (not (bound-and-true-p gptel-agent--result-file-scope)))
     (gptel-agent-instructions--initialize)
-    (cl-some (lambda (path)
-               (not (gptel-agent-instructions--inside-p
-                     path gptel-agent-instructions--boundary)))
-             (gptel-agent-access--paths name args))))
+    ;; Validate targets even when outside access has already been granted.
+    (let ((paths (gptel-agent-access--paths name args)))
+      (and (not (gptel-agent-access--granted-p))
+           (cl-some (lambda (path)
+                      (not (gptel-agent-instructions--inside-p
+                            path gptel-agent-instructions--boundary)))
+                    paths)))))
 
 (defun gptel-agent-access--scan (fsm)
   "Mark outside calls in FSM before instruction discovery and review hooks."
@@ -155,6 +198,10 @@
                                      (equal (file-truename directory) source)
                                      (equal (gptel-agent-access--paths name args) paths))
                           (error "Approved operation or target changed; submit a fresh call"))
+                        ;; Remember only after validating the live approval,
+                        ;; but before instruction discovery can defer the call.
+                        (when gptel-agent-access--remember
+                          (setq gptel-agent-access--grant (cons directory source)))
                         (let ((gptel-agent-access--approved paths)
                               (gptel-agent-instructions--request fsm))
                           (when (gptel-agent-instructions--enabled-p fsm)
@@ -198,6 +245,48 @@
           (funcall original fsm))
       (setf (plist-get info :callback) callback))))
 
+(defun gptel-agent-access--display (original calls info &optional minibuffer)
+  "Add a conversation grant action when ORIGINAL displays outside CALLS.
+INFO belongs to the requesting chat, even for workers shown in a parent.
+MINIBUFFER requests the native minibuffer approval interface."
+  (if (not (cl-some (lambda (call) (plist-get call :agent-access-pending))
+                   (plist-get info :tool-use)))
+      (funcall original calls info minibuffer)
+    (let* ((position (plist-get info :position))
+           (tracking (plist-get info :tracking-marker))
+           (owner (plist-get info :buffer))
+           (label (format "Run tools + allow all outside paths for %s"
+                          (buffer-name owner))))
+      (with-current-buffer (marker-buffer position)
+        (if (or minibuffer buffer-read-only
+                (get-char-property (max (point-min) (1- (or tracking position))) 'read-only))
+            (pcase (car (read-multiple-choice
+                        (format "%s wants to run %s. "
+                                (gptel-backend-name (plist-get info :backend))
+                                (mapconcat (lambda (call) (gptel-tool-name (car call))) calls ", "))
+                        `((?y "Run tools once") (?a ,label)
+                          (?n "Cancel (resumable)") (?i "Inspect or edit"))))
+              (?y (gptel--accept-tool-calls calls))
+              (?a (gptel-agent-allow-outside-access calls))
+              (?n (gptel--reject-tool-calls))
+              (?i (gptel--inspect-tool-calls calls info)))
+          (let* ((prompt (funcall original calls info minibuffer))
+                 (ov (cl-find-if (lambda (ov) (memq prompt (overlay-get ov 'prompt)))
+                                 (overlays-in (point-min) (point-max)))))
+            (when (and (overlayp prompt) ov)
+              (overlay-put
+               prompt 'before-string
+               (concat (overlay-get prompt 'before-string)
+                       (buttonize label
+                                  (lambda (_)
+                                    (gptel-agent-allow-outside-access
+                                     (overlay-get ov 'gptel-tool) ov)))
+                       " " (propertize "C-c C-a" 'face 'help-key-binding) "\n\n")))
+            prompt))))))
+
+(define-key gptel-tool-call-actions-map (kbd "C-c C-a") #'gptel-agent-allow-outside-access)
+(advice-add 'gptel-agent-instructions--initialize :after #'gptel-agent-access--granted-p)
+(advice-add 'gptel--display-tool-calls :around #'gptel-agent-access--display)
 (advice-add 'gptel--handle-pre-tool :around #'gptel-agent-access--pre-tool '((depth . -10)))
 (advice-add 'gptel--handle-tool-use :around #'gptel-agent-access--tool-use '((depth . -10)))
 

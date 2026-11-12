@@ -4138,8 +4138,9 @@ The preference for dedicated tools is not a ban on Bash file operations.
 - Quote file paths with spaces using double quotes.
 - Chain dependent commands with && (or ; if failures are OK)
 - Use absolute paths instead of cd when possible. Shell cd affects only this \
-invocation. File tools request per-operation approval for outside paths without \
-changing the conversation's directory. Agent and Discussion accept directory for a child's workspace.
+invocation. File tools request approval for outside paths unless the user grants \
+outside access for this chat. These approvals do not change the conversation's \
+directory. Agent and Discussion accept directory for a child's workspace.
 - For parallel commands, make multiple `Bash` calls in one message
 - Prefer foreground Bash (background=false, the default) for tests, builds and \
 commands whose result you need before proceeding. It waits for completion.

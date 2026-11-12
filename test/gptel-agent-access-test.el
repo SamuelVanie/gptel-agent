@@ -49,7 +49,10 @@
          (should-error (apply (gptel-tool-function (caar calls))
                               (gptel--map-tool-args (caar calls) (cadar calls))))
          ;; Neither the same path nor another outside call inherits approval.
-         (should (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt"))))))))
+         (let ((again (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt"))))
+           (should again)
+           (gptel-agent-allow-outside-access again)
+           (should-not (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))))))))
 
 (ert-deftest gptel-agent-access-settings-and-skill-grants-do-not-bypass ()
   (dolist (setting '(nil auto t))
@@ -64,6 +67,84 @@
          (setf (gptel-tool-confirm grant) nil
                (plist-get (gptel-fsm-info fsm) :tools) (list grant)))
        (should (gptel-agent-access-test--ask fsm "Read" (list :file_path (concat back "data.txt"))))))))
+
+(ert-deftest gptel-agent-access-remember-across-calls-and-turns ()
+  (dolist (instructions '(nil t))
+    (gptel-agent-access-test--with-project
+     (with-current-buffer parent (setq gptel-agent-use-project-instructions instructions))
+     (setq fsm (gptel-agent-instructions-test--request parent))
+     (let ((calls (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt"))))
+       (should calls)
+       ;; Acceptance can happen in a different buffer, as for worker previews.
+       (with-temp-buffer
+         (gptel-agent-allow-outside-access calls)
+         (should-not gptel-agent-access--grant)))
+     (should (buffer-local-value 'gptel-agent-access--grant parent))
+     (should-not (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))
+     (should-not (gptel-agent-access-test--ask fsm "Write" '(:file_path "../backend/new.txt" :content "new")))
+     (should (file-exists-p (concat back "new.txt")))
+     (setq fsm (gptel-agent-instructions-test--request parent))
+     (should-not (gptel-agent-access-test--ask fsm "PathInfo" (list :path root)))
+     (should (equal (buffer-local-value 'default-directory parent) front))
+     (should (equal (buffer-local-value 'gptel-agent-instructions--boundary parent) front))
+     (with-current-buffer parent (gptel-agent-revoke-outside-access))
+     (should (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt"))))))
+
+(ert-deftest gptel-agent-access-remember-survives-instruction-deferral ()
+  (gptel-agent-access-test--with-project
+   (setq fsm (gptel-agent-instructions-test--request parent))
+   (let* ((path (concat back "new.txt"))
+          (args (list :file_path path :content "new"))
+          (calls (gptel-agent-access-test--ask fsm "Write" args)))
+     (should calls)
+     (gptel-agent-allow-outside-access calls)
+     (should-not (file-exists-p path))
+     (should (string-match-p "Deferred before staging" (gptel-agent-instructions-test--payload fsm)))
+     (should-not (gptel-agent-access-test--ask fsm "Write" args))
+     (should (file-exists-p path))
+     ;; A later instruction change must still defer the write.
+     (gptel-agent-instructions-test--write (concat back "AGENTS.md") "UPDATED-INSTRUCTION")
+     (should-not (gptel-agent-access-test--ask fsm "Write" (list :file_path path :content "changed")))
+     (should (equal (with-temp-buffer (insert-file-contents path) (buffer-string)) "new"))
+     (should (string-match-p "UPDATED-INSTRUCTION" (gptel-agent-instructions-test--payload fsm))))))
+
+(ert-deftest gptel-agent-access-remember-preserves-confirmations-and-reviews ()
+  (gptel-agent-access-test--with-project
+   (with-current-buffer parent (setq gptel-agent-use-project-instructions nil))
+   (setq fsm (gptel-agent-instructions-test--request parent))
+   (gptel-agent-allow-outside-access
+    (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))
+   (with-current-buffer parent (setq gptel-confirm-tool-calls t))
+   (let ((calls (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt"))))
+     (should calls)
+     (gptel--accept-tool-calls calls))
+   (with-current-buffer parent
+     (setq gptel-confirm-tool-calls 'auto
+           gptel-pre-tool-call-functions '(smv/gptel-ediff-tool-call)))
+   (should-not (gptel-agent-access-test--ask fsm "Write" '(:file_path "../backend/new.txt" :content "new")))
+   (should (buffer-local-value 'gptel-agent-review--queue parent))
+   (should (file-exists-p (concat back "new.txt")))))
+
+(ert-deftest gptel-agent-access-remember-expires-on-directory-change ()
+  (gptel-agent-access-test--with-project
+   (setq fsm (gptel-agent-instructions-test--request parent))
+   (gptel-agent-allow-outside-access
+    (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))
+   (with-current-buffer parent (cd back))
+   ;; A new turn in another directory revokes even before a file tool runs.
+   (setq fsm (gptel-agent-instructions-test--request parent))
+   (should-not (buffer-local-value 'gptel-agent-access--grant parent))
+   (with-current-buffer parent (cd front))
+   (should (gptel-agent-access-test--ask fsm "Read" (list :file_path (concat root "old.txt"))))
+   (should-not (buffer-local-value 'gptel-agent-access--grant parent))))
+
+(ert-deftest gptel-agent-access-remember-still-rejects-remote-targets ()
+  (gptel-agent-access-test--with-project
+   (setq fsm (gptel-agent-instructions-test--request parent))
+   (gptel-agent-allow-outside-access
+    (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))
+   (should-not (gptel-agent-access-test--ask fsm "Read" '(:file_path "/ssh:host:/data.txt")))
+   (should (string-match-p "do not support remote targets" (gptel-agent-instructions-test--payload fsm)))))
 
 (ert-deftest gptel-agent-access-write-discovers-instructions-after-approval ()
   (gptel-agent-access-test--with-project
@@ -115,7 +196,9 @@
          ('symlink (delete-file (concat front "link"))
                    (make-symbolic-link root (concat front "link")))
          ('arguments (setcar values (concat back "other.txt"))))
-       (should-error (apply (gptel-tool-function tool) values))
+       (let ((gptel-agent-access--remember t))
+         (should-error (apply (gptel-tool-function tool) values)))
+       (should-not (buffer-local-value 'gptel-agent-access--grant parent))
        (should-not (file-exists-p (concat back "new.txt")))
        (should-not (file-exists-p (concat root "new.txt")))
        (should-not (file-exists-p (concat back "other.txt")))))))
@@ -250,8 +333,76 @@
       (should (string-match-p "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload worker)))
       (gptel-agent-workers-test--answer worker "Done")))))
 
+(ert-deftest gptel-agent-access-worker-grant-belongs-to-worker ()
+  (gptel-agent-access-test--with-project
+   (gptel-agent-workers-test--with-chat
+    (with-current-buffer parent
+      (cd front)
+      (setq-local gptel-agent-preset '(:tools ("Read"))))
+    (let* ((run (gptel-agent-workers-test--launch fsm))
+           (child (gptel-agent--run-child-buffer run))
+           (worker (gptel-agent--run-fsm run)))
+      (gptel-agent-workers-test--tool worker "Read" '(:file_path "../backend/data.txt"))
+      (with-current-buffer parent
+        (let* ((overlay (cl-find-if (lambda (ov) (overlay-get ov 'gptel-tool))
+                                   (overlays-in (point-min) (point-max))))
+               (prompt (car (overlay-get overlay 'prompt))))
+          (should (string-match-p "allow all outside paths" (overlay-get prompt 'before-string)))
+          (goto-char (overlay-start overlay))
+          (call-interactively (lookup-key gptel-tool-call-actions-map (kbd "C-c C-a")))))
+      (should (buffer-local-value 'gptel-agent-access--grant child))
+      (should-not (buffer-local-value 'gptel-agent-access--grant parent))
+      (should-not (gptel-agent-access-test--ask worker "Read" '(:file_path "../backend/data.txt")))
+      (gptel-agent-workers-test--answer worker "Done")))))
+
+(ert-deftest gptel-agent-access-minibuffer-offers-once-or-remember ()
+  (dolist (choice '(?y ?a ?n))
+    (gptel-agent-access-test--with-project
+     (setq fsm (gptel-agent-instructions-test--request parent))
+     (let* ((calls (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))
+            (info (gptel-fsm-info fsm)))
+       (cl-letf (((symbol-function 'read-multiple-choice)
+                  (lambda (_prompt choices &rest _)
+                    (should (assq ?a choices))
+                    (assq choice choices))))
+         (gptel--display-tool-calls calls info t))
+       (should (eq (and (buffer-local-value 'gptel-agent-access--grant parent) t) (= choice ?a)))
+       (when (= choice ?n) (gptel--fsm-transition fsm 'ABRT))))))
+
+(ert-deftest gptel-agent-access-workers-do-not-inherit-grants ()
+  (gptel-agent-access-test--with-project
+   (gptel-agent-workers-test--with-chat
+    (with-current-buffer parent
+      (cd front)
+      (setq-local gptel-agent-preset '(:tools ("Read"))))
+    (push (gptel-get-tool "Read") (plist-get (gptel-fsm-info fsm) :tools))
+    (gptel-agent-allow-outside-access
+     (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))
+    (should (buffer-local-value 'gptel-agent-access--grant parent))
+    (let* ((run (gptel-agent-workers-test--launch fsm))
+           (child (gptel-agent--run-child-buffer run))
+           (worker (gptel-agent--run-fsm run)))
+      (should-not (buffer-local-value 'gptel-agent-access--grant child))
+      (should (gptel-agent-access-test--ask worker "Read" '(:file_path "../backend/data.txt")))
+      (gptel--fsm-transition worker 'ABRT)))))
+
+(ert-deftest gptel-agent-access-discussions-do-not-inherit-grants ()
+  (gptel-agent-access-test--with-project
+   (gptel-agent-discussion-test--with-chat
+    (with-current-buffer parent (cd front))
+    (push (gptel-get-tool "Read") (plist-get (gptel-fsm-info fsm) :tools))
+    (gptel-agent-allow-outside-access
+     (gptel-agent-access-test--ask fsm "Read" '(:file_path "../backend/data.txt")))
+    (should (buffer-local-value 'gptel-agent-access--grant parent))
+    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+    (let ((child (gptel-agent-discussion--chat-buffer chat))
+          (worker (gptel-agent-discussion--chat-fsm chat)))
+      (should-not (buffer-local-value 'gptel-agent-access--grant child))
+      (push (gptel-get-tool "Read") (plist-get (gptel-fsm-info worker) :tools))
+      (should (gptel-agent-access-test--ask worker "Read" '(:file_path "../backend/data.txt")))))))
+
 (ert-deftest gptel-agent-access-discussion-approval-and-cancellation ()
-  (dolist (approve '(nil t))
+  (dolist (approve '(nil once remember))
     (gptel-agent-access-test--with-project
      (gptel-agent-discussion-test--with-chat
       (with-current-buffer parent (cd front))
@@ -268,9 +419,14 @@
           (should calls)
           (should-not (file-exists-p path))
           (with-current-buffer child
-            (if approve (gptel--accept-tool-calls calls overlay)
-              (gptel--reject-tool-calls calls overlay)))
-          (should (eq (file-exists-p path) approve))
+            (pcase approve
+              ('remember (gptel-agent-allow-outside-access calls overlay))
+              ('once (gptel--accept-tool-calls calls overlay))
+              (_ (gptel--reject-tool-calls calls overlay))))
+          (should (eq (file-exists-p path) (and approve t)))
+          (should (eq (and (buffer-local-value 'gptel-agent-access--grant child) t)
+                      (eq approve 'remember)))
+          (should-not (buffer-local-value 'gptel-agent-access--grant parent))
           (should (equal (buffer-local-value 'default-directory child) front))
           (should (equal (buffer-local-value 'default-directory parent) front))
           (unless approve

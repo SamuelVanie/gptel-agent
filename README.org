@@ -132,6 +132,21 @@ unchanged, and subsequent outside calls ask again. Changed arguments, redirected
 symlinks, cancellation of the request, or a manual directory change invalidate
 pending approvals. File review hooks run only after outside access is approved.
 
+To allow subsequent outside file operations, choose the
+=Run tools + allow all outside paths= action in the approval panel, or press
+=C-c C-a= there. The minibuffer
+approval prompt offers the same option with =a=. This approves the pending
+calls and grants access to all local paths for the requesting chat, including
+later turns and fresh operations proposed after instruction updates. Ordinary
+tool confirmations and file reviews still apply.
+
+The grant lasts only in that chat buffer, resets when its working directory
+changes, and is not saved across Emacs restarts. New workers and managed
+discussions do not inherit it. When a worker's approval is shown in its parent,
+the grant belongs to the worker named in the action. Run
+=M-x gptel-agent-revoke-outside-access= in the granted chat to require outside
+approval again. =C-c C-c= continues to approve just the pending calls.
+
 A =cd= inside =Bash= affects only that shell invocation. File-tool approval is
 not an operating-system sandbox for arbitrary shell commands or Elisp evaluation.
 
@@ -202,11 +217,13 @@ New workers and discussions inherit the effective boolean preference only.
 
 Managed file operations support local files. Targets outside the conversation's
 current discovery boundary, including escaping symlinks, require approval for
-each operation. Remote targets remain unsupported. Approved targets discover
+each operation unless the user grants outside access for that chat as described
+above. Remote targets remain unsupported. Approved targets discover
 their own scoped instructions without moving the chat or widening its boundary.
 If an outside mutation needs new or updated instructions, it defers before
 staging; the next model call receives those instructions and must propose a
-fresh operation, which asks for its own approval.
+fresh operation, which asks for its own approval unless outside access was
+granted for the chat.
 
 =AGENTS.md= may be a symlink to a readable regular local file, including a
 shared file outside the project. Absolute and relative links are supported.
