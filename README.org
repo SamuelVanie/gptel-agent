@@ -1103,7 +1103,9 @@ traversal, and stops when its request is aborted or its owning buffer is killed.
 =gptel-agent-search-traversal-max-bytes= bounds candidate metadata (4 MiB), and
 =gptel-agent-search-max-results= caps Glob entries or Grep matching lines
 globally (1,000). Both tools accept =max_entries= and =max_results= to lower
-these ceilings, plus =depth= to restrict traversal. Grep accepts 0–15 context
+these ceilings, plus =depth= to restrict traversal. Their request-local schemas
+include the configured upper bounds. Invalid arguments return tool errors so
+the agent can correct the call and continue. Grep accepts 0–15 context
 lines; a limit can cut trailing context short. Output stops at
 =gptel-agent-tool-result-max-chars=; individual subprocess records are bounded
 to 64 KiB and error diagnostics to 2,048 characters. The Emacs grep fallback

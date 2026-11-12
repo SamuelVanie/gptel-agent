@@ -101,6 +101,13 @@ emit({'status': status, 'examined': count})
   (let* ((tool (gptel--copy-tool base)) (name (gptel-tool-name base))
          (args (copy-tree (gptel-tool-args base)))
          (syntax (gptel-agent--repo-syntax name backend)))
+    (setq args
+          (mapcar (lambda (arg)
+                    (pcase (plist-get arg :name)
+                      ("max_results" (plist-put arg :maximum gptel-agent-search-max-results))
+                      ("max_entries" (plist-put arg :maximum gptel-agent-search-max-entries))
+                      (_ arg)))
+                  args))
     (setf (gptel-tool-description tool)
           (concat (if (equal name "Glob") gptel-agent--repo-glob-description
                     gptel-agent--repo-grep-description)
@@ -421,8 +428,8 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
     (error "%s must be 1..%s (configured ceiling)" name ceiling))
   (or value ceiling))
 
-(defun gptel-agent--repo-start (callback name pattern path glob context depth type max-results max-entries fsm backend)
-  "Start an owned NAME search with validated arguments and captured BACKEND."
+(defun gptel-agent--repo-prepare (callback name pattern path glob context depth type max-results max-entries fsm backend)
+  "Validate arguments and create a NAME search without starting owned resources."
   (gptel-agent--repo-pattern pattern (equal name "Glob"))
   (when glob (gptel-agent--repo-pattern glob t))
   (unless (or (null depth) (and (integerp depth) (> depth 0))) (error "depth must be an integer >= 1"))
@@ -432,15 +439,35 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
   (when (file-remote-p (expand-file-name path)) (error "%s requires a local filesystem path" name))
   (setq path (gptel-agent-path-resolve path (if (equal name "Glob") 'directory 'any) t))
   (unless (or (file-directory-p path) (file-regular-p path)) (error "Search requires a regular file or directory"))
-  (let* ((job (gptel-agent--make-repo
-               :name name :source (current-buffer) :callback callback :fsm fsm
-               :backend (or backend (gptel-agent--repo-select-backend)) :root path :regex pattern
-               :glob (and glob (wildcard-to-regexp glob)) :context context :depth depth :type type
-               :max-results (gptel-agent--repo-checked-limit max-results gptel-agent-search-max-results "max_results")
-               :max-entries (gptel-agent--repo-checked-limit max-entries gptel-agent-search-max-entries "max_entries")
-               :limit (max 0 gptel-agent-tool-result-max-chars)
-               :traversal-limit (max 0 gptel-agent-search-traversal-max-bytes)))
-         (cleanup (lambda (&rest _) (gptel-agent--repo-dispose job))))
+  (gptel-agent--make-repo
+   :name name :source (current-buffer) :callback callback :fsm fsm
+   :backend (or backend (gptel-agent--repo-select-backend)) :root path :regex pattern
+   :glob (and glob (wildcard-to-regexp glob)) :context context :depth depth :type type
+   :max-results (gptel-agent--repo-checked-limit max-results gptel-agent-search-max-results "max_results")
+   :max-entries (gptel-agent--repo-checked-limit max-entries gptel-agent-search-max-entries "max_entries")
+   :limit (max 0 gptel-agent-tool-result-max-chars)
+   :traversal-limit (max 0 gptel-agent-search-traversal-max-bytes)))
+
+(defun gptel-agent--repo-start (callback name pattern path glob context depth type max-results max-entries fsm backend)
+  "Start an owned NAME search, reporting invalid arguments through CALLBACK."
+  ;; Older gptel versions do not catch errors from asynchronous tools.  Keep
+  ;; validation inside this boundary so a bad call cannot terminate a worker.
+  (let ((job (condition-case err
+                 (gptel-agent--repo-prepare
+                  callback name pattern path glob context depth type max-results max-entries fsm backend)
+               (error (concat "Error: " (error-message-string err))))))
+    (if (stringp job)
+        ;; Deliver outside the handler: callback failures must not deliver twice.
+        (funcall callback job)
+      (gptel-agent--repo-run job)))
+  nil)
+
+(defun gptel-agent--repo-run (job)
+  "Start resources for a validated JOB and register cancellation cleanup."
+  (let ((cleanup (lambda (&rest _) (gptel-agent--repo-dispose job)))
+        (path (gptel-agent--repo-root job))
+        (depth (gptel-agent--repo-depth job))
+        (fsm (gptel-agent--repo-fsm job)))
     (push job gptel-agent--repository-searches)
     (add-hook 'kill-buffer-hook #'gptel-agent--repository-searches-cleanup nil t)
     (setf (gptel-agent--repo-cleanup job) cleanup)

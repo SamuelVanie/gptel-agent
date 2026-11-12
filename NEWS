@@ -4,6 +4,10 @@
 
 ** New features and UI changes
 
+- Invalid ~Glob~ and ~Grep~ arguments now return recoverable tool errors
+  instead of terminating sub-agents. Their request-local schemas include the
+  configured ~max_results~ and ~max_entries~ upper bounds.
+
 - File tools now request ordinary tool approval for each operation outside the
   current project boundary, without changing the chat's working directory.
   Approval precedes instruction discovery and file review hooks and does not

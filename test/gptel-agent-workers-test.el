@@ -135,6 +135,50 @@
       (setq start (match-end 0) count (1+ count)))
     count))
 
+(ert-deftest gptel-agent-workers-invalid-search-limits-allow-retry ()
+  (dolist (background '(blocking t))
+    (dolist (name '("Glob" "Grep"))
+      (dolist (limit '(:max_results :max_entries))
+        (gptel-agent-workers-test--with-chat
+          (with-current-buffer parent
+            (setq-local gptel-agent-preset `(:tools (,name))))
+          (let* ((gptel-agent-search-max-results 1000)
+                 (gptel-agent-search-max-entries 20000)
+                 (run (gptel-agent-workers-test--launch fsm "test-worker" nil background))
+                 (worker (gptel-agent--run-child-buffer run))
+                 (child (gptel-agent--run-fsm run))
+                 (args (if (equal name "Glob")
+                           '(:pattern "*" :root_directory ".")
+                         '(:regex "needle" :path "."))))
+            (gptel-agent-workers-test--tool
+             child name (append args (list limit 20001)))
+            (should (eq (gptel-fsm-state child) 'WAIT))
+            (should (eq (gptel-agent--run-state run) 'requesting-after-tool))
+            (should (string-match-p
+                     (if (eq limit :max_results)
+                         "max_results must be 1..1000"
+                       "max_entries must be 1..20000")
+                     (gptel-agent-workers-test--data child)))
+            (with-current-buffer worker
+              (should-not gptel-agent--repository-searches))
+            ;; Keep the real validation, dispatch, and result delivery paths;
+            ;; only replace subprocess startup for the corrected query.
+            (cl-letf (((symbol-function 'gptel-agent--repo-launch)
+                       (lambda (job _command)
+                         (gptel-agent--repo-finish job "complete"))))
+              (gptel-agent-workers-test--tool child name (append args (list limit 1))))
+            (should (eq (gptel-fsm-state child) 'WAIT))
+            (should (string-match-p (concat name " complete;")
+                                    (gptel-agent-workers-test--data child)))
+            (gptel-agent-workers-test--answer child "SEARCH-RECOVERED")
+            (should (eq (gptel-agent--run-state run) 'completed))
+            (gptel-agent-workers-test--wake fsm)
+            (gptel-agent-workers-test--answer fsm "Finished")
+            (when (eq (gptel-fsm-state fsm) 'AGWT)
+              (gptel-agent-workers-test--wake fsm)
+              (gptel-agent-workers-test--answer fsm "Worker result received"))
+            (should (eq (gptel-fsm-state fsm) 'DONE))))))))
+
 (ert-deftest gptel-agent-workers-todos-stay-in-worker-and-allow-completion ()
   (dolist (background '(blocking t))
     (gptel-agent-workers-test--with-chat
