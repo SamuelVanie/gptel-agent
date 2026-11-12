@@ -519,32 +519,85 @@ requiring `gptel-agent-update'."
     (message "Skills updated: %s enabled."
              (length gptel-agent--enabled-skills))))
 
-;;;###autoload
-(defun gptel-agent-use-skill (&optional skill)
-  "Insert a request to load SKILL through the Skill tool at point.
-With no SKILL, offer completion over skills whose frontmatter contains
-disable-model-invocation: true, with descriptions as annotations.
-Discover skills for the current directory, independently of the Skill
-tool's enabled list.  Insert ordinary text naming the chosen skill.
+(defun gptel-agent-skill-capf ()
+  "Complete /skill references to manually invoked skills at point.
+Candidates include the slash so automatic completion can start at /.
+Accepting a candidate inserts a Skill tool request, displayed as /skill
+in `gptel-mode'.  Discovery reads metadata only, in the current directory;
+instructions and allowed-tools are loaded only when the model calls Skill."
+  ;; Completion frontends such as Company bind `buffer-read-only' while
+  ;; querying CAPFs.  Discovery must be read-only; acceptance edits normally.
+  (when gptel-mode
+    (let* ((end (point))
+           (start (save-excursion
+                    (skip-chars-backward "[:alnum:]_.:-")
+                    (when (and (eq (char-before) ?/)
+                               (not (eq (char-after end) ?/)))
+                      (backward-char)
+                      (when (and (or (bolp) (memq (char-before) '(?\s ?\t)))
+                                 (not (text-property-not-all (point) end 'gptel nil)))
+                        (point))))))
+      (when start
+        (let ((skills (mapcar (lambda (entry)
+                               (cons (concat "/" (car entry)) (cdr entry)))
+                             (cl-remove-if-not #'gptel-agent--manual-skill-p
+                                               (gptel-agent--update-skills)))))
+          (when skills
+            (list start end skills
+                  :exclusive 'no
+                  :company-prefix-length 1
+                  :annotation-function
+                  (lambda (name)
+                    (concat "  " (plist-get (cddr (assoc name skills)) :description)))
+                  :exit-function
+                  (lambda (name status)
+                    (when (and (memq status '(finished sole)) (assoc name skills)
+                               (equal (buffer-substring-no-properties start (point)) name))
+                      (atomic-change-group
+                        (delete-region start (point))
+                        (insert (format "Use the Skill tool to load %S."
+                                        (substring name 1))))
+                      (font-lock-ensure start (point)))))))))))
 
-Send with `gptel-send' when ready.  Instructions and allowed-tools are
-loaded only when the model calls Skill, exactly as for other skills."
-  (interactive)
-  (barf-if-buffer-read-only)
-  (let* ((skills (cl-remove-if-not #'gptel-agent--manual-skill-p
-                                   (gptel-agent--update-skills)))
-         (completion-extra-properties
-          (list :annotation-function
-                (lambda (name)
-                  (concat "  " (plist-get (cddr (assoc name skills)) :description))))))
-    (unless skills
-      (user-error "No skills with disable-model-invocation: true found"))
-    (setq skill (or skill (completing-read "Use skill: " skills nil t)))
-    (unless (assoc skill skills)
-      (user-error "Skill %s is not a manually invoked skill" skill))
-    (atomic-change-group
-      (unless (bolp) (insert "\n"))
-      (insert (format "Use the Skill tool to load %S.\n" skill)))))
+(defun gptel-agent--fontify-skill (limit)
+  "Find the next user-written Skill tool request before LIMIT."
+  (let ((case-fold-search nil) found)
+    (while (and (not found)
+                (re-search-forward
+                 (rx "Use the Skill tool to load "
+                     (group "\"" (* (or (not (any "\"\\\n"))
+                                       (seq "\\" nonl))) "\"") ".")
+                 limit t))
+      (setq found
+            (and (or (= (match-beginning 0) (point-min))
+                     (memq (char-before (match-beginning 0)) '(?\s ?\t ?\n)))
+                 (not (text-property-not-all
+                       (match-beginning 0) (match-end 0) 'gptel nil))
+                 (ignore-errors (stringp (read (match-string-no-properties 1)))))))
+    found))
+
+(defconst gptel-agent--skill-font-lock-keywords
+  '((gptel-agent--fontify-skill
+     (0 (list 'face 'font-lock-keyword-face
+              'display (concat "/" (read (match-string-no-properties 1)))
+              'help-echo (match-string-no-properties 0)) prepend)))
+  "Display Skill tool requests as slash references without changing text.
+Matching the underlying request also restores decoration in saved chats.")
+
+(defun gptel-agent--setup-skill-completion ()
+  "Set up slash completion and skill display for `gptel-mode'."
+  (cond
+   (gptel-mode
+    (font-lock-add-keywords nil gptel-agent--skill-font-lock-keywords t)
+    (setq-local font-lock-extra-managed-props
+                (cl-union '(display help-echo) font-lock-extra-managed-props))
+    (add-hook 'completion-at-point-functions #'gptel-agent-skill-capf nil t))
+   (t
+    (font-lock-remove-keywords nil gptel-agent--skill-font-lock-keywords)
+    (remove-hook 'completion-at-point-functions #'gptel-agent-skill-capf t)))
+  (font-lock-flush))
+
+(add-hook 'gptel-mode-hook #'gptel-agent--setup-skill-completion)
 
 ;;; Sub-agent definition parsers for Markdown and Org
 

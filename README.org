@@ -838,9 +838,14 @@ Read references/checklist.md, then review the current change.
 #+end_src
 
 Place it under one of =gptel-agent-skill-dirs=, like any other skill. While
-composing a message, run =M-x gptel-agent-use-skill= and choose its name with
-completion. Descriptions appear as annotations. The command refreshes discovery
-for the current directory and inserts ordinary text:
+composing a message in =gptel-mode=, type =/= and choose a skill with your
+completion frontend, or use =M-TAB= (=completion-at-point=). Descriptions appear
+as annotations. Completion refreshes discovery for the current directory and
+includes skills with =disable-model-invocation: true=, independently of the
+Skill tool's enabled list.
+
+Accepting a completion displays =/review-my-change= in the buffer. Underneath,
+the buffer contains ordinary text:
 
 #+begin_example
 Use the Skill tool to load "review-my-change".
@@ -848,9 +853,13 @@ Use the Skill tool to load "review-my-change".
 
 Add your task details and send normally. The model loads the instructions,
 supporting paths and =allowed-tools= through the existing =Skill= tool. Inserting
-or sending the request itself loads no instructions and grants no tools. You can
-edit, undo, copy or save the text normally, or type the request yourself. The
-=Skill= tool must be enabled in the conversation.
+or sending the request itself loads no instructions and grants no tools. This
+uses a font-lock =display= property: gptel sends the underlying instruction, so
+no send-time expansion is needed. Copying or saving also preserves the full
+instruction; reopening a chat restores its slash display. Hover over the
+reference to see the full instruction. Undo restores the text before completion.
+An unaccepted =/skill= stays literal text. You can also type the full request
+yourself. The =Skill= tool must be enabled in the conversation.
 
 These skills are omitted from the advertised skill list and
 =gptel-agent-toggle-skill=, but remain callable by name through =Skill=.

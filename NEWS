@@ -14,9 +14,11 @@
   authorize later calls. The agent-controlled directory-changing tool is removed.
 
 - Skills with ~disable-model-invocation: true~ are hidden from automatic
-  discovery. ~gptel-agent-use-skill~ completes their names and inserts a plain
-  request to load the chosen skill. The model uses the existing ~Skill~ tool
-  for instructions and ~allowed-tools~, just as for other skills.
+  discovery. In ~gptel-mode~, slash completion replaces ~gptel-agent-use-skill~.
+  Accepting ~/skill~ inserts a plain Skill tool request displayed as ~/skill~;
+  gptel sends the underlying text without a send-time expansion. The model uses
+  the existing ~Skill~ tool for instructions and ~allowed-tools~, just as for
+  other skills.
 
 - ~Discussion~ accepts an optional ~model~ in gptel's ~Backend:model~ format.
   The tool advertises configured backend/model pairs and applies the selection
