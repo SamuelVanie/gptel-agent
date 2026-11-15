@@ -89,9 +89,31 @@ There are two ways to use gptel-agent:
   (gptel-plan) by applying them from gptel's menu, or clicking on the backend
   name in the header line.
 
-  The difference between them is just in the tools available to the model -- the
-  planning preset has read-only access to the filesystem and is instructed to
-  create a systematic plan of action.
+  The planning preset has read-only access to the filesystem and works with you
+  to settle a concrete implementation design. The implementation preset makes
+  and verifies the changes using that design and the project's conventions.
+
+***** Planning before implementation
+
+=gptel-plan= first inspects project instructions, nearby implementations,
+callers, and tests to establish the existing conventions. It then proposes exact
+folder and file names, module responsibilities, function names and contracts,
+and the flow of data and calls between them. It compares meaningful alternatives
+and recommends an approach with evidence and trade-offs.
+
+Related design choices are presented together for you to decide through
+=AskUserQuestion=. Choices you already supplied or accepted are retained. You
+can explicitly delegate choices to the planner, for example, "Choose the file
+names using the existing conventions, but discuss module boundaries with me."
+The planner records those decisions and their rationale without asking again.
+
+The final plan is a standalone implementation handoff with exact paths and
+interfaces, interactions and state ownership, ordered changes, and concrete
+acceptance checks. A design with unanswered questions or missing evidence is
+labeled a draft. The implementation agent is instructed to follow settled
+decisions and resolve new conflicts or missing contracts with you before making
+dependent edits. These are prompt instructions, not a runtime enforcement of
+plan completeness or conformance.
 
 **** Anywhere in Emacs
 

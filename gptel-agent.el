@@ -140,6 +140,8 @@ Preserve:
 - The active goal, latest user corrections, constraints, preferences, and explicit instructions.
 - Completed changes and verified results, distinct from plans, assumptions, and unverified claims.
 - Decisions and their reasons, essential evidence/references, and failed approaches worth avoiding.
+- The current plan's readiness and exact agreed file layout, names, interface contracts, module interactions, ownership, and acceptance checks. Preserve convention references and rejected alternatives with their reasons; do not reduce the design to high-level tasks.
+- Which design choices the user accepted or specified, which are fixed by project constraints, which were made within explicit delegated authority, and which remain proposals or unanswered questions. Preserve the scope of delegated choices; never turn a recommendation into agreement.
 - Unfinished work, blockers, unanswered questions, and concrete next steps.
 - Paths, symbols, commands, versions, and active job/worker IDs needed to resume safely; pending reviews and approval scope when relevant. Silence is not approval.
 
