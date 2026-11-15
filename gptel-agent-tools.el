@@ -2077,6 +2077,74 @@ The caller must have appended all tool results before entering this function."
                          (list (cons 'response (gptel-agent--workers-answer gate))))))
     (setf (gptel-agent--workers-answer gate) nil)))
 
+(defun gptel-agent--workers-save-tool-answer (gate)
+  "Retain GATE's displayed narration in the current tool-call message.
+Some gptel parsers retain tool calls but omit the accompanying text.
+Repair only this round's payload, before tool callbacks can resume it.
+Already complete messages, including signed reasoning, stay intact."
+  (let* ((info (gptel-fsm-info (gptel-agent--workers-fsm gate)))
+         (data (plist-get info :data))
+         (answer (gptel-agent--workers-answer gate))
+         (start (or (plist-get info :agent-tool-prompt-count) 0)))
+    (when (and (stringp answer) (not (string-empty-p answer))
+               (plist-get info :tool-use))
+      (cond
+       ;; Responses represents tool calls as separate input items.  Insert
+       ;; narration before them, never between a call and its result.
+       ((plist-member data :input)
+        (let* ((input (plist-get data :input))
+               (round (seq-subseq input start))
+               (call (seq-position round "function_call"
+                                   (lambda (item type)
+                                     (equal (plist-get item :type) type)))))
+          (when (and call
+                     (not (seq-some (lambda (item)
+                                      (equal (plist-get item :role) "assistant"))
+                                    round)))
+            (gptel--inject-prompt
+             (plist-get info :backend) data
+             (gptel--parse-list (plist-get info :backend)
+                               (list (cons 'response answer)))
+             (+ start call)))))
+       ((plist-member data :messages)
+        (let* ((messages (plist-get data :messages))
+               (last (and (> (length messages) 0)
+                          (elt messages (1- (length messages)))))
+               (content (plist-get last :content)))
+          (when (equal (plist-get last :role) "assistant")
+            (cond
+             ;; Chat Completions streaming currently uses :content :null.
+             ((plist-get last :tool_calls)
+              (when (or (null content) (eq content :null)
+                        (equal content ""))
+                (plist-put last :content answer)))
+             ;; Anthropic can retain only part of the text when the final
+             ;; text delta and tool call arrive in the same network chunk.
+             ((and (sequencep content)
+                   (seq-some (lambda (block)
+                               (equal (plist-get block :type) "tool_use"))
+                             content))
+              (let ((text (mapconcat
+                           (lambda (block)
+                             (if (equal (plist-get block :type) "text")
+                                 (plist-get block :text) ""))
+                           content "")))
+                (unless (equal text answer)
+                  (let (blocks inserted)
+                    (seq-doseq (block content)
+                      (cond
+                       ((equal (plist-get block :type) "text")
+                        (unless inserted
+                          (push (plist-put (copy-sequence block) :text answer) blocks)
+                          (setq inserted t)))
+                       (t
+                        (when (and (not inserted)
+                                   (equal (plist-get block :type) "tool_use"))
+                          (push (list :type "text" :text answer) blocks)
+                          (setq inserted t))
+                        (push block blocks))))
+                    (plist-put last :content (vconcat (nreverse blocks)))))))))))))))
+
 (defun gptel-agent--workers-status (gate text &optional state)
   "Display TEXT for GATE and its owning worker overlay.
 Set the owning worker's STATE, defaulting to `waiting-for-agents'."
@@ -2150,7 +2218,17 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
                (when (eq state 'WAIT)
                  (gptel-agent--workers-wrap-callback gate)
                  (gptel-agent--workers-inject gate)
-                 (setf (gptel-agent--workers-answer gate) nil))
+                 (let ((data (plist-get info :data)))
+                   (plist-put info :agent-tool-prompt-count
+                              (length (or (plist-get data :messages)
+                                          (plist-get data :contents)
+                                          (plist-get data :input)))))
+                 (setf (gptel-agent--workers-answer gate) nil)
+                 ;; Text left by a parser's final chunk belongs to the
+                 ;; previous response, not the next model/tool round.
+                 (plist-put info :partial_text nil))
+               (when (eq state 'TOOL)
+                 (gptel-agent--workers-save-tool-answer gate))
                ;; Supervised workers own transient-error retry decisions.
                ;; Their terminal run-finish also stops their subtree.
                (when (or (eq state 'ABRT)
@@ -4740,9 +4818,11 @@ the global registry while this request is in flight."
                   (mapcar (lambda (candidate)
                             (if (eq candidate base-tool) tool candidate))
                           gptel-tools))))
+  ;; Even presets without Agent/AskUserQuestion need to retain narration
+  ;; across tool continuations (for example a background Bash launch).
   (when (or (gptel-agent--run-p (plist-get (gptel-fsm-info fsm) :context))
-            (cl-find-if (lambda (tool) (member (gptel-tool-name tool)
-                                               '("Agent" "AgentControl")))
+            (cl-find-if (lambda (tool) (equal (gptel-tool-category tool)
+                                             "gptel-agent"))
                         gptel-tools))
     (gptel-agent--workers-install fsm))
   (when-let* ((base-tool

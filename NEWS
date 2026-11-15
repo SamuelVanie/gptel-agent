@@ -4,6 +4,11 @@
 
 ** New features and UI changes
 
+- Tool continuations now retain the assistant's narration before a tool call,
+  including with streaming and immediate nonblocking acknowledgements. This
+  repairs missing text in OpenAI, Responses and Anthropic request histories
+  that could cause the model to repeat itself after calling a tool.
+
 - Session saves now stage immutable chat versions and atomically publish a
   complete family manifest. Interrupted batches retain the previous complete
   checkpoint; new children join before publication, unchanged versions are
