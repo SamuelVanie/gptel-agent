@@ -963,6 +963,19 @@ Send a new message normally, or use =gptel-agent-discussion-resume= in a chat
 without an unsent draft to resume delivery of queued discussion messages.
 =M-x gptel-agent-session-save= saves changed chats immediately.
 
+Use =M-x gptel-agent-sessions= to browse saved families, their chat counts,
+open buffers and last-save times. =RET= restores the selected family, =d=
+deletes it after confirmation, and =g= refreshes the list. Browsing reads only
+small snapshot headers and does not open chats or enable autosaving. You can
+also delete a family directly with =M-x gptel-agent-session-delete=.
+
+Deletion includes the main chat and all its nested discussions. It removes
+their session snapshots; open chat buffers, running requests, worktrees and
+separately saved transcript files remain intact. Open chats in the deleted
+family, including new discussions they spawn, stop saving so autosave cannot
+recreate the deleted session. To save that family again, run
+=C-u M-x gptel-agent-session-save= from one of its open chat buffers.
+
 Snapshots retain the transcript and gptel's response, tool and reasoning
 boundaries, unsent drafts, queued discussion and main-chat messages, chat IDs,
 ownership, turn counts, working directories and worktree metadata. They also

@@ -4,6 +4,12 @@
 
 ** New features and UI changes
 
+- ~gptel-agent-sessions~ lists saved discussion families with chat counts,
+  open buffers and save times. ~RET~ restores, ~d~ deletes a whole family
+  after confirmation, and ~g~ refreshes. Deleting snapshots keeps live chats
+  usable and excludes them and new descendants from autosaving. Use
+  ~C-u M-x gptel-agent-session-save~ in a chat to save its family again.
+
 - Opt-in ~gptel-agent-session-mode~ saves ordinary chats and their discussion
   relationships across Emacs restarts. ~gptel-agent-session-restore~ reopens a
   chosen family with transcripts, drafts, queued messages, supported settings
