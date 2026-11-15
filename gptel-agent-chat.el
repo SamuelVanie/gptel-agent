@@ -19,6 +19,13 @@
   :group 'gptel-agent)
 
 (defvar gptel-agent-chat--counter 0)
+(defvar gptel-agent-chat--namespace
+  (substring (secure-hash 'sha256
+                          (format "%s:%s:%s:%s" (system-name) (emacs-pid)
+                                  (float-time) (random)))
+             0 16)
+  "Process namespace preventing new IDs from colliding with restored IDs.
+Keep this value when reloading the module, just like the counter.")
 (defvar-local gptel-agent-chat--id nil)
 (defvar-local gptel-agent-chat--inbox nil)
 (defvar-local gptel-agent-chat--request-token nil)
@@ -43,7 +50,8 @@
   (with-current-buffer buffer
     (or gptel-agent-chat--id
         (setq gptel-agent-chat--id
-              (format "chat-%d" (cl-incf gptel-agent-chat--counter))))))
+              (format "chat-%d-%s" (cl-incf gptel-agent-chat--counter)
+                      gptel-agent-chat--namespace)))))
 
 (defun gptel-agent-chat--label (text limit)
   "Return plain TEXT metadata bounded to LIMIT characters."

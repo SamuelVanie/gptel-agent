@@ -69,6 +69,7 @@
 (require 'gptel-agent-tools)
 (require 'gptel-agent-discussion)
 (require 'gptel-agent-chat)
+(require 'gptel-agent-session)
 (eval-when-compile (require 'cl-lib))
 
 (declare-function yaml-parse-string "yaml")

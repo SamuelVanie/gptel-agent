@@ -655,7 +655,8 @@ to continue. It never reads transcripts. Generated discussions, workers and
 review asides cannot use this tool or appear as recipients, including closed
 or detached discussions. =DiscussionControl= still sees only the calling
 conversation's own discussions. Main-chat IDs survive buffer renames, are
-not reused after killing a buffer, and last only for this Emacs session.
+not reused for new chats, and are retained when a chat is restored with
+=gptel-agent-session-mode=.
 
 A recipient receives messages at its next model-request boundary, after any
 pending tool results. Sending never starts a new model request, submits an
@@ -933,11 +934,73 @@ its discussions, which remain usable; killing a child marks it closed without
 waking the parent. =close= retains the transcript and stops only that discussion's
 current request (including its ordinary Agent workers).
 
-Management IDs, ownership and event queues are retained for the current Emacs
-session; saving and reopening a transcript does not restore supervision.
+Enable the session system below to retain management IDs, ownership and event
+queues across Emacs restarts. Saving a transcript with ordinary =save-buffer=
+alone does not preserve these relationships.
 After updating, reload/rebuild the package and run =gptel-agent-update=, then
 reapply the =gptel-agent= preset. For custom presets, include both =Discussion=
 and =DiscussionControl= in their tool lists.
+
+*** Persistent discussion sessions
+
+Add this after loading =gptel-agent= in your init file:
+
+#+begin_src emacs-lisp
+(gptel-agent-session-mode 1)
+#+end_src
+
+The mode saves ordinary main chats and the discussions they create, including
+nested discussions. Temporary =Agent= worker buffers and file-review asides
+are excluded. Each chat has its own snapshot and a persistent parent ID, so a
+restored main chat can list, read and message its existing discussions and
+create new ones. The child buffers remain ordinary editable gptel chats.
+
+Run =M-x gptel-agent-session-restore= and choose a saved main chat to reopen its
+discussion family. Only that family is loaded; existing live buffers are
+reused without replacing their edits. Use =M-x gptel-agent-discussions= and
+=RET= to visit the children as usual. Restoring never starts model requests.
+Send a new message normally, or use =gptel-agent-discussion-resume= in a chat
+without an unsent draft to resume delivery of queued discussion messages.
+=M-x gptel-agent-session-save= saves changed chats immediately.
+
+Snapshots retain the transcript and gptel's response, tool and reasoning
+boundaries, unsent drafts, queued discussion and main-chat messages, chat IDs,
+ownership, turn counts, working directories and worktree metadata. They also
+retain supported data settings, including the system prompt, model, registered
+backend and tool names, temperature and enabled agent/skill selections. Closed
+discussions keep their transcripts and remain closed after restoration.
+
+Active requests and temporary workers are not resumed. Pending question or
+approval callbacks, file-review queues, access grants, attached context,
+custom hooks and captured runtime configuration are not restored. Backends
+and tools must be registered in the new Emacs session; backend credentials
+are obtained from your normal configuration. A snapshot preserves worktree
+metadata, not a copy of the worktree's files.
+
+Saving is incremental: edits and metadata changes queue a chat once, without
+scanning its transcript on every keystroke. One timer checks the queue each
+second and processes a small batch while Emacs is idle. Defaults are:
+
+| Option | Default | Purpose |
+|--------+---------+---------|
+| =gptel-agent-session-idle-delay= | 5 seconds | Wait for user inactivity before autosaving |
+| =gptel-agent-session-save-interval= | 30 seconds | Minimum interval between automatic saves of one chat |
+| =gptel-agent-session-batch-size= | 4 | Maximum dirty chats considered per batch |
+| =gptel-agent-session-time-budget= | 0.02 seconds | Soft time budget for a batch |
+
+Continuous streaming does not reset the save interval. Unchanged chats are
+not rewritten, and the saver does not rewrite a global transcript collection.
+The time budget is soft because a single large transcript must finish its
+atomic write. Manual saving, killing a chat and normal Emacs shutdown bypass
+the autosave interval. Changes since the last completed snapshot can still be
+lost after a crash or forced shutdown.
+
+=gptel-agent-session-directory= defaults to =gptel-agent/sessions/= beneath
+=user-emacs-directory=. Storage is local, with private directory/file
+permissions and a single writer lock; use separate directories for concurrent
+Emacs instances. Snapshots are replaced atomically and retained until deleted.
+They are session data files, separate from any transcript files saved with
+=save-buffer=. Disable session mode before changing the storage directory.
 
 *** Using sub-agents
 

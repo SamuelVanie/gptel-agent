@@ -29,6 +29,13 @@
   id chat fsm kind text (state 'pending) callback calls overlays source-fsm)
 
 (defvar gptel-agent-discussion--counter 0)
+(defvar gptel-agent-discussion--namespace
+  (substring (secure-hash 'sha256
+                          (format "%s:%s:%s:%s" (system-name) (emacs-pid)
+                                  (float-time) (random)))
+             0 16)
+  "Process namespace preventing new IDs from colliding with restored IDs.
+Keep this value when reloading the module, just like the counter.")
 (defvar gptel-agent-discussion--approval-guards (make-hash-table :test #'eq :weakness 'key)
   "Approval callback to tool guard, including tools replaced in the inspector.")
 (defvar-local gptel-agent-discussion--self nil)
@@ -50,8 +57,9 @@
   (put var 'permanent-local t))
 
 (defun gptel-agent-discussion--id (prefix)
-  "Return a session-unique identifier with PREFIX."
-  (format "%s-%d" prefix (cl-incf gptel-agent-discussion--counter)))
+  "Return an identifier with PREFIX, unique across requests and restarts."
+  (format "%s-%d-%s" prefix (cl-incf gptel-agent-discussion--counter)
+          gptel-agent-discussion--namespace))
 
 (defun gptel-agent-discussion--active-p (fsm)
   "Whether FSM can still advance."

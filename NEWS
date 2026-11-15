@@ -4,6 +4,16 @@
 
 ** New features and UI changes
 
+- Opt-in ~gptel-agent-session-mode~ saves ordinary chats and their discussion
+  relationships across Emacs restarts. ~gptel-agent-session-restore~ reopens a
+  chosen family with transcripts, drafts, queued messages, supported settings
+  and stable IDs; existing live buffers are reused. Restored delivery is paused,
+  and temporary Agent workers or request callbacks are never replayed.
+  Autosaving uses one dirty queue, bounded idle batches and an atomic file per
+  chat, with a 30-second minimum interval per chat. ~gptel-agent-session-save~,
+  buffer killing and normal shutdown save immediately. Private local storage
+  is protected by a single writer lock.
+
 - Invalid ~Glob~ and ~Grep~ arguments now return recoverable tool errors
   instead of terminating sub-agents. Their request-local schemas include the
   configured ~max_results~ and ~max_entries~ upper bounds.
