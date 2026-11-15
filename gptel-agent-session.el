@@ -3,7 +3,7 @@
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
-;; One atomic file per ordinary chat, including its persistent parent ID.
+;; Immutable chat versions, published through one atomic manifest per family.
 ;; Changes enqueue buffers in O(1); a single idle-gated timer drains a bounded
 ;; batch.  No transcript polling, worker snapshots, or global manifest rewrites.
 ;; Restore opens only the selected family, in two passes, without sending.
@@ -12,6 +12,7 @@
 
 (require 'gptel-agent-discussion)
 (require 'gptel-agent-chat)
+(require 'gptel-agent-session-checkpoint)
 
 (defcustom gptel-agent-session-directory
   (locate-user-emacs-file "gptel-agent/sessions/")
@@ -27,11 +28,13 @@ before changing it.  Snapshots are retained until explicitly deleted."
 (defcustom gptel-agent-session-save-interval 30
   "Minimum seconds between automatic saves of the same chat.
 Edits do not reset this interval, so continuous streaming cannot starve a
-chat.  Manual saving, buffer killing and Emacs shutdown bypass it."
+chat.  Failed writes also wait this interval before automatic retry.
+Manual saving, buffer killing and Emacs shutdown bypass it."
   :type 'number :group 'gptel-agent)
 
 (defcustom gptel-agent-session-batch-size 4
-  "Maximum dirty buffers considered in one automatic save batch."
+  "Maximum chat snapshots written in one automatic save batch.
+Several batches can stage one family; restore sees it only after publication."
   :type 'natnum :group 'gptel-agent)
 
 (defcustom gptel-agent-session-time-budget 0.02
@@ -48,16 +51,18 @@ A single large transcript can exceed this budget; it is written atomically."
 (defvar gptel-agent-session--lock nil)
 (defvar gptel-agent-session--restoring nil)
 (defvar gptel-agent-session--closing nil)
+(defvar gptel-agent-session--checkpoint-initialized nil)
 (defvar-local gptel-agent-session--id nil)
 (defvar-local gptel-agent-session--parent-id nil)
 (defvar-local gptel-agent-session--chat nil)
 (defvar-local gptel-agent-session--last-save 0)
+(defvar-local gptel-agent-session--last-attempt 0)
 (defvar-local gptel-agent-session--error nil)
 (defvar-local gptel-agent-session--excluded nil
   "Non-nil when this live chat was explicitly removed from session saving.")
 (defvar-local gptel-agent-session--list-directory nil)
 (dolist (symbol '(gptel-agent-session--id gptel-agent-session--parent-id
-                  gptel-agent-session--chat gptel-agent-session--last-save
+                  gptel-agent-session--chat gptel-agent-session--last-save gptel-agent-session--last-attempt
                   gptel-agent-session--error gptel-agent-session--excluded))
   (put symbol 'permanent-local t))
 
@@ -94,14 +99,25 @@ attachments, hooks, runtime agent snapshots and approval scopes are excluded.")
   (when (and gptel-agent-session-mode gptel-agent-session--id
              (not gptel-agent-session--excluded)
              (not gptel-agent-session--restoring)
-             (not (eq (current-buffer) gptel-agent-session--closing))
-             (not (gethash (current-buffer) gptel-agent-session--dirty)))
+             (not (eq (current-buffer) gptel-agent-session--closing)))
+    (cl-incf gptel-agent-session--revision)
     (puthash (current-buffer) t gptel-agent-session--dirty)
-    (let ((cell (list (current-buffer))))
-      (if gptel-agent-session--queue-tail
-          (setcdr gptel-agent-session--queue-tail cell)
-        (setq gptel-agent-session--queue cell))
-      (setq gptel-agent-session--queue-tail cell))))
+    (gptel-agent-session-checkpoint--enqueue (current-buffer))))
+
+(defun gptel-agent-session--ensure-timer ()
+  "Arm one timer only while changed chats are waiting."
+  (when (and gptel-agent-session-mode gptel-agent-session--queue
+             (not (timerp gptel-agent-session--timer)))
+    (setq gptel-agent-session--timer (run-at-time 1 1 #'gptel-agent-session--tick))))
+
+(defun gptel-agent-session--stop-if-clean ()
+  "Stop the timer and discard stale queue entries when no chats need saving."
+  (when (and (= (hash-table-count gptel-agent-session--dirty) 0)
+             (= (hash-table-count gptel-agent-session--transactions) 0))
+    (when (timerp gptel-agent-session--timer) (cancel-timer gptel-agent-session--timer))
+    (setq gptel-agent-session--timer nil
+          gptel-agent-session--queue nil gptel-agent-session--queue-tail nil)
+    (clrhash gptel-agent-session--queued)))
 
 (defun gptel-agent-session--track (&optional buffer)
   "Register BUFFER (default current) without traversing other chats."
@@ -109,6 +125,12 @@ attachments, hooks, runtime agent snapshots and approval scopes are excluded.")
              (not (eq (or buffer (current-buffer)) gptel-agent-session--closing))
              (gptel-agent-session--eligible-p (or buffer (current-buffer))))
     (with-current-buffer (or buffer (current-buffer))
+      (when-let* ((chat gptel-agent-discussion--self)
+                  (owner (gptel-agent-discussion--chat-owner chat))
+                  ((buffer-live-p owner)) ((not (eq owner (current-buffer)))))
+        (unless (buffer-local-value 'gptel-agent-session--id owner)
+          (gptel-agent-session--track owner))
+        (setq gptel-agent-session--parent-id (buffer-local-value 'gptel-agent-session--id owner)))
       (when-let* ((existing (gethash gptel-agent-session--id gptel-agent-session--buffers))
                   ((buffer-live-p existing)) ((not (eq existing (current-buffer)))))
         (gptel-agent-session--clone))
@@ -122,12 +144,15 @@ attachments, hooks, runtime agent snapshots and approval scopes are excluded.")
       (when (gptel-agent-chat--main-p (current-buffer))
         (gptel-agent-chat--id (current-buffer)))
       (when gptel-agent-discussion--self
-        (setq gptel-agent-session--chat gptel-agent-discussion--self)))))
+        (setq gptel-agent-session--chat gptel-agent-discussion--self))
+      (gptel-agent-session-checkpoint--register (current-buffer)))))
 
 (defun gptel-agent-session--clone ()
   "Give a copied chat independent identity instead of sharing saved ownership."
   (setq gptel-agent-session--id nil gptel-agent-session--parent-id nil
         gptel-agent-session--chat nil gptel-agent-session--last-save 0
+        gptel-agent-session--last-attempt 0
+        gptel-agent-session--revision 0 gptel-agent-session--staged-revision 0
         gptel-agent-session--error nil
         gptel-agent-discussion--self nil gptel-agent-discussion--children nil
         gptel-agent-discussion--fsm nil gptel-agent-discussion--inbox nil
@@ -224,19 +249,22 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
               :main-inbox (gptel-agent-session--data gptel-agent-chat--inbox))))))
 
 (defun gptel-agent-session--file (id)
-  "Return snapshot file for validated ID."
-  (unless (and (stringp id) (string-match-p "\\`[a-f0-9]\\{64\\}\\'" id))
-    (error "Invalid session ID: %S" id))
-  (expand-file-name (concat id ".eld") gptel-agent-session-directory))
+  "Return ID's committed snapshot file, never an incomplete staged version."
+  (gptel-agent-session-store--file gptel-agent-session-directory id))
 
-(defun gptel-agent-session--write (record)
-  "Atomically replace RECORD's snapshot, keeping the old file on failure."
+(defun gptel-agent-session--assert-writer ()
+  "Refuse disk mutations unless this Emacs owns the configured store lock."
   (unless (and gptel-agent-session--lock
                (equal (file-name-directory gptel-agent-session--lock)
                       (file-name-as-directory (expand-file-name gptel-agent-session-directory)))
                (eq t (file-locked-p gptel-agent-session--lock)))
-    (error "Session writer lock is not held"))
-  (let* ((file (gptel-agent-session--file (plist-get record :id)))
+    (error "Session writer lock is not held")))
+
+(defun gptel-agent-session--write (record)
+  "Atomically write RECORD's payload, keeping the old file on failure."
+  (gptel-agent-session--assert-writer)
+  (let* ((file (or gptel-agent-session--write-file
+                   (gptel-agent-session--file (plist-get record :id))))
          (temporary (make-temp-file (expand-file-name ".snapshot-" gptel-agent-session-directory)))
          (coding-system-for-write 'utf-8-emacs)
          (print-length nil) (print-level nil) (print-circle nil)
@@ -259,53 +287,13 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
       (when (file-exists-p temporary) (delete-file temporary)))))
 
 (defun gptel-agent-session--save-buffer (buffer)
-  "Save BUFFER, returning non-nil on success; retain dirty state on errors."
-  (when (gptel-agent-session--eligible-p buffer)
-    (with-current-buffer buffer
-      (condition-case err
-          (progn
-            (gptel-agent-session--write (gptel-agent-session--snapshot))
-            (setq gptel-agent-session--last-save (float-time)
-                  gptel-agent-session--error nil)
-            t)
-        (error
-         (let ((text (error-message-string err)))
-           (unless (equal text gptel-agent-session--error)
-             (message "Session save failed for %s: %s" (buffer-name) text))
-           (setq gptel-agent-session--error text))
-         nil)))))
+  "Stage BUFFER and publish its family only when the checkpoint is complete."
+  (gptel-agent-session-checkpoint--save-buffer buffer))
 
 (defun gptel-agent-session--drain (&optional all)
-  "Drain a fair bounded batch; ALL flushes the initial queue regardless of age.
-Return the number saved.  Failed writes are requeued once per batch."
-  (let* ((started (float-time)) (saved 0) (examined 0)
-         (limit (if all (length gptel-agent-session--queue)
-                  (max 1 gptel-agent-session-batch-size)))
-         ;; Detach this batch, so failures and too-young buffers cannot spin.
-         (pending gptel-agent-session--queue)
-         (pending-tail gptel-agent-session--queue-tail))
-    (setq gptel-agent-session--queue nil gptel-agent-session--queue-tail nil)
-    (while (and pending (< examined limit)
-                (or all (= examined 0)
-                    (< (- (float-time) started) gptel-agent-session-time-budget)))
-      (let ((buffer (pop pending)))
-        (cl-incf examined)
-        (when (gethash buffer gptel-agent-session--dirty)
-          (remhash buffer gptel-agent-session--dirty)
-          (when (gptel-agent-session--eligible-p buffer)
-            (with-current-buffer buffer
-              (if (and (or all (>= (- started gptel-agent-session--last-save)
-                                  gptel-agent-session-save-interval))
-                       (gptel-agent-session--save-buffer buffer))
-                  (cl-incf saved)
-                (gptel-agent-session--mark-dirty)))))))
-    ;; Unexamined buffers go first, preserving fairness under continuous edits.
-    (when pending
-      (setcdr pending-tail gptel-agent-session--queue)
-      (unless gptel-agent-session--queue-tail
-        (setq gptel-agent-session--queue-tail pending-tail))
-      (setq gptel-agent-session--queue pending))
-    saved))
+  "Stage bounded chat versions, atomically publishing complete families.
+ALL finishes each initially queued family without the automatic interval."
+  (gptel-agent-session-checkpoint--drain all))
 
 (defun gptel-agent-session--tick ()
   "Save a small batch only when Emacs has been idle long enough."
@@ -352,17 +340,15 @@ family after deleting its snapshots with `gptel-agent-session-delete'."
                      (equal id (plist-get record :id))
                      (stringp (plist-get record :name)))
           (error "Invalid or unsupported session snapshot %s" id))
+        (when-let* ((entry (gptel-agent-session-store--entry gptel-agent-session-directory id))
+                    ((string-prefix-p "snapshots/" (plist-get entry :file))))
+          (unless (equal (plist-get entry :parent) (plist-get record :parent))
+            (error "Session payload ownership disagrees with its committed family: %s" id)))
         record))))
 
 (defun gptel-agent-session--catalog ()
-  "Read only small snapshot headers, warning about unreadable files."
-  (let (records)
-    (when (file-directory-p gptel-agent-session-directory)
-      (dolist (file (directory-files gptel-agent-session-directory nil "\\`[a-f0-9]\\{64\\}\\.eld\\'"))
-        (condition-case err
-            (push (gptel-agent-session--read (file-name-sans-extension file) t) records)
-          (error (display-warning 'gptel-agent-session (error-message-string err))))))
-    records))
+  "Read committed family headers only; staged versions remain invisible."
+  (gptel-agent-session-store--catalog gptel-agent-session-directory t))
 
 (defun gptel-agent-session--live-catalog ()
   "Return saved headers augmented with live chats, including unsaved children."
@@ -462,9 +448,10 @@ Return the private staging directory; its contents can then be discarded."
         moved)
     (condition-case err
         (progn
-          (dolist (record records)
-            (let* ((file (gptel-agent-session--file (plist-get record :id)))
-                   (target (expand-file-name (file-name-nondirectory file) directory)))
+          (dolist (file (gptel-agent-session-store--files
+                        gptel-agent-session-directory
+                        (mapcar (lambda (record) (plist-get record :id)) records)))
+            (let ((target (expand-file-name (number-to-string (length moved)) directory)))
               (when (file-exists-p file)
                 (rename-file file target)
                 (push (cons file target) moved))))
@@ -512,15 +499,33 @@ with a prefix argument to `gptel-agent-session-save'."
            (unless (equal root (plist-get (car family) :id))
              (user-error "Session ownership changed; select the family again"))
            (dolist (record family) (puthash (plist-get record :id) t ids))
+           ;; Staged members can outlive their buffers before the first family
+           ;; manifest exists.  They must be removed along with the live root.
+           (when-let* ((members (gethash root gptel-agent-session--family-members)))
+             (maphash (lambda (id _)
+                        (unless (gethash id ids)
+                          (puthash id t ids)
+                          (push (list :id id) family))) members))
            (let ((directory (gptel-agent-session--delete-files family)))
+             (maphash (lambda (id _)
+                        (when-let* ((family-root (gethash id gptel-agent-session--member-roots)))
+                          (remhash family-root gptel-agent-session--transactions)
+                          (remhash family-root gptel-agent-session--family-members))
+                        (remhash id gptel-agent-session--member-roots)) ids)
+             (gptel-agent-session-store--forget gptel-agent-session-directory)
              (gptel-agent-session--exclude-descendants
               (cl-remove-if-not (lambda (buffer)
                                   (gethash (buffer-local-value 'gptel-agent-session--id buffer) ids))
                                 (buffer-list)))
              (setq gptel-agent-session--queue
-                   (cl-delete-if (lambda (buffer) (not (gethash buffer gptel-agent-session--dirty)))
+                   (cl-delete-if (lambda (item)
+                                   (if (bufferp item)
+                                       (not (gethash item gptel-agent-session--dirty))
+                                     (not (gethash item gptel-agent-session--transactions))))
                                  gptel-agent-session--queue)
                    gptel-agent-session--queue-tail (last gptel-agent-session--queue))
+             (clrhash gptel-agent-session--queued)
+             (dolist (item gptel-agent-session--queue) (puthash item t gptel-agent-session--queued))
              (condition-case err (delete-directory directory t)
                (error (display-warning 'gptel-agent-session
                                        (format "Session removed; could not erase staged files in %s: %s"
@@ -693,7 +698,8 @@ approval callbacks cannot survive a restart and are never replayed."
               (unless (buffer-live-p (gethash key gptel-agent-session--buffers))
                 (let ((buffer (gptel-agent-session--restore-buffer record)))
                   (push buffer created)
-                  (puthash key buffer gptel-agent-session--buffers)))))
+                  (puthash key buffer gptel-agent-session--buffers)
+                  (gptel-agent-session-checkpoint--register buffer)))))
           (dolist (record records)
             (with-current-buffer (gethash (plist-get record :id) gptel-agent-session--buffers)
               (when-let* ((chat gptel-agent-session--chat)
@@ -732,7 +738,7 @@ approval callbacks cannot survive a restart and are never replayed."
   (gptel-agent-session--track)
   (gptel-agent-session--mark-dirty))
 
-(defun gptel-agent-session--chat-changed (chat &rest _)
+(defun gptel-agent-session--chat-changed (chat &optional kind &rest _)
   "Record changes to CHAT, including a closed chat with no `--self'."
   (when (and gptel-agent-session-mode (not gptel-agent-session--restoring)
              (not gptel-agent-session--closing)
@@ -748,9 +754,33 @@ approval callbacks cannot survive a restart and are never replayed."
                  (buffer-local-value 'gptel-agent-session--excluded (gptel-agent-discussion--chat-owner chat)))
         (gptel-agent-session--exclude))
       (gptel-agent-session--changed))
-    (when (buffer-live-p (gptel-agent-discussion--chat-owner chat))
+    ;; Ownership lives in the child's snapshot.  Only a report changes the
+    ;; parent's durable inbox; status notices must not rewrite its transcript.
+    (when (and (eq kind 'report) (buffer-live-p (gptel-agent-discussion--chat-owner chat)))
       (with-current-buffer (gptel-agent-discussion--chat-owner chat)
         (gptel-agent-session--changed)))))
+
+(defun gptel-agent-session--taken (event)
+  "Record consumption of EVENT, leaving an empty inbox read clean."
+  (when event (gptel-agent-session--changed))
+  event)
+
+(defun gptel-agent-session--inject (original fsm variable)
+  "Call ORIGINAL on FSM, recording a change only if inbox VARIABLE changed."
+  (let* ((buffer (plist-get (gptel-fsm-info fsm) :buffer))
+         (before (and (buffer-live-p buffer) (buffer-local-value variable buffer))))
+    (prog1 (funcall original fsm)
+      (when (and (buffer-live-p buffer)
+                 (not (eq before (buffer-local-value variable buffer))))
+        (gptel-agent-session--request-changed fsm)))))
+
+(defun gptel-agent-session--inject-discussion (original fsm)
+  "Record actual discussion inbox consumption by ORIGINAL for FSM."
+  (gptel-agent-session--inject original fsm 'gptel-agent-discussion--inbox))
+
+(defun gptel-agent-session--inject-peer (original fsm)
+  "Record actual main-chat inbox consumption by ORIGINAL for FSM."
+  (gptel-agent-session--inject original fsm 'gptel-agent-chat--inbox))
 
 (defun gptel-agent-session--created (chat)
   "Attach a newly created CHAT to its durable family."
@@ -772,16 +802,19 @@ approval callbacks cannot survive a restart and are never replayed."
                  (with-current-buffer buffer (gptel-agent-session--mark-dirty))))
              gptel-agent-session--buffers)))
 
-(defun gptel-agent-session--setting-changed (_symbol _value operation where)
+(defun gptel-agent-session--setting-changed (symbol value operation where)
   "Queue settings changes in WHERE after a non-dynamic OPERATION."
   (when (and gptel-agent-session-mode (not gptel-agent-session--restoring)
              (memq operation '(set makunbound)))
     (if (bufferp where)
-        (with-current-buffer where (gptel-agent-session--mark-dirty))
-      (maphash (lambda (_ buffer)
-                 (when (buffer-live-p buffer)
-                   (with-current-buffer buffer (gptel-agent-session--mark-dirty))))
-               gptel-agent-session--buffers))))
+        (with-current-buffer where
+          (unless (and (eq operation 'set) (boundp symbol) (eq value (symbol-value symbol)))
+            (gptel-agent-session--mark-dirty)))
+      (unless (and (eq operation 'set) (default-boundp symbol) (eq value (default-value symbol)))
+        (maphash (lambda (_ buffer)
+                   (when (and (buffer-live-p buffer) (not (local-variable-p symbol buffer)))
+                     (with-current-buffer buffer (gptel-agent-session--mark-dirty))))
+                 gptel-agent-session--buffers)))))
 
 (defun gptel-agent-session--before-kill ()
   "Save before local kill hooks clear ownership and inboxes."
@@ -789,14 +822,16 @@ approval callbacks cannot survive a restart and are never replayed."
              gptel-agent-session--id (gptel-agent-session--eligible-p (current-buffer)))
     (unless (gptel-agent-session--save-buffer (current-buffer))
       (user-error "Chat could not be saved; retry or disable session mode before killing it"))
-    (remhash (current-buffer) gptel-agent-session--dirty))
+    (remhash (current-buffer) gptel-agent-session--dirty)
+    (gptel-agent-session--stop-if-clean))
   t)
 
 (defun gptel-agent-session--unregister ()
   "Release references only after kill queries have agreed to close this chat."
   (remhash (current-buffer) gptel-agent-session--dirty)
   (when gptel-agent-session--id
-    (remhash gptel-agent-session--id gptel-agent-session--buffers)))
+    (remhash gptel-agent-session--id gptel-agent-session--buffers))
+  (gptel-agent-session--stop-if-clean))
 
 (defun gptel-agent-session--kill-discussion (original &rest args)
   "Suppress teardown-only dirty notifications while ORIGINAL handles ARGS."
@@ -805,23 +840,25 @@ approval callbacks cannot survive a restart and are never replayed."
 
 (defconst gptel-agent-session--advice
   '((rename-buffer :after gptel-agent-session--changed)
+    (gptel-send :after gptel-agent-session--changed)
     (gptel-agent-discussion--create :filter-return gptel-agent-session--created)
     (gptel-agent-discussion--emit :after gptel-agent-session--chat-changed)
     (gptel-agent-discussion--send :after gptel-agent-session--chat-changed)
     (gptel-agent-discussion--close :after gptel-agent-session--chat-changed)
     (gptel-agent-discussion--cleanup-worktree :after gptel-agent-session--chat-changed)
-    (gptel-agent-discussion--take :after gptel-agent-session--changed)
-    (gptel-agent-discussion--inject :after gptel-agent-session--request-changed)
+    (gptel-agent-discussion--take :filter-return gptel-agent-session--taken)
+    (gptel-agent-discussion--inject :around gptel-agent-session--inject-discussion)
     (gptel-agent-discussion--terminal :after gptel-agent-session--request-changed)
     (gptel-agent-chat--send :after gptel-agent-session--peer-changed)
-    (gptel-agent-chat--inject :after gptel-agent-session--request-changed)
+    (gptel-agent-chat--inject :around gptel-agent-session--inject-peer)
     (gptel-agent-discussion--kill :around gptel-agent-session--kill-discussion)))
 
 (defun gptel-agent-session--shutdown ()
   "Flush changed chats before normal shutdown and release the writer lock."
   (when gptel-agent-session-mode
     (gptel-agent-session--drain t)
-    (when (> (hash-table-count gptel-agent-session--dirty) 0)
+    (when (or (> (hash-table-count gptel-agent-session--dirty) 0)
+              (> (hash-table-count gptel-agent-session--transactions) 0))
       (display-warning 'gptel-agent-session "Some chats could not be saved during shutdown"))
     (when gptel-agent-session--lock (unlock-file gptel-agent-session--lock))))
 
@@ -838,6 +875,10 @@ family on demand; enabling this mode never opens archives or starts requests."
               (user-error "Session storage must be local"))
             (setq gptel-agent-session-directory
                   (file-name-as-directory (expand-file-name gptel-agent-session-directory)))
+            (when (and gptel-agent-session--lock
+                       (not (equal (file-name-directory gptel-agent-session--lock)
+                                   gptel-agent-session-directory)))
+              (user-error "Disable session mode before changing its storage directory"))
             (make-directory gptel-agent-session-directory t)
             (set-file-modes gptel-agent-session-directory #o700)
             (let* ((file (expand-file-name ".writer" gptel-agent-session-directory))
@@ -848,6 +889,10 @@ family on demand; enabling this mode never opens archives or starts requests."
               (unless (eq t (file-locked-p file))
                 (error "Could not acquire session writer lock"))
               (setq gptel-agent-session--lock file))
+            (unless gptel-agent-session--checkpoint-initialized
+              (gptel-agent-session-checkpoint--load)
+              (gptel-agent-session-store--prune gptel-agent-session-directory)
+              (setq gptel-agent-session--checkpoint-initialized t))
             (dolist (entry gptel-agent-session--advice)
               (advice-add (nth 0 entry) (nth 1 entry) (nth 2 entry)))
             (dolist (symbol (append gptel-agent-session--settings '(gptel-backend gptel-tools default-directory)))
@@ -858,12 +903,11 @@ family on demand; enabling this mode never opens archives or starts requests."
             (add-hook 'kill-buffer-hook #'gptel-agent-session--unregister t)
             (add-hook 'kill-emacs-hook #'gptel-agent-session--shutdown)
             (gptel-agent-session--track-all)
-            (unless (timerp gptel-agent-session--timer)
-              (setq gptel-agent-session--timer
-                    (run-at-time 1 1 #'gptel-agent-session--tick))))
+            (gptel-agent-session--ensure-timer))
         (error (gptel-agent-session-mode -1) (signal (car err) (cdr err))))
     (let ((gptel-agent-session-mode t)) (gptel-agent-session--drain t))
-    (when (> (hash-table-count gptel-agent-session--dirty) 0)
+    (when (or (> (hash-table-count gptel-agent-session--dirty) 0)
+              (> (hash-table-count gptel-agent-session--transactions) 0))
       (display-warning 'gptel-agent-session "Session mode disabled with unsaved chats; previous snapshots retained"))
     (when (timerp gptel-agent-session--timer) (cancel-timer gptel-agent-session--timer))
     (setq gptel-agent-session--timer nil)
@@ -883,6 +927,8 @@ family on demand; enabling this mode never opens archives or starts requests."
     (clrhash gptel-agent-session--buffers)
     (clrhash gptel-agent-session--dirty)
     (setq gptel-agent-session--queue nil gptel-agent-session--queue-tail nil)
+    (gptel-agent-session-checkpoint--reset)
+    (setq gptel-agent-session--checkpoint-initialized nil)
     (when gptel-agent-session--lock (unlock-file gptel-agent-session--lock))
     (setq gptel-agent-session--lock nil)))
 

@@ -4,6 +4,17 @@
 
 ** New features and UI changes
 
+- Session saves now stage immutable chat versions and atomically publish a
+  complete family manifest. Interrupted batches retain the previous complete
+  checkpoint; new children join before publication, unchanged versions are
+  reused, and missing members never trigger partial restore or automatic
+  respawning. Existing flat archives migrate on their next family save.
+
+- Session autosaving now stops its timer when the save queue is empty, avoids
+  dirtying unchanged parents on child status events or empty inbox reads, and
+  ignores unchanged setting assignments. Failed writes respect the save
+  interval before retrying automatically.
+
 - ~gptel-agent-sessions~ lists saved discussion families with chat counts,
   open buffers and save times. ~RET~ restores, ~d~ deletes a whole family
   after confirmation, and ~g~ refreshes. Deleting snapshots keeps live chats

@@ -865,9 +865,10 @@ new Git worktree from that directory and start the chat in its root."
                         (copy-sequence gptel-prompt-transform-functions))
             (add-hook 'gptel-prompt-transform-functions
                       #'gptel-agent-discussion--localize t t)
-            (gptel-mode 1)
             (setq-local gptel-agent-discussion--self chat
-                        gptel-agent--child-chat-p t
+                        gptel-agent--child-chat-p t)
+            (gptel-mode 1)
+            (setq-local
                         ;; Strip parent-only closures even if a custom preset
                         ;; replaces the normal prompt transforms.
                         gptel-tools (cl-remove "MainChat" gptel-tools

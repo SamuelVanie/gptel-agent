@@ -951,9 +951,17 @@ Add this after loading =gptel-agent= in your init file:
 
 The mode saves ordinary main chats and the discussions they create, including
 nested discussions. Temporary =Agent= worker buffers and file-review asides
-are excluded. Each chat has its own snapshot and a persistent parent ID, so a
+are excluded. Each chat has its own immutable snapshot and a persistent parent ID, so a
 restored main chat can list, read and message its existing discussions and
 create new ones. The child buffers remain ordinary editable gptel chats.
+
+Each family also has a small checkpoint manifest naming every member's saved
+version. Changed chats are written in small batches, and the manifest is
+replaced atomically only after every required version is ready. Until then,
+restore and the session browser use the previous complete family. A family's
+first save stays hidden until it is complete. Unchanged members reuse their
+existing versions; four chats per batch does not mean restoring only four
+members of a larger family.
 
 Run =M-x gptel-agent-session-restore= and choose a saved main chat to reopen its
 discussion family. Only that family is loaded; existing live buffers are
@@ -990,30 +998,50 @@ and tools must be registered in the new Emacs session; backend credentials
 are obtained from your normal configuration. A snapshot preserves worktree
 metadata, not a copy of the worktree's files.
 
+A checkpoint guarantees complete family membership and atomic publication,
+not a simultaneous snapshot of all running chats: buffers are captured across
+batches, and later edits remain queued for the next checkpoint. New children
+join an in-progress checkpoint before publication. This does not guarantee
+exactly-once message delivery or roll back external tool effects. Missing
+children are never silently respawned, since a new conversation cannot recover
+their history or safely infer which work was already done. A missing or corrupt
+member of a committed checkpoint makes restoration fail before opening a
+partial family.
+
 Saving is incremental: edits and metadata changes queue a chat once, without
-scanning its transcript on every keystroke. One timer checks the queue each
-second and processes a small batch while Emacs is idle. Defaults are:
+scanning its transcript on every keystroke. While changes are queued, one timer
+checks each second and processes a small batch while Emacs is idle. When the
+queue becomes empty, the timer stops until another change arrives. Defaults are:
 
 | Option | Default | Purpose |
 |--------+---------+---------|
 | =gptel-agent-session-idle-delay= | 5 seconds | Wait for user inactivity before autosaving |
 | =gptel-agent-session-save-interval= | 30 seconds | Minimum interval between automatic saves of one chat |
-| =gptel-agent-session-batch-size= | 4 | Maximum dirty chats considered per batch |
+| =gptel-agent-session-batch-size= | 4 | Maximum chat snapshots staged per batch |
 | =gptel-agent-session-time-budget= | 0.02 seconds | Soft time budget for a batch |
 
 Continuous streaming does not reset the save interval. Unchanged chats are
 not rewritten, and the saver does not rewrite a global transcript collection.
+Child status notifications and empty inbox checks do not trigger parent saves.
+Failed writes wait the save interval before retrying automatically.
 The time budget is soft because a single large transcript must finish its
-atomic write. Manual saving, killing a chat and normal Emacs shutdown bypass
-the autosave interval. Changes since the last completed snapshot can still be
-lost after a crash or forced shutdown.
+atomic write; publication also processes the family's small manifest. Manual
+saving and normal Emacs shutdown flush pending families without the autosave
+interval. Killing a chat stages its final contents and keeps its place in the
+family, even if other members still await saving. Changes after the last
+complete checkpoint can be lost after a crash or forced shutdown; incomplete
+staging never replaces that checkpoint.
 
 =gptel-agent-session-directory= defaults to =gptel-agent/sessions/= beneath
 =user-emacs-directory=. Storage is local, with private directory/file
 permissions and a single writer lock; use separate directories for concurrent
-Emacs instances. Snapshots are replaced atomically and retained until deleted.
+Emacs instances. Committed families remain until deleted; superseded versions
+are cleaned after publication and abandoned staging is cleaned on startup.
 They are session data files, separate from any transcript files saved with
 =save-buffer=. Disable session mode before changing the storage directory.
+Older flat snapshot files remain readable and migrate on the next family save.
+Migration preserves their known members; it cannot reconstruct children that
+were never saved by the older format.
 
 *** Using sub-agents
 
