@@ -109,11 +109,19 @@ The planner records those decisions and their rationale without asking again.
 
 The final plan is a standalone implementation handoff with exact paths and
 interfaces, interactions and state ownership, ordered changes, and concrete
-acceptance checks. A design with unanswered questions or missing evidence is
-labeled a draft. The implementation agent is instructed to follow settled
-decisions and resolve new conflicts or missing contracts with you before making
-dependent edits. These are prompt instructions, not a runtime enforcement of
-plan completeness or conformance.
+acceptance checks. It includes pseudocode for each part with new or changed
+logic, tied to exact files and functions, covering branches, collaborator calls,
+state changes, and relevant errors and cleanup. Planned tests include setup,
+action, and assertions; declarative changes specify structures or values.
+You can review this logic before agreeing to the design. The implementer uses
+idiomatic project code and checks it against the agreed pseudocode, reporting
+any agreed material deviations and their reasons.
+
+A design with unanswered questions or missing evidence is labeled a draft.
+The implementation agent is instructed to follow settled decisions and resolve
+new conflicts or missing contracts with you before making dependent edits.
+These are prompt instructions, not a runtime enforcement of plan completeness
+or conformance.
 
 **** Anywhere in Emacs
 
