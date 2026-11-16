@@ -672,6 +672,51 @@
      (should-not (string-match-p "Completed silently"
                                  (gptel-agent-workers-test--data fsm))))))
 
+(defun gptel-agent-discussion-test--kill-large-answer (chat weak-data close-first)
+  "Finish CHAT with large data, weakly track it in WEAK-DATA, and kill it.
+CLOSE-FIRST closes monitoring while the editable transcript is still live."
+  (let ((child (gptel-agent-discussion--chat-buffer chat))
+        (request (gptel-agent-discussion--chat-fsm chat)))
+    (gptel-agent-workers-test--answer request (make-string 1000000 ?x))
+    (puthash request 'request weak-data)
+    (puthash (gptel-agent-discussion--chat-result chat) 'answer weak-data)
+    (when close-first
+      (gptel-agent-discussion--close chat)
+      (should (buffer-live-p child))
+      (should-not (buffer-local-value 'gptel-agent-discussion--self child))
+      (should (string-match-p "xxxxxxxxxx" (gptel-agent-discussion--read chat 0))))
+    (kill-buffer child)))
+
+(ert-deftest gptel-agent-discussion-killed-chat-releases-request-and-full-answer ()
+  (dolist (close-first '(nil t))
+    (ert-info ((format "Close before kill: %s" close-first))
+      (gptel-agent-discussion-test--with-chat
+       (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+       (let ((weak-data (make-hash-table :test #'eq :weakness 'key))
+             (id (gptel-agent-discussion--chat-id chat))
+             (title (gptel-agent-discussion--chat-title chat))
+             (turn (gptel-agent-discussion--chat-turn chat)))
+         (gptel-agent-discussion-test--kill-large-answer chat weak-data close-first)
+         ;; Drop the mocked transport's request log before checking reachability.
+         (setq requests nil)
+         (garbage-collect)
+         (should (= 0 (hash-table-count weak-data)))
+         ;; The parent's registry keeps only the metadata needed for management.
+         (should (eq chat (car (buffer-local-value 'gptel-agent-discussion--children parent))))
+         (should (eq (gptel-agent-discussion--chat-owner chat) parent))
+         (should (equal (gptel-agent-discussion--chat-id chat) id))
+         (should (equal (gptel-agent-discussion--chat-title chat) title))
+         (should (= (gptel-agent-discussion--chat-turn chat) turn))
+         (should (eq (gptel-agent-discussion--chat-state chat) 'closed))
+         (should-not (gptel-agent-discussion--chat-fsm chat))
+         (should-not (gptel-agent-discussion--chat-result chat))
+         (should (string-match-p (regexp-quote id)
+                                 (gptel-agent-discussion-test--control fsm "list")))
+         (should (string-match-p "buffer: (killed)"
+                                 (gptel-agent-discussion-test--control fsm "read" chat)))
+         (should (string-prefix-p "Error:"
+                                  (gptel-agent-discussion-test--control fsm "send" chat "Too late"))))))))
+
 (ert-deftest gptel-agent-discussion-killed-owner-detaches-child ()
   (gptel-agent-discussion-test--with-chat
    (setq chat (gptel-agent-discussion-test--spawn fsm parent))

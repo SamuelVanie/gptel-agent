@@ -1058,7 +1058,7 @@ SOURCE is `user' for direct user steering; otherwise it is the manager."
     interaction))
 
 (defun gptel-agent-discussion--close (chat)
-  "Stop monitoring CHAT, abort its current turn, and retain its editable buffer."
+  "Stop monitoring CHAT, release its request, and retain its editable buffer."
   (unless (eq (gptel-agent-discussion--chat-state chat) 'closed)
     ;; Invalidate attention before aborting so old UI callbacks cannot restart it.
     (setf (gptel-agent-discussion--chat-state chat) 'closed)
@@ -1082,6 +1082,11 @@ SOURCE is `user' for direct user steering; otherwise it is the manager."
         (when (cl-some #'gptel-agent-discussion--wait-closed-p
                        gptel-agent-discussion--waiters)
           (gptel-agent-discussion--schedule owner)))))
+  ;; The owner's registry retains CHAT for listing and worktree management.
+  ;; Release request data here: closing clears --self, so a later buffer kill
+  ;; cannot find CHAT.  A live buffer still owns its editable transcript.
+  (setf (gptel-agent-discussion--chat-fsm chat) nil
+        (gptel-agent-discussion--chat-result chat) nil)
   (gptel-agent-discussion--status chat))
 
 (defun gptel-agent-discussion--wait (callback fsm ids)
