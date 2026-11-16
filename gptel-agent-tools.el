@@ -2585,7 +2585,8 @@ steers current work without creating a run or resetting supervision budgets."
   "Finish RUN exactly once in terminal STATE with RESULT.
 
 REASON is retained for diagnostics.  When SUPPRESS-DELIVERY is non-nil, do
-not send RESULT to the parent tool callback."
+not send RESULT to the parent tool callback.  Release request-local parent
+references after delivery or enqueueing, preserving the worker session."
   (when (gptel-agent--run-active-p run)
     (setf (gptel-agent--run-state run) state
           (gptel-agent--run-terminal-reason run) reason
@@ -2628,26 +2629,32 @@ not send RESULT to the parent tool callback."
       (when (buffer-live-p (gptel-agent--run-child-buffer run))
         (let ((gptel-agent--disposing-run-buffer run))
           (kill-buffer (gptel-agent--run-child-buffer run)))))
-    (when (and (not suppress-delivery)
-               (buffer-live-p (gptel-agent--run-parent-buffer run)))
-      ;; Async tool callbacks can arrive from a Curl/process buffer.  Resume
-      ;; the parent FSM in its own buffer so its buffer-local gptel settings
-      ;; cannot be taken from an unrelated concurrent request.
-      (with-current-buffer (gptel-agent--run-parent-buffer run)
-        (condition-case err
-            (if (gptel-agent--run-background run)
-                (gptel-agent--workers-enqueue run)
-              (setf (gptel-agent--run-delivered run) t)
-              (funcall
-               (gptel-agent--run-callback run)
-               (if-let* ((session (gptel-agent--run-session run))
-                         ((gptel-agent--session-resumable session)))
-                   (format "agent_id: %s\nUse Agent with this agent_id for related follow-up tasks.\n\n%s"
-                           (gptel-agent--session-id session) result)
-                 result)))
-          (error
-           (message "gptel-agent: parent callback for run %s failed: %S"
-                    (gptel-agent--run-id run) err)))))
+    (unwind-protect
+        (when (and (not suppress-delivery)
+                   (buffer-live-p (gptel-agent--run-parent-buffer run)))
+          ;; Async tool callbacks can arrive from a Curl/process buffer.  Resume
+          ;; the parent FSM in its own buffer so its buffer-local gptel settings
+          ;; cannot be taken from an unrelated concurrent request.
+          (with-current-buffer (gptel-agent--run-parent-buffer run)
+            (condition-case err
+                (if (gptel-agent--run-background run)
+                    (gptel-agent--workers-enqueue run)
+                  (setf (gptel-agent--run-delivered run) t)
+                  (funcall
+                   (gptel-agent--run-callback run)
+                   (if-let* ((session (gptel-agent--run-session run))
+                             ((gptel-agent--session-resumable session)))
+                       (format "agent_id: %s\nUse Agent with this agent_id for related follow-up tasks.\n\n%s"
+                               (gptel-agent--session-id session) result)
+                     result)))
+              (error
+               (message "gptel-agent: parent callback for run %s failed: %S"
+                        (gptel-agent--run-id run) err)))))
+      ;; Retained sessions and inspection overlays keep terminal runs alive.
+      ;; Delivery needs these references, but retaining them afterward also
+      ;; retains the parent request's unrelated conversation and tool state.
+      (setf (gptel-agent--run-parent-fsm run) nil
+            (gptel-agent--run-callback run) nil))
     t))
 
 (defun gptel-agent--cancel-runs-for-buffer (parent-buffer)
