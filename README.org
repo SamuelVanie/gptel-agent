@@ -935,6 +935,9 @@ pages are bounded by =gptel-agent-discussion-report-limit= (16000 characters by
 default). Ownership lasts across turns, but a different conversation cannot
 manage these IDs.
 Completing a turn without reporting does not satisfy =wait=; it can time out.
+Closing or killing a selected discussion ends a pending =wait= with
+=no_eligible_work= when none of the selected discussions is still active.
+Reports already queued are delivered first.
 
 Run =M-x gptel-agent-discussions= in the parent or a managed discussion to open
 the list. =RET= opens a chat, =s= sends a message, =c= closes monitoring, and =g=
@@ -942,6 +945,9 @@ refreshes. In a child buffer, use =gptel-send= normally for a new turn. During a
 active turn, use =M-x gptel-agent-discussion-send= to queue steering; it is
 delivered after pending tools finish, or as a follow-up if the response finishes
 first. Concurrent requests in the same monitored buffer are prevented.
+To stop a stuck request in the original chat, run =M-x gptel-abort= there, then
+send again. Errors or cancellation while preparing a new request release its
+send guard automatically, preserving your draft for retry.
 
 The parent can answer structured questions itself. Tool approvals stay in the
 child discussion buffer, where the user can approve or reject them with gptel's
@@ -961,7 +967,7 @@ Automatic sending waits when you have an unsent draft. Send that draft with
 automatic delivery without stopping its discussions. A new manual send or
 =gptel-agent-discussion-resume= re-enables delivery. Killing the parent detaches
 its discussions, which remain usable; killing a child marks it closed without
-waking the parent. =close= retains the transcript and stops only that discussion's
+waking an idle parent. =close= retains the transcript and stops only that discussion's
 current request (including its ordinary Agent workers).
 
 Enable the session system below to retain management IDs, ownership and event

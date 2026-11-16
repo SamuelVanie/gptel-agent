@@ -270,10 +270,13 @@ and can be inspected with DiscussionControl read without waking the owner."
         (cancel-timer gptel-agent-discussion--timer))
       (setq gptel-agent-discussion--timer nil)
       (dolist (waiter (copy-sequence gptel-agent-discussion--waiters))
-        (when-let* (((gptel-agent-discussion--active-p (nth 0 waiter)))
-                    (event (gptel-agent-discussion--take (nth 1 waiter))))
-          (gptel-agent-discussion--finish-waiter
-           waiter (gptel-agent-discussion--event-text event))))
+        (when (gptel-agent-discussion--active-p (nth 0 waiter))
+          (if-let* ((event (gptel-agent-discussion--take (nth 1 waiter))))
+              (gptel-agent-discussion--finish-waiter
+               waiter (gptel-agent-discussion--event-text event))
+            (when (gptel-agent-discussion--wait-closed-p waiter)
+              (gptel-agent-discussion--finish-waiter
+               waiter "status: no_eligible_work\nA selected discussion was closed; no selected discussion has active work.")))))
       (when gptel-agent-discussion--inbox
         (cond
          ((gptel-agent-discussion--active-p gptel-agent-discussion--fsm)
@@ -326,7 +329,7 @@ and can be inspected with DiscussionControl read without waking the owner."
         (with-current-buffer buffer
           (when (and (gptel-agent-discussion--active-p gptel-agent-discussion--fsm)
                      (not (eq fsm gptel-agent-discussion--fsm)))
-            (user-error "Discussion is running; use gptel-agent-discussion-send to steer it"))
+            (gptel-agent-discussion--send-error))
           (setq gptel-agent-discussion--fsm fsm
                 gptel-agent-discussion--paused nil)
           (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
@@ -403,11 +406,46 @@ and can be inspected with DiscussionControl read without waking the owner."
                 (lambda (message) (gptel-agent-discussion--report chat fsm message)))
           (push tool gptel-tools))))))
 
+(defun gptel-agent-discussion--send-error ()
+  "Explain how to recover or steer this buffer's active request."
+  (if gptel-agent-discussion--self
+      (user-error "Discussion is running; use M-x gptel-agent-discussion-send to steer, or M-x gptel-abort first")
+    (user-error "Chat request is still running; use M-x gptel-abort in this buffer, then send again")))
+
+(defun gptel-agent-discussion--guard-request (original &rest args)
+  "Release newly monitored requests when ORIGINAL fails during startup.
+ARGS are the arguments to `gptel-request'.  An older active request must
+survive a rejected concurrent send."
+  (let* ((buffer (or (plist-get (cdr args) :buffer) (current-buffer)))
+         (previous (and (buffer-live-p buffer)
+                        (buffer-local-value 'gptel-agent-discussion--fsm buffer))))
+    (condition-case err
+        (apply original args)
+      ((error quit)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (let ((fsm gptel-agent-discussion--fsm))
+             (when (and (not (eq fsm previous))
+                        (gptel-agent-discussion--active-p fsm))
+               (let* ((info (gptel-fsm-info fsm))
+                      (data (plist-get info :data)))
+                 ;; Before realization, :data is a temporary prompt buffer.
+                 ;; Terminal handlers expect a payload plist instead.
+                 (setf (gptel-fsm-info fsm)
+                       (plist-put info :error (error-message-string err)))
+                 (with-demoted-errors "Discussion startup cleanup failed: %S"
+                   (unwind-protect
+                       (when (bufferp data)
+                         (setf (plist-get info :data) nil)
+                         (when (buffer-live-p data) (kill-buffer data)))
+                     (gptel--fsm-transition fsm (if (eq (car err) 'quit) 'ABRT 'ERRS)))))))))
+       (signal (car err) (cdr err))))))
+
 (defun gptel-agent-discussion--guard-send (original &optional arg)
   "Protect monitored buffers from concurrent `gptel-send' through ORIGINAL.
 Prefix ARG still opens the normal gptel menu."
   (if (and (not arg) (gptel-agent-discussion--active-p gptel-agent-discussion--fsm))
-      (user-error "Discussion is running; use M-x gptel-agent-discussion-send to steer, or abort first")
+      (gptel-agent-discussion--send-error)
     (funcall original arg)))
 
 (defun gptel-agent-discussion--finish-waiter (waiter text)
@@ -416,6 +454,21 @@ Prefix ARG still opens the normal gptel menu."
   (when (timerp (nth 3 waiter)) (cancel-timer (nth 3 waiter)))
   (when (gptel-agent-discussion--active-p (car waiter))
     (funcall (nth 2 waiter) text)))
+
+(defun gptel-agent-discussion--wait-closed-p (waiter)
+  "Whether a closure left WAITER without any active selected discussion."
+  (let (closed active)
+    (dolist (id (nth 1 waiter))
+      (let ((chat (cl-find id gptel-agent-discussion--children
+                           :key #'gptel-agent-discussion--chat-id :test #'equal)))
+        (cond
+         ((or (null chat)
+              (eq (gptel-agent-discussion--chat-state chat) 'closed)
+              (not (buffer-live-p (gptel-agent-discussion--chat-buffer chat))))
+          (setq closed t))
+         ((gptel-agent-discussion--live-p chat (gptel-agent-discussion--chat-fsm chat))
+          (setq active t)))))
+    (and closed (not active))))
 
 (defun gptel-agent-discussion--clear-waiters (fsm)
   "Invalidate waiters owned by FSM, or all waiters when FSM is nil."
@@ -1020,7 +1073,15 @@ SOURCE is `user' for direct user steering; otherwise it is the manager."
         (when (timerp gptel-agent-discussion--timer)
           (cancel-timer gptel-agent-discussion--timer))
         (setq gptel-agent-discussion--timer nil)))
-    (gptel-agent-discussion--emit chat 'closed "Discussion closed. Its transcript remains an ordinary editable gptel buffer."))
+    (gptel-agent-discussion--emit chat 'closed "Discussion closed. Its transcript remains an ordinary editable gptel buffer.")
+    ;; A close is not a report, but it can make an existing wait impossible.
+    ;; Deliver after close/kill hooks unwind, without waking an idle owner.
+    (when-let* ((owner (gptel-agent-discussion--chat-owner chat))
+                ((buffer-live-p owner)))
+      (with-current-buffer owner
+        (when (cl-some #'gptel-agent-discussion--wait-closed-p
+                       gptel-agent-discussion--waiters)
+          (gptel-agent-discussion--schedule owner)))))
   (gptel-agent-discussion--status chat))
 
 (defun gptel-agent-discussion--wait (callback fsm ids)
@@ -1232,6 +1293,7 @@ If a draft remains, send it explicitly with `gptel-send' instead."
 
 (add-hook 'gptel-prompt-transform-functions #'gptel-agent-discussion--localize t)
 (add-hook 'gptel-agent-question-functions #'gptel-agent-discussion--question)
+(advice-add 'gptel-request :around #'gptel-agent-discussion--guard-request)
 (advice-add 'gptel-send :around #'gptel-agent-discussion--guard-send)
 (advice-add 'gptel--accept-tool-calls :around #'gptel-agent-discussion--guard-approval)
 (advice-add 'gptel--reject-tool-calls :around #'gptel-agent-discussion--cancel-approval)

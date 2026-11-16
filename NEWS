@@ -4,6 +4,11 @@
 
 ** New features and UI changes
 
+- Failed or cancelled request preparation no longer leaves discussion-enabled
+  chats blocked from sending. Closing the last active discussion selected by a
+  pending wait now releases the wait, and a busy parent chat points to ~gptel-abort~
+  for recovery instead of the child-only steering command.
+
 - Tool continuations now retain the assistant's narration before a tool call,
   including with streaming and immediate nonblocking acknowledgements. This
   repairs missing text in OpenAI, Responses and Anthropic request histories

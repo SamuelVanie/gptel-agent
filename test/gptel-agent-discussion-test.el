@@ -77,6 +77,115 @@
   "Return BUFFER's visible transcript."
   (with-current-buffer buffer (buffer-substring-no-properties (point-min) (point-max))))
 
+(ert-deftest gptel-agent-discussion-startup-failure-releases-owner ()
+  (dolist (entrypoint '(send request))
+    (dolist (failure '(error quit))
+      (ert-info ((format "Entrypoint: %s, failure: %s" entrypoint failure))
+        (gptel-agent-discussion-test--with-chat
+         (gptel-agent-workers-test--answer fsm "Initial request finished")
+         (with-current-buffer parent
+           (goto-char (point-max))
+           (insert "Retry this user draft")
+           (let* ((transforms gptel-prompt-transform-functions)
+                  (count (length requests))
+                  failed-fsm
+                  (fail-transform
+                   (lambda (request)
+                     (setq failed-fsm request)
+                     (signal failure '("Prompt transform failed")))))
+             (setq-local gptel-prompt-transform-functions
+                         (append transforms (list fail-transform)))
+             (should
+              (equal
+               (condition-case err
+                   (if (eq entrypoint 'send)
+                       (gptel-send)
+                     (gptel-request nil
+                       :fsm (gptel-make-fsm :table gptel-send--transitions
+                                            :handlers gptel-send--handlers)
+                       :transforms gptel-prompt-transform-functions))
+                 ((error quit) err))
+               (list failure "Prompt transform failed")))
+             (should (gptel-fsm-p failed-fsm))
+             (should-not (gptel-agent-discussion--active-p failed-fsm))
+             (should (eq (gptel-fsm-state failed-fsm)
+                         (if (eq failure 'quit) 'ABRT 'ERRS)))
+             (should gptel-agent-discussion--paused)
+             (should-not gptel-agent--worker-requests)
+             (should (= count (length requests)))
+             (should (string-match-p "Retry this user draft" (buffer-string)))
+             (setq-local gptel-prompt-transform-functions transforms)
+             (gptel-send)
+             (should (= (1+ count) (length requests)))
+             (should (gptel-agent-discussion--active-p gptel-agent-discussion--fsm))
+             (should-not (eq failed-fsm gptel-agent-discussion--fsm))
+             (should (string-match-p
+                      "Retry this user draft"
+                      (gptel-agent-workers-test--data gptel-agent-discussion--fsm))))))))))
+
+(ert-deftest gptel-agent-discussion-running-owner-send-has-actionable-error ()
+  (gptel-agent-discussion-test--with-chat
+   (with-current-buffer parent
+     (let ((count (length requests))
+           (error (should-error (gptel-send) :type 'user-error)))
+       (should (string-match-p "gptel-abort" (error-message-string error)))
+       (should-not (string-match-p "gptel-agent-discussion-send"
+                                   (error-message-string error)))
+       (should (= count (length requests)))
+       (should (eq fsm gptel-agent-discussion--fsm))
+       (should (gptel-agent-discussion--active-p fsm))))))
+
+(ert-deftest gptel-agent-discussion-startup-cleanup-error-releases-owner ()
+  (gptel-agent-discussion-test--with-chat
+   (gptel-agent-workers-test--answer fsm "Initial request finished")
+   (with-current-buffer parent
+     (let ((transforms gptel-prompt-transform-functions)
+           (kill (symbol-function 'kill-buffer))
+           prompt failed-fsm)
+       (unwind-protect
+           (progn
+             (setq-local
+              gptel-prompt-transform-functions
+              (append transforms
+                      (list (lambda (request)
+                              (setq prompt (current-buffer)
+                                    failed-fsm request)
+                              (error "Original startup failure")))))
+             (cl-letf (((symbol-function 'kill-buffer)
+                        (lambda (&optional buffer)
+                          (if (eq buffer prompt)
+                              (error "Prompt cleanup failure")
+                            (funcall kill buffer)))))
+               (should
+                (equal (should-error (gptel-send))
+                       '(error "Original startup failure"))))
+             (should-not (gptel-agent-discussion--active-p failed-fsm))
+             (should-not gptel-agent--worker-requests)
+             (setq-local gptel-prompt-transform-functions transforms)
+             (gptel-send)
+             (should (gptel-agent-discussion--active-p gptel-agent-discussion--fsm))
+             (should-not (eq failed-fsm gptel-agent-discussion--fsm)))
+         (when (buffer-live-p prompt) (kill-buffer prompt)))))))
+
+(ert-deftest gptel-agent-discussion-rejected-concurrent-request-preserves-owner ()
+  (gptel-agent-discussion-test--with-chat
+   (with-current-buffer parent
+     (let ((count (length requests))
+           (rejected-fsm (gptel-make-fsm :table gptel-send--transitions
+                                        :handlers gptel-send--handlers)))
+       (unwind-protect
+           (progn
+             (should-error
+              (gptel-request nil :fsm rejected-fsm
+                :transforms gptel-prompt-transform-functions)
+              :type 'user-error)
+             (should (= count (length requests)))
+             (should (eq fsm gptel-agent-discussion--fsm))
+             (should (gptel-agent-discussion--active-p fsm)))
+         ;; Rejection precedes monitoring, so gptel still owns this prompt.
+         (let ((prompt (plist-get (gptel-fsm-info rejected-fsm) :data)))
+           (when (buffer-live-p prompt) (kill-buffer prompt))))))))
+
 (ert-deftest gptel-agent-discussion-independent-completion-and-followup ()
   (dolist (backend (list (gptel-make-openai "d-openai" :key "unused" :models '(test) :stream t)
                          (gptel-make-openai-responses "d-responses" :key "unused" :models '(test) :stream t)
@@ -476,6 +585,92 @@
      (gptel-agent-discussion--flush parent)
      (should (= count (length requests))))
    (should (buffer-local-value 'gptel-agent-discussion--inbox parent))))
+
+(ert-deftest gptel-agent-discussion-closing-waited-child-releases-owner ()
+  (dolist (close '(close kill))
+    (gptel-agent-discussion-test--with-chat
+     (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+     (gptel-agent-workers-test--tool fsm "DiscussionControl" '(:action "wait"))
+     (let* ((waiter (car (buffer-local-value 'gptel-agent-discussion--waiters parent)))
+            (timer (nth 3 waiter))
+            (late-timeout (timer--function timer))
+            (count (length requests)))
+       (if (eq close 'kill)
+           (kill-buffer (gptel-agent-discussion--chat-buffer chat))
+         (gptel-agent-discussion--close chat))
+       ;; Finishing a pending tool must happen after close/kill hooks unwind.
+       (should (= count (length requests)))
+       (gptel-agent-discussion--flush parent)
+       (should (eq (gptel-fsm-state fsm) 'WAIT))
+       (should (string-match-p "status: no_eligible_work"
+                               (gptel-agent-workers-test--data fsm)))
+       (should-not (buffer-local-value 'gptel-agent-discussion--waiters parent))
+       (should-not (memq timer timer-list))
+       (let ((count (length requests)))
+         (funcall late-timeout)
+         (should (= count (length requests))))
+       (gptel-agent-workers-test--answer fsm "Discussion closed")
+       (with-current-buffer parent
+         (goto-char (point-max))
+         (insert "Continue in the original chat")
+         (gptel-send)
+         (should (gptel-agent-discussion--active-p gptel-agent-discussion--fsm)))))))
+
+(ert-deftest gptel-agent-discussion-close-preserves-other-selected-work ()
+  (gptel-agent-discussion-test--with-chat
+   (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+   (let ((other (gptel-agent-discussion-test--spawn fsm parent "Other work")))
+     (gptel-agent-workers-test--tool fsm "DiscussionControl" '(:action "wait"))
+     (gptel-agent-discussion--close chat)
+     (gptel-agent-discussion--flush parent)
+     (should (eq (gptel-fsm-state fsm) 'TOOL))
+     (should (buffer-local-value 'gptel-agent-discussion--waiters parent))
+     (gptel-agent-workers-test--tool (gptel-agent-discussion--chat-fsm other)
+                                   "DiscussionReport" '(:message "OTHER-REPORT"))
+     (gptel-agent-discussion--flush parent)
+     (should (eq (gptel-fsm-state fsm) 'WAIT))
+     (should (string-match-p "OTHER-REPORT" (gptel-agent-workers-test--data fsm)))
+     ;; An explicitly selected closed child can no longer produce a report,
+     ;; even when an unselected sibling is still running.
+     (gptel-agent-discussion-test--spawn fsm parent "Unselected work")
+     (gptel-agent-workers-test--tool
+      fsm "DiscussionControl"
+      (list :action "wait" :discussion_ids (vector (gptel-agent-discussion--chat-id other))))
+     (gptel-agent-discussion--close other)
+     (gptel-agent-discussion--flush parent)
+     (should (eq (gptel-fsm-state fsm) 'WAIT))
+     (should-not (buffer-local-value 'gptel-agent-discussion--waiters parent)))))
+
+(ert-deftest gptel-agent-discussion-close-delivers-queued-report-before-ending-wait ()
+  (gptel-agent-discussion-test--with-chat
+   (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+   (gptel-agent-workers-test--tool fsm "DiscussionControl" '(:action "wait"))
+   (gptel-agent-workers-test--tool (gptel-agent-discussion--chat-fsm chat)
+                                 "DiscussionReport" '(:message "FINAL-REPORT"))
+   (gptel-agent-discussion--close chat)
+   (gptel-agent-discussion--flush parent)
+   (should (eq (gptel-fsm-state fsm) 'WAIT))
+   (should (string-match-p "FINAL-REPORT" (gptel-agent-workers-test--data fsm)))
+   (should-not (string-match-p "no_eligible_work" (gptel-agent-workers-test--data fsm)))
+   (should-not (buffer-local-value 'gptel-agent-discussion--waiters parent))
+   (should-not (buffer-local-value 'gptel-agent-discussion--inbox parent))))
+
+(ert-deftest gptel-agent-discussion-closing-last-active-child-releases-mixed-wait ()
+  (gptel-agent-discussion-test--with-chat
+   (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+   (let ((other (gptel-agent-discussion-test--spawn fsm parent "Other work")))
+     (gptel-agent-workers-test--answer (gptel-agent-discussion--chat-fsm chat)
+                                      "Completed silently")
+     (gptel-agent-workers-test--tool fsm "DiscussionControl" '(:action "wait"))
+     (should (eq (gptel-fsm-state fsm) 'TOOL))
+     (gptel-agent-discussion--close other)
+     (gptel-agent-discussion--flush parent)
+     (should (eq (gptel-fsm-state fsm) 'WAIT))
+     (should (string-match-p "status: no_eligible_work"
+                             (gptel-agent-workers-test--data fsm)))
+     (should-not (buffer-local-value 'gptel-agent-discussion--waiters parent))
+     (should-not (string-match-p "Completed silently"
+                                 (gptel-agent-workers-test--data fsm))))))
 
 (ert-deftest gptel-agent-discussion-killed-owner-detaches-child ()
   (gptel-agent-discussion-test--with-chat
