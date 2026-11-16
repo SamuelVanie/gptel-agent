@@ -1278,9 +1278,9 @@ If a draft remains, send it explicitly with `gptel-send' instead."
 
 (gptel-make-tool
  :name "DiscussionReport"
- :description "Send a concise message to this discussion's managing conversation. Ordinary replies are local and are NEVER forwarded automatically. Use this tool when the manager asks for an answer or progress report, or when a finding or blocker matters to its work. Choose whether reporting is useful; do not routinely forward direct user exchanges, acknowledgements, or every completed turn. A report may start a model request in the managing conversation. No discussion_id is needed: this reports only to your own manager."
+ :description "Send a concise message to this discussion's managing conversation. Ordinary replies are local and are NEVER forwarded automatically. Use this tool for requested answers, substantive findings, or blockers the manager can act on. Do not report merely that you are asking or waiting for user input, clarification, permission, tool approval, or file review, including before the interaction becomes pending. Keep those notices in this discussion; local controls and echo-area notices already alert the user. Do not ask the manager to relay them. Do not routinely forward direct user exchanges, acknowledgements, or every completed turn. A report may start a model request in the managing conversation. No discussion_id is needed: this reports only to your own manager."
  :function (lambda (&rest _) "Error: DiscussionReport is available only in a live managed discussion.")
- :args '((:name "message" :type string :description "The answer, useful update, or blocker to share with the managing conversation."))
+ :args '((:name "message" :type string :description "A requested answer, substantive finding, or blocker the manager can act on. Exclude notices about asking or waiting for user interaction."))
  :category "gptel-agent" :include t)
 
 (gptel-make-tool

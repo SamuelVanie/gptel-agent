@@ -907,10 +907,13 @@ turn or raising an alert does not start another request in the parent.
 
 Each managed child receives =DiscussionReport=, including with a custom preset
 or when its parent enabled management through a skill. The child chooses when
-to send a concise answer, useful update or blocker to its managing conversation.
-It should report when the parent asks for an answer, without routinely forwarding
-direct user exchanges or acknowledgements. The parent can use =send= to request
-a report, or =read= to inspect the child's work without a child model request.
+to send a requested answer, substantive finding or blocker the parent can act on.
+Reporting instructions exclude notices that the child is asking or waiting for
+user input, clarification, permission, tool approval or file review, including
+before the interaction becomes pending. Local controls and echo-area notices
+already alert the user. The child should not routinely forward direct user
+exchanges or acknowledgements. The parent can use =send= to request a report,
+or =read= to inspect the child's work without a child model request.
 
 Only explicit reports reach the parent at its next safe request boundary, or
 start a new ordinary gptel turn when it is idle. They are recorded in the parent's

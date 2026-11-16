@@ -4,6 +4,11 @@
 
 ** New features and UI changes
 
+- Discussion reporting instructions now exclude notices about asking or waiting
+  for user input, permission, tool approval or file review. These interactions
+  use the child's local controls and echo-area notices without requesting an
+  extra parent turn.
+
 - Failed or cancelled request preparation no longer leaves discussion-enabled
   chats blocked from sending. Closing the last active discussion selected by a
   pending wait now releases the wait, and a busy parent chat points to ~gptel-abort~
