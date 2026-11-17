@@ -26,7 +26,7 @@
 ;; - "Process"        : Manage this conversation's background shell jobs.
 ;;
 ;; Web:
-;; - "WebSearch" : Search the web for the first five results to a query.
+;; - "WebSearch" : Search the web for pages matching a query.
 ;; - "WebFetch"  : Fetch and read the contents of a URL, and for
 ;;                 YouTube URLs get the video description and transcript.
 ;;
@@ -44,8 +44,6 @@
 
 
 (require 'gptel)
-(require 'eww)
-(require 'url-http)
 (require 'cl-lib)
 (require 'gptel-agent-edit)
 (require 'gptel-agent-instructions)
@@ -53,6 +51,7 @@
 (require 'gptel-agent-process)
 (require 'gptel-agent-read)
 (require 'gptel-agent-search)
+(require 'gptel-agent-web)
 
 (declare-function org-escape-code-in-region "org-src")
 (declare-function gptel-agent--cached-read-file "gptel-agent")
@@ -65,9 +64,6 @@
 (declare-function gptel-agent--manual-skill-p "gptel-agent")
 (declare-function gptel-agent--agents-tool-message "gptel-agent")
 
-(defvar url-http-end-of-headers)
-(defvar url-http-content-type)
-(defvar url-http-response-status)
 (defvar gptel-agent--agents)
 (defvar gptel-agent--skills)
 (defvar gptel-agent--skill-tool-base-desc)
@@ -183,32 +179,6 @@ sub-agent a tool-free synthesis turn.  Set to nil to disable the separate
 web-call budget."
   :type '(choice (natnum :tag "Maximum calls")
                  (const :tag "Disable" nil))
-  :group 'gptel-agent)
-
-(defcustom gptel-agent-web-search-default-count 10
-  "Default number of results returned by WebSearch."
-  :type 'natnum
-  :group 'gptel-agent)
-
-(defcustom gptel-agent-web-search-max-count 30
-  "Maximum number of results returned by one WebSearch call.
-
-Keeping this bounded prevents a single search-engine response from flooding
-the model context."
-  :type 'natnum
-  :group 'gptel-agent)
-
-(defcustom gptel-agent-web-request-timeout 30
-  "Timeout in seconds for each WebSearch or WebFetch request."
-  :type 'natnum
-  :group 'gptel-agent)
-
-(defcustom gptel-agent-web-fetch-max-chars 50000
-  "Default maximum characters returned by one WebFetch call.
-
-Longer textual responses are truncated with an explicit notice so a single
-page cannot consume the sub-agent context."
-  :type 'natnum
   :group 'gptel-agent)
 
 (defcustom gptel-agent-task-timeout nil
@@ -864,479 +834,6 @@ foreground execution so cancelling the request also stops its commands."
                          "Use Process wait (until=exit) for completion, or read with view=tail for recent output.\n"))
         process)
     (gptel-agent--start-foreground-bash callback command query fsm)))
-
-;;; Web tools
-
-(defun gptel-agent--fetch-with-timeout (url url-cb tool-cb failed-msg &rest args)
-  "Fetch URL and call URL-CB in the result buffer.
-
-Call TOOL-CB if there is an error or a timeout.  TOOL-CB and ARGS are
-passed to URL-CB.  FAILED-MSG is a fragment used for messaging.  The tool
-callback is guaranteed to run at most once, including parser exceptions."
-  (let* ((timeout gptel-agent-web-request-timeout) timer done proc-buffer
-         (inherit-process-coding-system t)
-         (url-request-noninteractive t)
-         (finish
-          (lambda (result)
-            (unless done
-              (setq done t)
-              (when timer (cancel-timer timer))
-              (funcall tool-cb result)))))
-    (condition-case err
-        (let ((url-request-extra-headers
-               (append
-                '(("Accept" . "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5")
-                  ("Accept-Language" . "en-US,en;q=0.8"))
-                url-request-extra-headers)))
-          (setq
-           proc-buffer
-           (url-retrieve
-            url
-            (lambda (status)
-              (unwind-protect
-                  (if-let* ((request-error (plist-get status :error)))
-                      (funcall finish
-                               (gptel-agent--web-request-error
-                                failed-msg request-error))
-                    (condition-case parse-error
-                        (apply url-cb finish args)
-                      (error
-                       (funcall
-                        finish
-                        (format "Error: %s could not be parsed: %S"
-                                failed-msg parse-error)))))
-                (when (buffer-live-p (current-buffer))
-                  (kill-buffer (current-buffer)))))
-            nil 'silent)))
-      (error
-       (funcall finish
-                (format "Error: %s could not start: %S" failed-msg err))))
-    (when (and proc-buffer (not done))
-      (setq timer
-            (run-at-time
-             timeout nil
-             (lambda (buf)
-               (unless done
-                 (when (buffer-live-p buf)
-                   (let ((kill-buffer-query-functions)) (kill-buffer buf)))
-                 (funcall
-                  finish (format "Error: %s timed out after %d seconds."
-                                 failed-msg timeout))))
-             proc-buffer)))
-    proc-buffer))
-
-(defun gptel-agent--web-response-body ()
-  "Return the current URL response body as decoded text."
-  (let* ((start (if (and (boundp 'url-http-end-of-headers)
-                         url-http-end-of-headers)
-                    (if (markerp url-http-end-of-headers)
-                        (marker-position url-http-end-of-headers)
-                      url-http-end-of-headers)
-                  (save-excursion
-                    (goto-char (point-min))
-                    (if (re-search-forward "\r?\n\r?\n" nil t)
-                        (point)
-                      (point-min)))))
-         (raw (buffer-substring-no-properties start (point-max)))
-         (content-type (and (boundp 'url-http-content-type)
-                            url-http-content-type))
-         (coding
-          (and content-type
-               (string-match
-                "charset=[\"']?\\([^;\"'[:space:]]+\\)" content-type)
-               (coding-system-from-name (match-string 1 content-type)))))
-    (when (string-search "\0" raw)
-      (error "Response body contains NUL bytes; use a specialized tool for this binary resource"))
-    (if (multibyte-string-p raw)
-        raw
-      (decode-coding-string
-       raw (or coding (detect-coding-string raw t) 'utf-8) t))))
-
-(defun gptel-agent--web-request-error (failed-msg request-error)
-  "Format a useful FAILED-MSG diagnostic for REQUEST-ERROR."
-  (let* ((type (and (boundp 'url-http-content-type)
-                    url-http-content-type
-                    (replace-regexp-in-string
-                     "[[:cntrl:]]" "?" url-http-content-type)))
-         (body (ignore-errors (string-trim (gptel-agent--web-response-body))))
-         (excerpt (and body (not (string-empty-p body))
-                       (truncate-string-to-width body 500 nil nil t))))
-    (format "Error: %s failed%s%s with error: %S%s"
-            failed-msg
-            (if (and (boundp 'url-http-response-status)
-                     url-http-response-status)
-                (format " (HTTP %s" url-http-response-status)
-              "")
-            (cond
-             ((and (boundp 'url-http-response-status)
-                   url-http-response-status type)
-              (format ", content-type %s)" type))
-             ((and (boundp 'url-http-response-status)
-                   url-http-response-status) ")")
-             (type (format " (content-type %s)" type))
-             (t ""))
-            request-error
-            (if excerpt (format "\nResponse excerpt:\n%s" excerpt) ""))))
-
-;;;; Web search
-(defun gptel-agent--shr-next-link ()
-  "Jump to the next SHR link in the buffer.  Return jump position."
-  (let ((current-prop (get-char-property (point) 'shr-url))
-        (next-pos (point)))
-    (while (and (not (eobp))
-                (setq next-pos
-                      (or (next-single-property-change (point) 'shr-url)
-                          (point-max)))
-                (let ((next-prop (get-char-property next-pos 'shr-url)))
-                  (or (equal next-prop current-prop)
-                      (equal next-prop nil))))
-      (goto-char next-pos))
-    (goto-char next-pos)))
-
-(defvar gptel-agent--web-search-active nil)
-
-(defun gptel-agent--web-search-count (count)
-  "Return a safe effective WebSearch result COUNT."
-  (min (max 1 gptel-agent-web-search-max-count)
-       (max 1 (if (and (integerp count) (> count 0))
-                  count
-                gptel-agent-web-search-default-count))))
-
-(defun gptel-agent--web-search-eww (tool-cb query &optional count)
-  "Search the web using eww's default search engine (usually DuckDuckGo).
-
-Call TOOL-CB with the results as a string.  QUERY is the search string.
-COUNT is the requested number of results.  It defaults to
-`gptel-agent-web-search-default-count' and is capped by
-`gptel-agent-web-search-max-count'."
-  (setq count (gptel-agent--web-search-count count))
-  ;; No more than two active searches at one time
-  (setq gptel-agent--web-search-active
-        (cl-delete-if-not
-         (lambda (buf) (and (buffer-live-p buf)
-                       (process-live-p (get-buffer-process buf))))
-         gptel-agent--web-search-active))
-  (if (>= (length gptel-agent--web-search-active) 2)
-      (progn (message "Web search: waiting for turn")
-             (run-at-time 5 nil #'gptel-agent--web-search-eww
-                          tool-cb query count))
-    (when-let* ((buffer
-                 (gptel-agent--fetch-with-timeout
-                  (concat eww-search-prefix (url-hexify-string query))
-                  #'gptel-agent--web-search-eww-callback
-                  tool-cb (format "Web search for \"%s\"" query) query count)))
-      (push buffer gptel-agent--web-search-active))))
-
-(defun gptel-agent--web-search-eww-callback (cb query count)
-  "Extract search results for QUERY and run callback CB with them.
-
-COUNT is the already normalized requested result count."
-  (let (results)
-    (goto-char (point-min))
-    (goto-char url-http-end-of-headers)
-    (when (save-excursion (search-forward "\0" nil t))
-      (error "WebSearch received a response body containing NUL bytes; cannot parse binary content"))
-    (let* ((dom (libxml-parse-html-region (point) (point-max)))
-           (result-count 0))
-      (eww-score-readability dom)
-      ;; (erase-buffer) (buffer-disable-undo)
-      (with-temp-buffer
-        (shr-insert-document (eww-highest-readability dom))
-        (goto-char (point-min))
-        (while (and (not (eobp)) (< result-count count))
-          (let ((pos (point))
-                (url (get-char-property (point) 'shr-url))
-                (next-pos (gptel-agent--shr-next-link)))
-            (when-let* (((stringp url))
-                        (idx (string-search "http" url))
-                        (url-fmt (url-unhex-string (substring url idx))))
-              (cl-incf result-count)
-              (push (list :url url-fmt
-                          :excerpt
-                          (string-trim
-                           (buffer-substring-no-properties pos next-pos)))
-                    results))))))
-    (setq results (nreverse results))
-    (funcall
-     cb
-     (prin1-to-string
-      (list :query query
-            :requested-count count
-            :returned-count (length results)
-            :coverage-note
-            "These are only the top results exposed by the current search page; absence is not proof that the target does not exist."
-            :results results)))))
-
-;;;; Read URLs
-(defun gptel-agent--web-fetch-limit (text max-chars)
-  "Limit fetched TEXT to MAX-CHARS with an explicit truncation notice."
-  (let ((max-chars (max 1000 (or max-chars
-                                 gptel-agent-web-fetch-max-chars))))
-    (if (<= (length text) max-chars)
-        text
-      (concat
-       (substring text 0 max-chars)
-       (format "\n\n[WebFetch truncated %d remaining characters. Fetch a more specific URL or request a larger max_chars value if needed.]"
-               (- (length text) max-chars))))))
-
-(defun gptel-agent--web-binary-content-p (content-type)
-  "Return non-nil when CONTENT-TYPE is not usefully representable as text."
-  (and content-type
-       (string-match-p
-        (rx string-start
-            (or "image/" "audio/" "video/" "font/"
-                "application/pdf" "application/zip"
-                "application/octet-stream"))
-        content-type)))
-
-(defun gptel-agent--web-html-content-p (content-type body)
-  "Return non-nil when CONTENT-TYPE or BODY identifies an HTML document."
-  (or (and content-type
-           (string-match-p (rx (or "text/html" "application/xhtml+xml"))
-                           content-type))
-      (and (or (null content-type) (string-empty-p content-type))
-           (string-match-p
-            (rx string-start (* space)
-                (or "<!doctype html" "<html" "<head" "<body"))
-            (downcase body)))))
-
-(defun gptel-agent--web-render-dom (dom)
-  "Render DOM as plain text with SHR."
-  (with-temp-buffer
-    (let ((shr-use-colors nil)
-          (shr-use-fonts nil))
-      (shr-insert-document dom)
-      (string-trim (buffer-substring-no-properties (point-min) (point-max))))))
-
-(defun gptel-agent--web-render-html (body)
-  "Render HTML BODY, falling back when readability extraction is unsuitable."
-  (condition-case parse-error
-      (with-temp-buffer
-        (insert body)
-        (let* ((dom (libxml-parse-html-region (point-min) (point-max)))
-               (full-dom (copy-tree dom))
-               readable)
-          (condition-case nil
-              (progn
-                (eww-score-readability dom)
-                (setq readable
-                      (gptel-agent--web-render-dom
-                       (eww-highest-readability dom))))
-            (error nil))
-          (if (and readable (>= (length readable) 200))
-              readable
-            (let ((full (gptel-agent--web-render-dom full-dom)))
-              (if (string-empty-p full)
-                  (or readable "")
-                full)))))
-    (error
-     (concat
-      (format "[HTML parsing failed (%S); returning the decoded response body.]\n\n"
-              parse-error)
-      body))))
-
-(defun gptel-agent--web-fetch-callback (cb max-chars)
-  "Parse the current WebFetch response and call CB.
-
-MAX-CHARS bounds the returned text."
-  (let* ((content-type
-          (downcase (or (and (boundp 'url-http-content-type)
-                             url-http-content-type)
-                        "")))
-         (safe-content-type
-          (replace-regexp-in-string "[[:cntrl:]]" "?" content-type))
-         (body (gptel-agent--web-response-body))
-         (text
-          (cond
-           ((gptel-agent--web-binary-content-p content-type)
-            (format "Error: WebFetch received unsupported binary content-type %s. Use a specialized tool for this resource."
-                    safe-content-type))
-           ((gptel-agent--web-html-content-p content-type body)
-            (gptel-agent--web-render-html body))
-           (t (string-trim body)))))
-    (funcall
-     cb
-     (if (string-empty-p text)
-         (format "Error: WebFetch received no readable text (content-type %s). The page may require JavaScript, authentication, or a specialized client."
-                 (if (string-empty-p content-type) "unknown" safe-content-type))
-       (gptel-agent--web-fetch-limit text max-chars)))))
-
-(defun gptel-agent--read-url (tool-cb url &optional max-chars)
-  "Fetch URL text and call TOOL-CB with it.
-
-YouTube URLs return the video description and transcript.  For other URLs,
-MAX-CHARS optionally overrides `gptel-agent-web-fetch-max-chars'."
-  (if-let* ((video-id (gptel-agent--yt-video-id url)))
-      (gptel-agent--yt-fetch-watch-page tool-cb video-id)
-    (gptel-agent--fetch-with-timeout
-     url #'gptel-agent--web-fetch-callback
-     tool-cb (format "Fetch for \"%s\"" url) max-chars)))
-
-;;;; Fetch youtube transcript
-(defun gptel-agent--yt-video-id (url)
-  "Return the video ID if URL is a YouTube video URL, nil otherwise."
-  (and (string-match
-        (rx bol (opt "http" (opt "s") "://")
-            (opt "www.") "youtu" (or ".be" "be.com") "/"
-            (opt "watch?v=")
-            (group (one-or-more (not (any "?&")))))
-        url)
-       (match-string 1 url)))
-
-(defun gptel-agent--yt-parse-captions (xml-string)
-  "Parse YouTube caption XML-STRING and return DOM."
-  (with-temp-buffer
-    (insert xml-string)
-    (set-buffer-multibyte t)
-    (decode-coding-region (point-min) (point-max) 'utf-8)
-    (goto-char (point-min))
-    ;; Clean up the XML
-    (dolist (reps '(("\n" . " ")
-                    ("&amp;" . "&")
-                    ("&quot;" . "\"")
-                    ("&#39;" . "'")
-                    ("&lt;" . "<")
-                    ("&gt;" . ">")))
-      (save-excursion
-        (while (search-forward (car reps) nil t)
-          (replace-match (cdr reps) nil t))))
-    (libxml-parse-xml-region (point-min) (point-max))))
-
-(defun gptel-agent--yt-format-captions (caption-dom &optional chunk-time)
-  "Format CAPTION-DOM as paragraphs with timestamps.
-
-CHUNK-TIME is the number of seconds per paragraph (default 30)."
-  (when (and (listp caption-dom)
-             (eq (car-safe caption-dom) 'transcript))
-    (let ((chunk-time (or chunk-time 30))
-          (result "")
-          (current-para "")
-          (para-start-time 0))
-      (dolist (elem (cddr caption-dom)) ;; Process each text element
-        (when (and (listp elem) (eq (car elem) 'text))
-          (let* ((attrs (cadr elem))
-                 (text (caddr elem))
-                 (start (string-to-number (cdr (assoc 'start attrs))))
-                 ;; Check if we've crossed into a new chunk-time boundary
-                 (should-chunk (and (> (abs (- start para-start-time)) 3)
-                                    (not (= (floor para-start-time chunk-time)
-                                            (floor start chunk-time))))))
-            (when (and should-chunk (> (length current-para) 0))
-              ;; Add completed paragraph
-              (setq result (concat result
-                                   (format "[%d:%02d]\n%s\n\n"
-                                           (floor para-start-time 60)
-                                           (mod para-start-time 60)
-                                           (string-trim current-para))))
-              (setq current-para "")
-              (setq para-start-time start))
-
-            (when text
-              (setq current-para (concat current-para " " text))))))
-
-      ;; Add final paragraph
-      (when (> (length current-para) 0)
-        (setq result (concat result
-                             (format "[%d:%02d]\n%s\n\n"
-                                     (floor para-start-time 60)
-                                     (mod para-start-time 60)
-                                     (string-trim current-para)))))
-      result)))
-
-(defun gptel-agent--yt-fetch-watch-page (callback video-id)
-  "Step 1: Fetch YouTube watch page for VIDEO-ID.
-
-Call CALLBACK with error or proceeds to fetch InnerTube data."
-  (url-retrieve
-   (format "https://youtube.com/watch?v=%s" video-id)
-   (lambda (status callback video-id)
-     (if-let ((error (plist-get status :error)))
-         (funcall callback (format "Error fetching page: %s" error))
-       (goto-char (point-min))
-       (search-forward "\n\n" nil t)
-       (let* ((html (buffer-substring (point) (point-max)))
-              (api-key (and (string-match
-                             "\"INNERTUBE_API_KEY\":\"\\([a-zA-Z0-9_-]+\\)"
-                             html)
-                            (match-string 1 html))))
-         (if api-key
-             (gptel-agent--yt--fetch-innertube callback video-id api-key)
-           (funcall callback "Error: Could not extract API key")))))
-   (list callback video-id)))
-
-(defun gptel-agent--yt--fetch-innertube (callback video-id api-key)
-  "Step 2: Fetch VIDEO-ID metadata from YouTube InnerTube API.
-
-Call CALLBACK with error or proceeds to fetch captions."
-  (let ((url-request-method "POST")
-        (url-request-extra-headers
-         '(("Content-Type" . "application/json")
-           ("Accept-Language" . "en-US")))
-        (url-request-data
-         (encode-coding-string
-          (json-encode
-           `((context . ((client . ((clientName . "ANDROID")
-                                    (clientVersion . "20.10.38")))))
-             (videoId . ,video-id)))
-          'utf-8)))
-    (url-retrieve
-     (format "https://www.youtube.com/youtubei/v1/player?key=%s" api-key)
-     (lambda (status callback)
-       (if-let ((error (plist-get status :error)))
-           (funcall callback (format "Error fetching metadata: %s" error))
-         (goto-char (point-min))
-         (search-forward "\n\n" nil t)
-         (let* ((json-data (ignore-errors
-                             (json-parse-buffer :object-type 'plist)))
-                (video-details (plist-get json-data :videoDetails))
-                (description (plist-get video-details :shortDescription))
-                (caption-tracks (map-nested-elt
-                                 json-data
-                                 '(:captions
-                                   :playerCaptionsTracklistRenderer
-                                   :captionTracks))))
-           (gptel-agent--yt-fetch-captions callback description caption-tracks))))
-     (list callback))))
-
-(defun gptel-agent--yt-fetch-captions (callback description caption-tracks)
-  "Step 3: Find and fetch English captions for CAPTION-TRACKS.
-
-Call CALLBACK with formatted result containing DESCRIPTION and transcript."
-  (if (not caption-tracks)
-      (funcall callback
-               (format "# Description\n\n%s\n\n# Transcript\n\nNo transcript available."
-                       (or description "No description available.")))
-    (let ((en-caption
-           (cl-find-if
-            (lambda (track)
-              (string-match-p "^en" (or (plist-get track :languageCode) "")))
-            caption-tracks)))
-      (if (not en-caption)
-          (funcall callback
-                   (format "# Description\n\n%s\n\n# Transcript\n\nNo English transcript available."
-                           (or description "No description available.")))
-        (let ((base-url (replace-regexp-in-string
-                         "&fmt=srv3" ""
-                         (plist-get en-caption :baseUrl))))
-          (url-retrieve
-           base-url
-           (lambda (status callback description)
-             (if-let ((error (plist-get status :error)))
-                 (funcall callback
-                          (format "# Description\n\n%s\n\n# Transcript\n\nError fetching transcript: %s"
-                                  (or description "No description available.")
-                                  error))
-               (goto-char (point-min))
-               (search-forward "\n\n" nil t)
-               (let* ((xml-string (buffer-substring (point) (point-max)))
-                      (caption-dom (gptel-agent--yt-parse-captions xml-string))
-                      (formatted-transcript
-                       (gptel-agent--yt-format-captions caption-dom 30)))
-                 (funcall callback
-                          (format "# Description\n\n%s\n\n# Transcript\n\n%s"
-                                  (or description "No description available.")
-                                  (or formatted-transcript "Error parsing transcript."))))))
-           (list callback description)))))))
 
 ;;; Code tools
 ;;;; Diagnostics from flymake
@@ -2727,7 +2224,8 @@ ABRT after its children have stopped."
     (with-current-buffer buffer
       (gptel-agent--bash-cleanup)
       (gptel-agent--searches-cleanup)
-      (gptel-agent--repository-searches-cleanup))
+      (gptel-agent--repository-searches-cleanup)
+      (gptel-agent--webs-cleanup))
     (dolist (gate (copy-sequence
                   (buffer-local-value 'gptel-agent--worker-requests buffer)))
       (unless (gptel-agent--workers-closed gate)
@@ -4424,11 +3922,11 @@ demonstrate something to the user."
  :function 'gptel-agent--web-search-eww
  :description "Discover web pages matching a query.  Returns a plist containing the query, requested and returned result counts, a coverage warning, and a `:results` list.  Each result has `:url` and `:excerpt` keys.
 
-This tool uses the Emacs web browser (eww) with its default search engine (typically DuckDuckGo) to perform searches. No API key is required.
+Uses the configured eww search engine (typically DuckDuckGo), with asynchronous downloads and isolated text extraction. Multiple Web calls can run concurrently. No API key is required.
 
 Use WebSearch for discovery, not as proof that a target does not exist.  If the user supplies a structured identifier that determines a URL (for example GitHub owner/repository), construct that URL and use WebFetch directly.  If a relevant result is absent, do not repeat the same call: make at most one materially different exact/site-qualified query or increase `count` once, then report the negative or inconclusive outcome and confidence.
 
-Use WebFetch to read a selected result.  It may not handle JavaScript-only pages."
+Use WebFetch to read a selected result. If a page is empty, an app shell, or requires JavaScript, use agent-browser or another available real-browser tool. Prefer delegating browser work to an available subagent with browser access; ask it to return only the relevant content and source URL so browser details do not fill the parent context. If no browser tool is available, report the limitation."
  :args '((:name "query"
                 :type string
                 :description "The natural language search query, can be multiple words.")
@@ -4449,11 +3947,11 @@ Use WebFetch to read a selected result.  It may not handle JavaScript-only pages
 
 - YouTube URLs return the video description and transcript as timestamped paragraphs.
 - Handles HTML, JSON, source code, Markdown, Org, XML, and other textual responses according to content type.
-- HTML is reduced with readability extraction, with full-page and decoded-body fallbacks when extraction fails.
-- Binary resources and pages with no server-rendered text return an actionable error; JavaScript is not executed.
+- HTML text is extracted in an isolated worker without rendering or executing scripts. Scripts, styles, and hidden content are omitted; raw HTML is never returned on extraction failure.
+- Empty pages, JavaScript app shells, and browser challenges include browser guidance. Use agent-browser or another available real-browser tool. Prefer an available subagent with browser access and request only the relevant content and source URL, keeping browser details out of the parent context. If browser tools are unavailable, report the limitation. Binary resources require a specialized tool.
 - Output is bounded to protect context. Use `max_chars` only when more of a large response is needed.
 - One retry is reasonable for a timeout, network failure, HTTP 429, or HTTP 5xx. Do not retry the same URL after a deterministic HTTP 4xx; correct the URL, authentication, or access method.
-- Request timeout is controlled by `gptel-agent-web-request-timeout`."
+- Multiple calls run concurrently in a bounded queue. Download size is limited by `gptel-agent-web-max-response-bytes`; queueing, download, and extraction share `gptel-agent-web-request-timeout`."
  :args '(( :name "url"
            :type "string"
            :description "The URL to read")
@@ -4855,6 +4353,7 @@ the global registry while this request is in flight."
                           gptel-tools))))
   (gptel-agent--localize-result-search fsm)
   (gptel-agent--localize-repository-search fsm)
+  (gptel-agent--localize-web-tools fsm)
   (when-let* ((base-tool (cl-find "Process" gptel-tools
                                 :key #'gptel-tool-name :test #'equal)))
     (let ((tool (gptel--copy-tool base-tool)))

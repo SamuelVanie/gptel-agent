@@ -4,6 +4,13 @@
 
 ** New features and UI changes
 
+- Web tools now use bounded asynchronous downloads and isolated extraction
+  workers, preserving concurrent calls without parsing or laying out HTML in
+  interactive Emacs. A shared FIFO queue, response size limits, cancellation,
+  and deadlines cover searches, page fetches, and YouTube transcripts. Empty
+  JavaScript pages suggest available browser tools, preferably delegated to a
+  sub-agent that returns only relevant content and source URLs.
+
 - Discussion reporting instructions now exclude notices about asking or waiting
   for user input, permission, tool approval or file review. These interactions
   use the child's local controls and echo-area notices without requesting an

@@ -3,10 +3,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'gptel-agent)
-
-(defvar url-http-end-of-headers)
-(defvar url-http-content-type)
-(defvar url-http-response-status)
+(require 'gptel-agent-web-worker)
 
 (ert-deftest gptel-agent-todos-clear-header-when-completed ()
   (with-temp-buffer
@@ -229,18 +226,9 @@
     (should (= (gptel-agent--web-search-count 0) 10))))
 
 (ert-deftest gptel-agent-web-search-result-reports-coverage ()
-  (let (result)
-    (with-temp-buffer
-      (let ((url-http-end-of-headers (point-min)))
-        (cl-letf (((symbol-function 'libxml-parse-html-region)
-                   (lambda (&rest _) 'document))
-                  ((symbol-function 'eww-score-readability) #'identity)
-                  ((symbol-function 'eww-highest-readability) #'identity)
-                  ((symbol-function 'shr-insert-document)
-                   (lambda (_dom) (insert "no result links"))))
-          (gptel-agent--web-search-eww-callback
-           (lambda (value) (setq result (read value)))
-           "SamuelVanie/gptel-agent" 10))))
+  (let ((result (read (gptel-agent-web-worker-search
+                       "<html><body>No result links</body></html>"
+                       "SamuelVanie/gptel-agent" 10 "https://example.test/search"))))
     (should (equal (plist-get result :query) "SamuelVanie/gptel-agent"))
     (should (= (plist-get result :requested-count) 10))
     (should (= (plist-get result :returned-count) 0))
@@ -363,101 +351,29 @@
                                 (gptel-agent--run-finalization-reason run))))
       (should (= (gptel-agent--run-web-tool-calls run) 3)))))
 
-(ert-deftest gptel-agent-web-parser-exception-completes-callback-once ()
-  (let (results)
-    (cl-letf (((symbol-function 'url-retrieve)
-               (lambda (_url callback &rest _)
-                 (let ((buffer (generate-new-buffer " *web-parser-test*")))
-                   (with-current-buffer buffer (funcall callback nil))
-                   buffer))))
-      (gptel-agent--fetch-with-timeout
-       "https://example.test"
-       (lambda (_callback) (error "parser exploded"))
-       (lambda (result) (push result results))
-       "Test fetch"))
-    (should (= (length results) 1))
-    (should (string-match-p "could not be parsed" (car results)))))
-
-(ert-deftest gptel-agent-web-requests-are-noninteractive ()
-  (let (noninteractive result)
-    (cl-letf (((symbol-function 'url-retrieve)
-               (lambda (_url callback &rest _args)
-                 (setq noninteractive url-request-noninteractive)
-                 (let ((buffer (generate-new-buffer " *web-request-test*")))
-                   (with-current-buffer buffer
-                     (funcall callback nil))
-                   buffer))))
-      (gptel-agent--fetch-with-timeout
-       "https://example.test"
-       (lambda (callback) (funcall callback "ok"))
-       (lambda (value) (setq result value))
-       "Test fetch"))
-    (should noninteractive)
-    (should (equal result "ok"))))
-
-(ert-deftest gptel-agent-web-fetch-preserves-json-and-plain-text ()
-  (let (result)
-    (with-temp-buffer
-      (insert "{\"default_branch\":\"master\"}")
-      (let ((url-http-end-of-headers (point-min))
-            (url-http-content-type "application/json; charset=utf-8"))
-        (gptel-agent--web-fetch-callback
-         (lambda (value) (setq result value)) nil)))
-    (should (equal result "{\"default_branch\":\"master\"}"))))
-
-(ert-deftest gptel-agent-web-fetch-falls-back-to-full-html-render ()
-  (let (result)
-    (with-temp-buffer
-      (insert "<html><body>source</body></html>")
-      (let ((url-http-end-of-headers (point-min))
-            (url-http-content-type "text/html; charset=utf-8"))
-        (cl-letf (((symbol-function 'libxml-parse-html-region)
-                   (lambda (&rest _) '(html (body "full"))))
-                  ((symbol-function 'eww-score-readability) #'ignore)
-                  ((symbol-function 'eww-highest-readability)
-                   (lambda (_dom) '(p "tiny")))
-                  ((symbol-function 'shr-insert-document)
-                   (lambda (dom)
-                     (insert (if (eq (car dom) 'p)
-                                 "tiny"
-                               "Full rendered page content")))))
-          (gptel-agent--web-fetch-callback
-           (lambda (value) (setq result value)) nil))))
-    (should (equal result "Full rendered page content"))))
-
-(ert-deftest gptel-agent-web-fetch-rejects-binary-content-clearly ()
-  (let (result)
-    (with-temp-buffer
-      (insert "%PDF binary data")
-      (let ((url-http-end-of-headers (point-min))
-            (url-http-content-type "application/pdf"))
-        (gptel-agent--web-fetch-callback
-         (lambda (value) (setq result value)) nil)))
-    (should (string-match-p "unsupported binary content-type application/pdf"
-                            result))))
-
-(ert-deftest gptel-agent-web-fetch-bounds-large-responses ()
-  (let ((result (gptel-agent--web-fetch-limit (make-string 1500 ?x) 1000)))
-    (should (string-prefix-p (make-string 1000 ?x) result))
-    (should (string-match-p "truncated 500 remaining characters" result))))
-
 (ert-deftest gptel-agent-web-fetch-dispatches-youtube-urls ()
-  (let (generic-fetch video-id result)
-    (cl-letf (((symbol-function 'gptel-agent--yt-fetch-watch-page)
-               (lambda (callback id)
-                 (setq video-id id)
-                 (funcall callback "video transcript")))
-              ((symbol-function 'gptel-agent--fetch-with-timeout)
-               (lambda (&rest _args) (setq generic-fetch t))))
+  (let (kind options result)
+    (cl-letf (((symbol-function 'gptel-agent--web-enqueue)
+               (lambda (callback selected-kind _url selected-options &optional _fsm)
+                 (setq kind selected-kind options selected-options)
+                 (funcall callback "video transcript"))))
       (gptel-agent--read-url
        (lambda (value) (setq result value))
-       "https://www.youtube.com/watch?v=H2qJRnV8ZGA"))
-    (should (equal video-id "H2qJRnV8ZGA"))
+       "https://www.youtube.com/watch?v=H2qJRnV8ZGA" 1200))
+    (should (eq kind 'youtube))
+    (should (equal (plist-get options :video-id) "H2qJRnV8ZGA"))
+    (should (= (plist-get options :max-chars) 1200))
     (should (equal result "video transcript"))
-    (should-not generic-fetch)
     (should (string-match-p
              "YouTube URLs return the video description and transcript"
              (gptel-tool-description (gptel-get-tool "WebFetch"))))))
+
+(ert-deftest gptel-agent-web-tools-describe-conditional-browser-delegation ()
+  (dolist (name '("WebSearch" "WebFetch"))
+    (let ((description (gptel-tool-description (gptel-get-tool name))))
+      (should (string-match-p "agent-browser" description))
+      (should (string-match-p "available.*subagent" description))
+      (should (string-match-p "source URL" description)))))
 
 (ert-deftest gptel-agent-bash-schema-requires-an-extraction-query ()
   (let* ((tool (gptel-get-tool "Bash"))
@@ -598,17 +514,6 @@
         (remhash result-file gptel-agent--saved-tool-results)
         (when (file-exists-p result-file)
           (delete-file result-file))))))
-
-(ert-deftest gptel-agent-web-request-error-includes-response-details ()
-  (with-temp-buffer
-    (insert "Not found on this branch")
-    (let ((url-http-end-of-headers (point-min))
-          (url-http-content-type "text/plain")
-          (url-http-response-status 404))
-      (let ((message (gptel-agent--web-request-error
-                      "Fetch for test" '(error http 404))))
-        (should (string-match-p "HTTP 404, content-type text/plain" message))
-        (should (string-match-p "Not found on this branch" message))))))
 
 (ert-deftest gptel-agent-inspect-link-is-clickable ()
   (let* ((run (gptel-agent--make-run))
