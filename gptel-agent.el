@@ -410,9 +410,9 @@ AGENT-SKILLS is a alist of skill names and associated plist as value
  (See `gptel-agent--skills').  The plist is expected to have
 :description as a key."
   (let ((skills (gptel-agent--model-skills agent-skills)))
-    (concat "Load a skill to get detailed instructions for a specific task."
-            "Skills provide specialized knowledge and step-by-step guidance."
-            "Use this when a task matches an available skill's description."
+    (concat "Skills provide specialized knowledge and step-by-step guidance. "
+            "For a matching task, reuse instructions already in the current "
+            "context; otherwise load the skill."
             "\n<available_skills>\n"
             (mapconcat (lambda (skill-def)
                          (format "  <skill>

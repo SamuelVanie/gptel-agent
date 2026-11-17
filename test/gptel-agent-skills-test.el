@@ -247,7 +247,12 @@
       (should (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
       (should-not (buffer-local-value 'gptel-agent--skill-tools parent))
       (should (equal (gptel-agent-skills-test--wire-names fsm) '("Skill")))
-      (should (gptel-tool-confirm (gptel-get-tool "SkillMutation"))))))
+      (should (gptel-tool-confirm (gptel-get-tool "SkillMutation")))
+      ;; Failed activation must remain visible and retryable on later calls.
+      (gptel-agent-skills-test--load fsm)
+      (should-not (string-match-p "already loaded in the current context" (cdar requests)))
+      (should (= 2 (gptel-agent-workers-test--count
+                    "allowed-tools activation failed" (cdar requests)))))))
 
 (ert-deftest gptel-agent-skills-ambiguous-name-rejected ()
   (let* ((one (gptel--make-tool :name "Same" :category "one" :function #'ignore))
@@ -264,6 +269,123 @@
       (should (equal handlers (gptel-agent--workers-handlers (gptel-agent--workers-for fsm)))))
     (should (= 3 (length (plist-get (gptel-fsm-info fsm) :tools))))
     (should (= 2 (length (buffer-local-value 'gptel-agent--skill-tools parent))))))
+
+(ert-deftest gptel-agent-skills-reuse-current-context-all-providers ()
+  (dolist (backend (list (gptel-make-openai "reuse-oai" :key "unused" :models '(test))
+                        (gptel-make-openai-responses "reuse-responses" :key "unused" :models '(test))
+                        (gptel-make-anthropic "reuse-anthropic" :key "unused" :models '(test))
+                        (gptel-make-gemini "reuse-gemini" :key "unused" :models '(test))))
+    (let ((gptel-agent-workers-test--backend backend))
+      (gptel-agent-skills-test--with-chat ""
+        (gptel-agent-skills-test--load fsm)
+        (gptel-agent-skills-test--load fsm)
+        (should (= 1 (gptel-agent-workers-test--count
+                      "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
+        (should (string-match-p "already loaded in the current context" (cdar requests)))
+        ;; A new turn reparses the transcript, including whitespace trimming.
+        (gptel-agent-workers-test--answer fsm "Ready")
+        (with-current-buffer parent
+          (goto-char (point-max)) (insert "Similar task") (gptel-send))
+        (setq fsm (caar requests))
+        (gptel-agent-skills-test--load fsm)
+        (should (= 1 (gptel-agent-workers-test--count
+                      "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
+        (should (= 2 (gptel-agent-workers-test--count
+                      "already loaded in the current context" (cdar requests))))
+        ;; The source buffer still has the instructions, but the request does not.
+        (gptel-agent-workers-test--answer fsm "Ready again")
+        (with-current-buffer parent
+          (setq-local gptel--num-messages-to-send 0)
+          (goto-char (point-max)) (insert "Task without history") (gptel-send))
+        (setq fsm (caar requests))
+        (should-not (string-match-p "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))
+        (gptel-agent-skills-test--load fsm)
+        (should (= 1 (gptel-agent-workers-test--count
+                      "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
+        (should-not (string-match-p "already loaded in the current context" (cdar requests)))))))
+
+(ert-deftest gptel-agent-skills-changed-instructions-load-again ()
+  (gptel-agent-skills-test--with-chat ""
+    (gptel-agent-skills-test--load fsm)
+    (let ((mtime (file-attribute-modification-time (file-attributes file))))
+      (write-region "UPDATED-WORKFLOW\n" nil file t 'silent)
+      (set-file-times file (time-add mtime 1)))
+    (gptel-agent-skills-test--load fsm)
+    (should (= 2 (gptel-agent-workers-test--count
+                  "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
+    (should (string-match-p "UPDATED-WORKFLOW" (cdar requests)))
+    (should-not (string-match-p "already loaded in the current context" (cdar requests)))))
+
+(ert-deftest gptel-agent-skills-reuse-still-activates-tools ()
+  (gptel-agent-skills-test--with-chat "allowed-tools: SkillMutation\n"
+    (gptel-agent-skills-test--load fsm)
+    (gptel-agent-workers-test--answer fsm "Ready")
+    ;; Restored transcripts can contain instructions without live tool grants.
+    (with-current-buffer parent
+      (setq gptel-agent--skill-tools nil)
+      (goto-char (point-max)) (insert "Use the skill again") (gptel-send))
+    (setq fsm (caar requests))
+    (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+    (gptel-agent-skills-test--load fsm)
+    (should (string-match-p "already loaded in the current context" (cdar requests)))
+    (should (= 1 (gptel-agent-workers-test--count
+                  "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
+    (should (member "SkillMutation" (gptel-agent-skills-test--wire-names fsm)))
+    (gptel-agent-workers-test--tool fsm "SkillMutation" nil)
+    (should (= executions 1))))
+
+(ert-deftest gptel-agent-skills-reuse-preserves-discovery-and-filtering ()
+  (gptel-agent-skills-test--with-chat ""
+    (let* ((global (gptel-agent--skill-copy-tool (gptel-get-tool "Skill")))
+           (gptel--known-tools `(("test" ("Skill" . ,global))))
+           (original (gptel-agent-skills-test--tool fsm "Skill"))
+           (description (gptel-tool-description original)))
+      (gptel-agent-skills-test--load fsm)
+      ;; Discovery and filtering still update the registry immediately; an
+      ;; in-flight request keeps its snapshot until the next user turn.
+      (push (list "another-skill" root :description "Another capability") gptel-agent--skills)
+      (cl-letf (((symbol-function 'completing-read-multiple)
+                 (lambda (&rest _) '("another-skill"))))
+        (gptel-agent-toggle-skill))
+      (should (string-match-p "Another capability" (gptel-tool-description global)))
+      (should-not (string-match-p "Test capability" (gptel-tool-description global)))
+      (should (equal description (gptel-tool-description original)))
+      (gptel-agent-workers-test--answer fsm "Ready")
+      (with-current-buffer parent
+        (goto-char (point-max)) (insert "Next request") (gptel-send))
+      (setq fsm (caar requests))
+      (should (equal (gptel-tool-description global)
+                     (gptel-tool-description (gptel-agent-skills-test--tool fsm "Skill"))))
+      (gptel-agent-skills-test--load fsm)
+      (should (string-match-p "not enabled for this request" (cdar requests)))
+      ;; Re-enabling a loaded skill advertises it and still reuses its body.
+      (cl-letf (((symbol-function 'completing-read-multiple)
+                 (lambda (&rest _) '("test-skill" "another-skill"))))
+        (gptel-agent-toggle-skill))
+      (gptel-agent-workers-test--answer fsm "Ready")
+      (with-current-buffer parent
+        (goto-char (point-max)) (insert "Use the first skill") (gptel-send))
+      (setq fsm (caar requests))
+      (let ((current (gptel-tool-description (gptel-agent-skills-test--tool fsm "Skill"))))
+        (should (string-match-p "Test capability" current))
+        (should (string-match-p "Another capability" current)))
+      (gptel-agent-skills-test--load fsm)
+      (should (string-match-p "already loaded in the current context" (cdar requests)))
+      (should (= 1 (gptel-agent-workers-test--count
+                    "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests)))))))
+
+(ert-deftest gptel-agent-skills-reuse-ignores-ordinary-messages ()
+  (gptel-agent-skills-test--with-chat ""
+    (let* ((result (gptel-agent--get-skill "test-skill"))
+           (data (plist-get (gptel-fsm-info fsm) :data)))
+      (gptel--inject-prompt
+       (plist-get (gptel-fsm-info fsm) :backend) data
+       (list (list :role "user" :content result)
+             (list :role "assistant" :content result)))
+      (gptel-agent-skills-test--load fsm)
+      (should (= 3 (gptel-agent-workers-test--count
+                    "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
+      (should-not (string-match-p "already loaded in the current context" (cdar requests))))))
 
 (ert-deftest gptel-agent-skills-auto-preapproval-is-local ()
   (gptel-agent-skills-test--with-chat "allowed-tools: SkillMutation\n"
@@ -402,6 +524,9 @@
              (id (gptel-agent--session-id session)))
         (should-not (gptel-agent-skills-test--tool first "SkillMutation"))
         (gptel-agent-skills-test--load first)
+        (should (= 1 (gptel-agent-workers-test--count
+                      "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
+        (should-not (string-match-p "already loaded in the current context" (cdar requests)))
         (gptel-agent-followup-test--finish first "First result")
         (gptel-agent-workers-test--tool
          fsm "Agent" (list :subagent_type "researcher" :description "Follow up"
@@ -413,6 +538,9 @@
           ;; Reloading on follow-up must target next, never the completed FSM.
           (gptel-agent-skills-test--load next)
           (should-not (string-match-p "activation failed" (cdar requests)))
+          (should (string-match-p "already loaded in the current context" (cdar requests)))
+          (should (= 1 (gptel-agent-workers-test--count
+                        "SKILL-WORKFLOW-INSTRUCTIONS" (cdar requests))))
           (gptel-agent-workers-test--tool next "SkillMutation" nil)
           (should (= executions 1))
           (gptel-agent-followup-test--finish next "Follow-up result"))))))

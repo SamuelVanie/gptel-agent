@@ -1866,6 +1866,40 @@ anything.  Scoped expressions are deliberately unsupported."
     (error (format "allowed-tools activation failed: %s. No tools or pre-approvals were added."
                    (error-message-string err)))))
 
+(defun gptel-agent--skill-result-in-context-p (result fsm)
+  "Return non-nil when RESULT is already a tool result in FSM's payload.
+Inspect only the messages actually being sent, not conversation-local flags:
+history limits, deleted results and independent chats must allow fresh loads.
+Ignore surrounding whitespace, which gptel trims when parsing saved chats."
+  (let* ((data (and fsm (plist-get (gptel-fsm-info fsm) :data)))
+         (expected (string-trim result)))
+    (when (listp data)
+      (cl-labels ((matches (text)
+                    (and (stringp text) (equal expected (string-trim text)))))
+        (seq-some
+         (lambda (message)
+           (or
+            ;; Chat Completions and Responses API.
+            (and (equal (plist-get message :role) "tool")
+                 (matches (plist-get message :content)))
+            (and (equal (plist-get message :type) "function_call_output")
+                 (matches (plist-get message :output)))
+            ;; Anthropic and Gemini put results inside content/parts blocks.
+            (let ((blocks (or (plist-get message :parts)
+                              (plist-get message :content))))
+              (and (or (listp blocks) (vectorp blocks))
+                   (seq-some
+                    (lambda (block)
+                      (or (and (equal (plist-get block :type) "tool_result")
+                               (matches (plist-get block :content)))
+                          (matches (plist-get
+                                    (plist-get (plist-get block :functionResponse)
+                                               :response)
+                                    :content))))
+                    blocks)))))
+         (or (plist-get data :messages) (plist-get data :contents)
+             (plist-get data :input)))))))
+
 (defun gptel-agent--get-skill (skill &optional _args fsm registry)
   "Return the details of the SKILL.
 
@@ -1874,7 +1908,9 @@ tool in gptel, make sure the known skills are added to the context
 window.  `gptel-agent--skills-system-message' can be used to generate
 the known skills as string ready to be included to the context.
 FSM and REGISTRY are the calling request and its tool registry snapshot;
-they are supplied by the request-local Skill dispatcher for allowed-tools."
+they are supplied by the request-local Skill dispatcher for allowed-tools.
+When the same instructions are already in FSM's context, return a reminder
+instead of duplicating them.  Tool activation still runs on every call."
   (let ((skill-dir
          (car-safe
           (alist-get skill gptel-agent--skills nil nil #'string-equal))))
@@ -1906,7 +1942,12 @@ they are supplied by the request-local Skill dispatcher for allowed-tools."
                     (goto-char start)
                     (while (search-forward-regexp (regexp-quote rel-path) nil t)
                       (replace-match full-path t t))))
-                (buffer-string)))
+                (let ((result (buffer-string)))
+                  (if (and (not diagnostic)
+                           (gptel-agent--skill-result-in-context-p result fsm))
+                      (format "Skill %S is already loaded in the current context. Reuse its instructions from the earlier tool result; do not reload it for a new task or turn."
+                              skill)
+                    result))))
           (format "Could not load body of skill %s" skill))))))
 
 ;;; Task tool (sub-agent)
@@ -4679,10 +4720,11 @@ Each skill provides guidance on how to execute a specific task.
 You can invoke a skill with optional args, the args are for your future reference only.
 
 When to use:
-- When a skill is relevant, you must invoke this tool IMMEDIATELY
-- This is a BLOCKING REQUIREMENT: invoke the relevant Skill tool before generating any other response about the task
+- First check earlier Skill results in the current conversation. Reuse a relevant skill's instructions on later tasks or turns; a new task alone does not require another load.
+- Load a relevant skill before working on the task when its instructions are not already in the current context.
+- Reload only when the instructions have changed, the earlier result is no longer available in context, or a required skill-provided tool needs activation.
 - Only use skills listed below or explicitly requested by the user
-- Do not invoke a skill that is already loaded.
+- Repeated calls for unchanged instructions already in context return a reminder instead of another copy.
 
 How to use:
 - Invoke with the skill name and optional args.  The args are for your reference only

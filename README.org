@@ -832,6 +832,14 @@ integration to delete the branch. Repeated successful cleanup calls are safe.
 
 **** Skill tool declarations
 
+The =Skill= description lists the currently enabled skills and tells the model
+to reuse instructions already in the conversation on later tasks. If the model
+calls =Skill= again for unchanged instructions still in its request context,
+the tool returns a short reminder instead of another copy. Changed instructions
+or results no longer in context are loaded normally. Discovery and
+=gptel-agent-toggle-skill= continue to update the advertised list independently
+of this check.
+
 =allowed-tools= follows the experimental [[https://agentskills.io/specification#allowed-tools-field][Agent Skills specification]]: a
 space-separated string of pre-approved tool names. gptel-agent supports exact,
 uniquely registered names only. Category grants, wildcards and scoped expressions
