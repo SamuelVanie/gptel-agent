@@ -1034,9 +1034,14 @@ recreate the deleted session. To save that family again, run
 Snapshots retain the transcript and gptel's response, tool and reasoning
 boundaries, unsent drafts, queued discussion and main-chat messages, chat IDs,
 ownership, turn counts, working directories and worktree metadata. They also
-retain supported data settings, including the system prompt, model, registered
-backend and tool names, temperature and enabled agent/skill selections. Closed
-discussions keep their transcripts and remain closed after restoration.
+retain supported data settings, including the selected preset name, system
+prompt, model, registered backend and tool names, temperature and enabled
+agent/skill selections. Restoring the preset name does not reapply its definition
+or run its hooks, so saved settings keep any changes made after selecting the
+preset. Preset definitions remain part of your normal Emacs configuration.
+Older snapshots without a preset name cannot recover that selection; select
+the preset again and save the session. Closed discussions keep their transcripts
+and remain closed after restoration.
 
 Active requests and temporary workers are not resumed. Pending question or
 approval callbacks, file-review queues, access grants, attached context,

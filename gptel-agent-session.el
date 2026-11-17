@@ -67,7 +67,7 @@ A single large transcript can exceed this budget; it is written atomically."
   (put symbol 'permanent-local t))
 
 (defconst gptel-agent-session--settings
-  '(gptel-model gptel-system-prompt gptel-stream gptel-use-tools
+  '(gptel--preset gptel-model gptel-system-prompt gptel-stream gptel-use-tools
     gptel-temperature gptel-max-tokens gptel--num-messages-to-send
     gptel-include-reasoning gptel-cache gptel-use-curl gptel-confirm-tool-calls
     gptel-org-convert-response gptel-track-media gptel--request-params
@@ -75,6 +75,7 @@ A single large transcript can exceed this budget; it is written atomically."
     gptel-agent-use-project-instructions gptel-agent--current-agent
     gptel-agent--enabled-agents gptel-agent--enabled-skills gptel-agent--todos)
   "Data settings persisted without request closures, grants or credentials.
+The selected preset name is retained without reapplying its definition.
 Backend and tools are separately stored by registered name.  Context
 attachments, hooks, runtime agent snapshots and approval scopes are excluded.")
 
