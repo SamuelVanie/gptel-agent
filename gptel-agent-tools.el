@@ -3653,8 +3653,6 @@ CALLBACK receives an acknowledgement for edits, or the user's result for wait."
                          (gptel-agent--ask-update-questions
                           (gptel-agent--question-queue-overlay queue) questions)
                        "Error: No questions are queued to update.")))
-       ((seq-some (lambda (item) (plist-member item :question_number)) questions)
-        (setq result "Error: Use action=update to replace a numbered question."))
        (t
         (unless queue
           (let* ((owner (with-current-buffer source
@@ -4890,7 +4888,7 @@ none of the predefined options are suitable."
            :type array :optional t
            :items (:type object
                    :properties (:question_number (:type integer :minimum 1
-                                                  :description "Required for update. Use the number returned by add. Omit when adding.")
+                                                  :description "For update, use the number returned by add. Add assigns a new number regardless of this field.")
                                 :question (:type string)
                                 :choices (:type array
                                           :items (:type object

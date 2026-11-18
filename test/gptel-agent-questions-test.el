@@ -240,6 +240,49 @@
       (should (equal (overlay-get ov 'gptel-ask--custom-responses) ["My custom color" nil]))
       (should (= 1 (overlay-get ov 'gptel-ask--index))))))
 
+(ert-deftest gptel-agent-questions-add-assigns-numbers-despite-backend-fields ()
+  ;; Responses decodes null inside serialized arguments as nil.  Anthropic
+  ;; supplies a parsed input object, where the same JSON null is :null.
+  (dolist (backend (list (gptel-make-openai-responses "q-number-responses"
+                                                      :key "unused" :models '(test))
+                         (gptel-make-anthropic "q-number-anthropic"
+                                               :key "unused" :models '(test))))
+    (let ((gptel-agent-workers-test--backend backend))
+      (gptel-agent-questions-test--with-chat
+        (gptel-agent-workers-test--tool
+         fsm "AskUserQuestion"
+         '(:questions [(:question_number 9 :question "First?" :choices [(:value "Blue")])]))
+        (should (string-match-p "added: 1" (gptel-agent-workers-test--data fsm)))
+        (let ((ov (gptel-agent--question-queue-overlay
+                   (plist-get (gptel-fsm-info fsm) :agent-questions))))
+          (with-current-buffer (overlay-buffer ov)
+            (goto-char (overlay-start ov))
+            (gptel-agent--ask-confirm-choice))
+          ;; Even a number matching a saved question must append on add.
+          (gptel-agent-workers-test--tool
+           fsm "AskUserQuestion"
+           '(:action "add"
+             :questions [(:question "Second?" :question_number :null
+                          :choices [(:value "Green")])
+                         (:question "Third?" :question_number 1
+                          :choices [(:value "Black")])]))
+          (should (string-match-p "added: 2, 3" (gptel-agent-workers-test--data fsm)))
+          (should (equal (overlay-get ov 'gptel-ask--answers) ["Blue" nil nil]))
+          (gptel-agent-workers-test--tool
+           fsm "AskUserQuestion"
+           '(:action "update" :questions [(:question_number 3 :question "Last?"
+                                          :choices [(:value "White")])]))
+          (gptel-agent-workers-test--tool fsm "AskUserQuestion" '(:action "wait"))
+          (let ((call (car (plist-get (gptel-fsm-info fsm) :tool-use))))
+            (with-current-buffer (overlay-buffer ov)
+              (goto-char (overlay-start ov))
+              (gptel-agent--ask-submit)
+              (gptel-agent--ask-confirm-choice)
+              (gptel-agent--ask-confirm-choice)
+              (gptel-agent--ask-submit))
+            (should (equal (plist-get call :result)
+                           "Q1: First?\nR1: Blue\n\nQ2: Second?\nR2: Green\n\nQ3: Last?\nR3: White"))))))))
+
 (ert-deftest gptel-agent-questions-update-reopens-only-changed-questions ()
   (gptel-agent-questions-test--with-chat
     (gptel-agent-workers-test--tool
@@ -538,7 +581,6 @@
       (should (string-match-p "status: empty" result))
       (dolist (args '((nil "add") ([] "add") ([(:question "")] "add")
                       ([(:question "Bad choices" :choices [(:value 7)])] "add")
-                      ([(:question_number 1 :question "Number on add")] "add")
                       (nil "unknown")
                       ([(:question_number 1 :question "Missing queue")] "update")))
         (apply dispatch (lambda (value) (setq result value)) args)
