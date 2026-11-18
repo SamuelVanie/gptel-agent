@@ -4,8 +4,12 @@
 
 ** New features and UI changes
 
+- Session titles now wait until at least one message has been sent. Autosaving
+  an unfinished first prompt no longer names the chat. Title context excludes
+  unsent follow-up drafts, and the submitted-message boundary survives restore.
+
 - Saved sessions now generate a short conversation title on their first save
-  with message content, using the first and last messages (or the sole message).
+  with sent history, using the first and last messages (or the sole message).
   The title also renames the buffer to ~*gptel:TITLE*~ and remains unchanged
   through later saves and restores. Configure the title model with
   ~gptel-agent-session-title-preset~, using a named preset or plist just like

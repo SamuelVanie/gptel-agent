@@ -43,7 +43,8 @@ A single large transcript can exceed this budget; it is written atomically."
   :type 'number :group 'gptel-agent)
 
 (defcustom gptel-agent-session-auto-title t
-  "Generate a short title when saving a chat that has no title yet.
+  "Generate a short title when saving a chat with sent message history.
+Unsent drafts do not trigger generation or contribute to the title.
 Titles use `gptel-agent-session-title-preset' and also rename the chat
 buffer using the *gptel:TITLE* convention.  Once generated, a title is
 never automatically updated.  Set to nil to generate titles only on
@@ -64,7 +65,8 @@ requests, which always use a dedicated title-generation system prompt."
 (defcustom gptel-agent-session-title-context-function
   #'gptel-agent-session--title-context
   "Function returning conversation text for a session title, or nil.
-Called without arguments in the widened chat buffer when saving.
+Called without arguments in the chat buffer narrowed to sent history.
+It is not called until at least one message has been sent.
 The default uses the first and last nonempty user or assistant messages,
 up to 4000 characters each, skipping tools and reasoning.  If there is
 only one message, that message alone supplies the context."
@@ -89,6 +91,8 @@ only one message, that message alone supplies the context."
 (defvar-local gptel-agent-session--title nil)
 (defvar-local gptel-agent-session--title-context-hash nil)
 (defvar-local gptel-agent-session--title-request nil)
+(defvar-local gptel-agent-session--sent-end nil
+  "Marker at the end of the latest submitted prompt, excluding new drafts.")
 (defvar-local gptel-agent-session--excluded nil
   "Non-nil when this live chat was explicitly removed from session saving.")
 (defvar-local gptel-agent-session--list-directory nil)
@@ -96,7 +100,7 @@ only one message, that message alone supplies the context."
                   gptel-agent-session--chat gptel-agent-session--last-save gptel-agent-session--last-attempt
                   gptel-agent-session--error gptel-agent-session--excluded
                   gptel-agent-session--title gptel-agent-session--title-context-hash
-                  gptel-agent-session--title-request))
+                  gptel-agent-session--title-request gptel-agent-session--sent-end))
   (put symbol 'permanent-local t))
 
 (defconst gptel-agent-session--settings
@@ -131,6 +135,62 @@ attachments, hooks, runtime agent snapshots and approval scopes are excluded.")
 (defun gptel-agent-session--name ()
   "Return the current session's generated title or buffer-name fallback."
   (or gptel-agent-session--title (buffer-name)))
+
+(defun gptel-agent-session--sent-position (fsm)
+  "Return FSM's submitted prompt end in this chat, or nil before dispatch."
+  (when (and (gptel-fsm-p fsm)
+             (memq #'gptel--handle-post-insert
+                   (alist-get 'DONE
+                              (if-let* ((gate (gptel-agent--workers-for fsm)))
+                                  (gptel-agent--workers-handlers gate)
+                                (gptel-fsm-handlers fsm)))))
+    (let* ((info (gptel-fsm-info fsm)) (position (plist-get info :position)))
+      (when (and (eq (plist-get info :buffer) (current-buffer))
+                 (markerp position) (eq (marker-buffer position) (current-buffer))
+                 (or (eq (gptel-fsm-state fsm) 'WAIT)
+                     (memq 'WAIT (plist-get info :history))))
+        (marker-position position)))))
+
+(defun gptel-agent-session--sent (fsm)
+  "Record the submitted prompt boundary after FSM actually starts a request."
+  (when-let* (((and gptel-agent-session-mode (not gptel-agent-session--restoring)))
+              (buffer (plist-get (gptel-fsm-info fsm) :buffer))
+              ((gptel-agent-session--eligible-p buffer)))
+    (with-current-buffer buffer
+      (when-let* ((position (gptel-agent-session--sent-position fsm)))
+        (unless (and (markerp gptel-agent-session--sent-end)
+                     (eq (marker-buffer gptel-agent-session--sent-end) buffer)
+                     (>= gptel-agent-session--sent-end position))
+          ;; Do not advance when the user types at the send position while
+          ;; waiting for a response.  Response properties extend history below.
+          (setq gptel-agent-session--sent-end (copy-marker position nil))
+          (gptel-agent-session--changed))))))
+
+(defun gptel-agent-session--history-end ()
+  "Return the end of sent history in the widened chat, excluding its draft.
+Response properties also recognize old sessions without a saved send marker."
+  (let ((end (max (or (and (markerp gptel-agent-session--sent-end)
+                           (eq (marker-buffer gptel-agent-session--sent-end) (current-buffer))
+                           (marker-position gptel-agent-session--sent-end)) 0)
+                  ;; Session mode may have been enabled after dispatch.
+                  (or (gptel-agent-session--sent-position gptel-agent-discussion--fsm) 0)
+                  (or (gptel-agent-session--sent-position gptel--fsm-last) 0)))
+        (position (point-max)) found)
+    (while (and (not found) (> position (max end (point-min))))
+      (let* ((start (previous-single-property-change position 'gptel nil (point-min)))
+             (role (get-text-property start 'gptel)))
+        (when (memq (if (consp role) (car role) role) '(response reasoning tool))
+          (setq end (max end position) found t))
+        (setq position start)))
+    (when (> end (point-min)) (min end (point-max)))))
+
+(defun gptel-agent-session--title-history-context ()
+  "Call the title context function on sent history only, or return nil."
+  (save-restriction
+    (widen)
+    (when-let* ((end (gptel-agent-session--history-end)))
+      (narrow-to-region (point-min) end)
+      (funcall gptel-agent-session-title-context-function))))
 
 (defun gptel-agent-session--title-edge (backward)
   "Return the first message in the accessible buffer, or last if BACKWARD.
@@ -258,10 +318,8 @@ Return (START ROLE TEXT), skipping tool, reasoning and ignored regions."
              (not gptel-agent-session--title-request)
              (gptel-agent-session--eligible-p (current-buffer)))
     (condition-case err
-        (save-restriction
-          (widen)
-          (gptel-agent-session--request-title
-           (funcall gptel-agent-session-title-context-function)))
+        (gptel-agent-session--request-title
+         (gptel-agent-session--title-history-context))
       (error (message "Session title generation failed: %s" (error-message-string err))))))
 
 ;;;###autoload
@@ -274,12 +332,10 @@ Uses `gptel-agent-session-title-context-function' and
                (gptel-agent-session--eligible-p (current-buffer)))
     (user-error "Enable session mode in a chat included in session saving first"))
   (gptel-agent-session--track)
-  (save-restriction
-    (widen)
-    (let ((context (funcall gptel-agent-session-title-context-function)))
-      (unless (and (stringp context) (not (string-blank-p context)))
-        (user-error "No conversation text to generate a title"))
-      (gptel-agent-session--request-title context t))))
+  (let ((context (gptel-agent-session--title-history-context)))
+    (unless (and (stringp context) (not (string-blank-p context)))
+      (user-error "No sent conversation history to generate a title"))
+    (gptel-agent-session--request-title context t)))
 
 (defun gptel-agent-session--mark-dirty (&rest _)
   "Enqueue the current registered chat once, without inspecting its text."
@@ -339,6 +395,10 @@ Uses `gptel-agent-session-title-context-function' and
   (setq gptel-agent-session--id nil gptel-agent-session--parent-id nil
         gptel-agent-session--title nil gptel-agent-session--title-context-hash nil
         gptel-agent-session--title-request nil
+        gptel-agent-session--sent-end
+        (when-let* ((position (and (markerp gptel-agent-session--sent-end)
+                                   (marker-position gptel-agent-session--sent-end))))
+          (copy-marker position nil))
         gptel-agent-session--chat nil gptel-agent-session--last-save 0
         gptel-agent-session--last-attempt 0
         gptel-agent-session--revision 0 gptel-agent-session--staged-revision 0
@@ -413,6 +473,7 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
         (list :version 1 :id gptel-agent-session--id
               :parent gptel-agent-session--parent-id :name (gptel-agent-session--name)
               :title gptel-agent-session--title :buffer-name (buffer-name)
+              :sent-end (gptel-agent-session--history-end)
               :directory default-directory :source-file buffer-file-name
               :mode (cond ((derived-mode-p 'org-mode) 'org-mode)
                           ((derived-mode-p 'markdown-mode) 'markdown-mode)
@@ -822,6 +883,11 @@ with a prefix argument to `gptel-agent-session-save'."
           (gptel--restore-props (plist-get record :bounds))
           (setq gptel-agent-session--id (plist-get record :id)
                 gptel-agent-session--title (plist-get record :title)
+                gptel-agent-session--sent-end
+                (when-let* ((position (plist-get record :sent-end))
+                            ((integerp position))
+                            ((<= (point-min) position (point-max))))
+                  (copy-marker position nil))
                 gptel-agent-session--parent-id (plist-get record :parent)
                 gptel-agent-session--last-save (float-time)
                 gptel-agent-discussion--inbox (plist-get record :inbox)
@@ -1035,6 +1101,7 @@ approval callbacks cannot survive a restart and are never replayed."
 (defconst gptel-agent-session--advice
   '((rename-buffer :after gptel-agent-session--changed)
     (gptel-send :after gptel-agent-session--changed)
+    (gptel--handle-wait :after gptel-agent-session--sent)
     (gptel-agent-discussion--create :filter-return gptel-agent-session--created)
     (gptel-agent-discussion--emit :after gptel-agent-session--chat-changed)
     (gptel-agent-discussion--send :after gptel-agent-session--chat-changed)

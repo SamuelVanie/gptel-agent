@@ -36,6 +36,9 @@
            (gptel-agent-session-auto-title t)
            requests)
        (gptel-agent-session-mode 1)
+       ;; Most unit fixtures represent a submitted prompt awaiting its answer.
+       (with-current-buffer buffer
+         (setq gptel-agent-session--sent-end (copy-marker (point-max) nil)))
        (cl-letf (((symbol-function 'gptel-request)
                   (lambda (prompt &rest args)
                     (push (list :prompt prompt :args args :buffer (current-buffer)
@@ -230,16 +233,115 @@
       (gptel-agent-session-generate-title)
       (should (equal "Custom context" (plist-get (car requests) :prompt))))))
 
-(ert-deftest gptel-agent-session-title-empty-chat-waits-for-message ()
+(ert-deftest gptel-agent-session-title-empty-chat-waits-for-sent-message ()
   (gptel-agent-session-title-test--with-request
     (erase-buffer)
     (gptel-agent-session-save)
     (should-not requests)
     (insert "The first message")
     (gptel-agent-session--drain)
+    (should-not requests)
+    (gptel-agent-session--sent
+     (gptel-make-fsm :state 'WAIT :handlers gptel-send--handlers
+                     :info (list :buffer buffer :position (point-marker))))
+    (gptel-agent-session--drain)
     (should (= 1 (length requests)))
     (should (equal "First message (User):\nThe first message"
                    (plist-get (car requests) :prompt)))))
+
+(ert-deftest gptel-agent-session-title-unsent-draft-stays-unnamed-after-restoring ()
+  (gptel-agent-session-title-test--with-request
+    (setq gptel-agent-session--sent-end nil)
+    (let ((gptel-agent-session-title-context-function
+           (lambda () (ert-fail "Drafts must not reach the title context function"))))
+      (gptel-agent-session-save)
+      (goto-char (point-max))
+      (insert "Still writing the initial prompt")
+      (gptel-agent-session--drain)
+      (should-not requests)
+      (should (equal " *dated-session*" (buffer-name)))
+      (should-error (gptel-agent-session-generate-title) :type 'user-error)
+      (let ((id gptel-agent-session--id))
+        (gptel-agent-session-test--forget buffer)
+        (with-current-buffer (gptel-agent-session-restore id)
+          (should-not (gptel-agent-session--history-end))
+          (should-error (gptel-agent-session-generate-title) :type 'user-error)
+          (gptel-agent-session-save)))
+      (should-not requests))))
+
+(ert-deftest gptel-agent-session-title-sent-boundary-survives-restore ()
+  (gptel-agent-session-title-test--with-request
+    (goto-char (point-max))
+    (insert "A new unsent draft")
+    (let ((gptel-agent-session-auto-title nil)
+          (id gptel-agent-session--id))
+      (gptel-agent-session-save)
+      (should-not requests)
+      (gptel-agent-session-test--forget buffer)
+      (with-current-buffer (gptel-agent-session-restore id)
+        (gptel-agent-session-generate-title)
+        (should (equal "First message (User):\nExplain session names"
+                       (plist-get (car requests) :prompt)))))))
+
+(ert-deftest gptel-agent-session-title-legacy-history-excludes-followup-draft ()
+  (gptel-agent-session-title-test--with-request
+    ;; Old archives may have response properties but no submitted-prompt marker.
+    (setq gptel-agent-session--sent-end nil)
+    (goto-char (point-max))
+    (insert (propertize "An existing answer" 'gptel 'response 'rear-nonsticky t)
+            "An unfinished follow-up")
+    (gptel-agent-session-save)
+    (should (equal (plist-get (car requests) :prompt)
+                   (concat "First message (User):\nExplain session names"
+                           "\n\nLast message (Assistant):\nAn existing answer")))))
+
+(ert-deftest gptel-agent-session-title-plain-chat-waits-for-dispatch ()
+  (gptel-agent-session-test--with-store
+    (let ((buffer (gptel-agent-session-test--buffer
+                   " *unsent-plain-chat*" "Sent first message\nUnsent remainder"))
+          (gptel-agent-session-auto-title t)
+          requests)
+      (gptel-agent-session-mode 1)
+      (cl-letf (((symbol-function 'gptel-curl-get-response)
+                 (lambda (fsm)
+                   ;; The real transport installs this default callback.
+                   (unless (plist-get (gptel-fsm-info fsm) :callback)
+                     (setf (gptel-fsm-info fsm)
+                           (plist-put (gptel-fsm-info fsm) :callback #'gptel--insert-response)))
+                   (push fsm requests)))
+                ((symbol-function 'gptel--update-status) #'ignore))
+        (with-current-buffer buffer
+          (setq-local gptel-use-curl t gptel-stream nil
+                      gptel-prompt-transform-functions nil)
+          (gptel-agent-session-save)
+          (should-not requests)
+          (goto-char (point-min))
+          (end-of-line)
+          (let ((gptel-prompt-transform-functions
+                 (list (lambda (_fsm) (error "Request preparation failed")))))
+            (should-error (gptel-send)))
+          (gptel-agent-session-save)
+          (should-not requests)
+          (should-not gptel-agent-session--sent-end)
+          (gptel-send)
+          (should (= 1 (length requests)))
+          (should (= (point) gptel-agent-session--sent-end))
+          (gptel-agent-session-save)
+          (should (= 2 (length requests)))
+          (let ((data (prin1-to-string (plist-get (gptel-fsm-info (car requests)) :data))))
+            (should (string-match-p "Sent first message" data))
+            (should-not (string-match-p "Unsent remainder" data)))
+          ;; Retry naming after an empty title result and a completed reply.
+          ;; Both the original unsent suffix and the new draft remain private.
+          (gptel-agent-workers-test--answer (car requests) "")
+          (gptel-agent-workers-test--answer (cadr requests) "A completed answer")
+          (goto-char (point-max))
+          (insert "Still writing a follow-up")
+          (gptel-agent-session-save)
+          (should (= 3 (length requests)))
+          (let ((data (prin1-to-string (plist-get (gptel-fsm-info (car requests)) :data))))
+            (should (string-match-p "A completed answer" data))
+            (should-not (string-match-p "Unsent remainder\\|Still writing a follow-up" data))))))))
 
 (ert-deftest gptel-agent-session-title-buffer-name-collisions-keep-both-chats ()
   (gptel-agent-session-title-test--with-request

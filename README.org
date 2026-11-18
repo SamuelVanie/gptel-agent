@@ -1018,12 +1018,14 @@ Send a new message normally, or use =gptel-agent-discussion-resume= in a chat
 without an unsent draft to resume delivery of queued discussion messages.
 =M-x gptel-agent-session-save= saves changed chats immediately.
 
-The first save of a chat with message content automatically requests a short
-conversation title. By default, the title model sees the first and last
+The first save of a chat with at least one sent message automatically requests
+a short conversation title. By default, the title model sees the first and last
 nonempty user or assistant messages, shortened to 4000 characters each. If
-there is only one message, that message alone is used. Tool output and
-reasoning are excluded. The title appears in the session browser and restore
-picker and renames the current buffer to =*gptel:TITLE*=, matching spawned
+there is only one sent message, that message alone is used, even while its
+response is pending. Unsent drafts, tool output and reasoning are excluded.
+Saving a draft before sending anything never generates a title. The title
+appears in the session browser and restore picker and renames the current
+buffer to =*gptel:TITLE*=, matching spawned
 discussions. The title and buffer name survive restarting Emacs. Until a title
 is available, the session uses its existing buffer name.
 
@@ -1051,7 +1053,10 @@ the background; its result is queued for autosaving like other metadata.
 
 To change which messages inform the title, customize
 =gptel-agent-session-title-context-function=. It takes no arguments and returns
-a string from the widened current chat buffer, or =nil= to skip generation.
+a string from the current chat narrowed to sent history, or =nil= to skip
+generation. It is not called for a draft-only chat, including on explicit
+title generation. Saved sessions retain the sent-message boundary across
+restarts.
 Title requests always use a dedicated system prompt with tools, attached
 context and prompt transforms disabled.
 
