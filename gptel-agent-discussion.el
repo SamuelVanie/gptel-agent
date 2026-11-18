@@ -934,6 +934,7 @@ new Git worktree from that directory and start the chat in its root."
                   :id id :title title :owner owner :buffer buffer :worktree worktree)))
       (condition-case err
           (with-current-buffer buffer
+            (gptel-agent--child-buffer-created owner buffer 'discussion)
             (setq default-directory directory)
             (funcall gptel-default-mode)
             (dolist (entry config)

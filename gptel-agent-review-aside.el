@@ -12,6 +12,7 @@
 (require 'gptel-agent-review)
 
 (declare-function gptel-agent--copy-parent-request-config "gptel-agent-tools")
+(declare-function gptel-agent--child-buffer-created "gptel-agent-tools")
 (declare-function gptel-agent-instructions--transform "gptel-agent-instructions")
 (declare-function smv/gptel-ediff-open "gptel-ediff-prehook")
 (defvar gptel-agent-instructions--targets)
@@ -118,6 +119,9 @@
          ready)
     (unwind-protect
         (with-current-buffer buffer
+          ;; Session hooks can run as soon as gptel-mode starts.
+          (setq-local gptel-agent--child-chat-p t)
+          (gptel-agent--child-buffer-created owner buffer 'review-aside)
           ;; The source prompt is already flattened (including Org topics).
           ;; Do not reinterpret its headings or file snapshots as Org branches
           ;; or GPTEL_* configuration properties in this independent chat.
@@ -152,7 +156,6 @@
           (insert "\n\n")
           (set-text-properties (- (point) 2) (point) nil)
           (gptel-mode 1)
-          (setq-local gptel-agent--child-chat-p t)
           (gptel-agent-review-aside-mode 1)
           (setq-local gptel-agent-review-aside--draft-start (point-marker))
           (setq-local header-line-format

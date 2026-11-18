@@ -254,6 +254,26 @@ Keep this origin even after closing monitoring or changing major modes, so
 the buffer cannot become a main-chat messaging endpoint.")
 (put 'gptel-agent--child-chat-p 'permanent-local t)
 
+(defvar-local gptel-agent-session-managed-externally nil
+  "Non-nil when a host owns this buffer's persistence.
+Hosts should set this before enabling `gptel-mode'.  Such buffers and
+their agent and discussion descendants are excluded from the global
+session catalog, including after session mode is enabled or restarted.")
+(put 'gptel-agent-session-managed-externally 'permanent-local t)
+
+(defvar gptel-agent-child-buffer-functions nil
+  "Functions notified once when an agent, discussion or review aside is created.
+Each receives PARENT, CHILD and KIND (`agent', `discussion' or `review-aside') before
+the first request.  Hosts may attach transcript or lifecycle observers.")
+
+(defun gptel-agent--child-buffer-created (parent child kind)
+  "Inherit PARENT's persistence ownership in CHILD and notify observers of KIND."
+  (with-current-buffer child
+    (when (buffer-local-value 'gptel-agent-session-managed-externally parent)
+      (setq-local gptel-agent-session-managed-externally t)))
+  (with-current-buffer parent
+    (run-hook-with-args 'gptel-agent-child-buffer-functions parent child kind)))
+
 (defvar-local gptel-agent--sessions nil
   "Sub-agent conversations owned by this buffer, keyed by stable agent ID.")
 (put 'gptel-agent--sessions 'permanent-local t)
@@ -3217,6 +3237,8 @@ the child's current directory."
                     #'gptel-agent--handle-child-buffer-kill nil t))
         (condition-case err
             (progn
+              (unless previous
+                (gptel-agent--child-buffer-created parent-buffer child-buffer 'agent))
               (setq task-timeout
                     (if previous (gptel-agent--run-task-timeout previous)
                       (gptel-agent--supervision-value

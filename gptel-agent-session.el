@@ -122,7 +122,8 @@ attachments, hooks, runtime agent snapshots and approval scopes are excluded.")
   "Whether BUFFER is an ordinary chat, including a closed discussion."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
-         (and gptel-mode (not gptel-agent-session--excluded)
+         (and gptel-mode (not gptel-agent-session-managed-externally)
+              (not gptel-agent-session--excluded)
               (not gptel-agent--supervised-run)
               (not (bound-and-true-p gptel-agent-review-aside-mode))
               (not (bound-and-true-p gptel-agent-review-aside--path))
@@ -342,7 +343,7 @@ Uses `gptel-agent-session-title-context-function' and
 (defun gptel-agent-session--mark-dirty (&rest _)
   "Enqueue the current registered chat once, without inspecting its text."
   (when (and gptel-agent-session-mode gptel-agent-session--id
-             (not gptel-agent-session--excluded)
+             (not gptel-agent-session-managed-externally) (not gptel-agent-session--excluded)
              (not gptel-agent-session--restoring)
              (not (eq (current-buffer) gptel-agent-session--closing)))
     (cl-incf gptel-agent-session--revision)
@@ -568,6 +569,8 @@ ALL finishes each initially queued family without the automatic interval."
 With prefix INCLUDE-CURRENT, resume saving the current live discussion
 family after deleting its snapshots with `gptel-agent-session-delete'."
   (interactive "P")
+  (when (and include-current gptel-agent-session-managed-externally)
+    (user-error "This chat is saved by its workflow host"))
   (unless gptel-agent-session-mode (gptel-agent-session-mode 1))
   (when include-current
     (unless gptel-agent-session--id (gptel-agent-session--track))
@@ -625,7 +628,8 @@ family after deleting its snapshots with `gptel-agent-session-delete'."
       (puthash (plist-get record :id) record index))
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
-        (when (and gptel-agent-session--id (not gptel-agent--supervised-run))
+        (when (and gptel-agent-session--id (not gptel-agent-session-managed-externally)
+                   (not gptel-agent--supervised-run))
           (puthash gptel-agent-session--id
                    (list :id gptel-agent-session--id :parent gptel-agent-session--parent-id
                          :name (gptel-agent-session--name)
@@ -890,12 +894,13 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
               (put-text-property (point) (line-end-position)
                                  'keymap gptel--markdown-block-map))))))))
 
-(defun gptel-agent-session--restore-buffer (record)
-  "Restore RECORD as an ordinary buffer; do not connect or send requests yet."
+(defun gptel-agent-session--restore-buffer (record &optional external)
+  "Restore RECORD into a buffer, with host-owned persistence if EXTERNAL."
   (let ((buffer (generate-new-buffer (or (plist-get record :buffer-name)
                                         (plist-get record :name)))))
     (condition-case err
         (with-current-buffer buffer
+          (when external (setq-local gptel-agent-session-managed-externally t))
           (let ((mode (plist-get record :mode)))
             (unless (memq mode '(text-mode org-mode markdown-mode))
               (error "Unsupported saved chat mode %S" mode))
@@ -949,7 +954,8 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
           (add-hook 'gptel-prompt-transform-functions #'gptel-agent-discussion--localize t t)
           (add-hook 'gptel-prompt-transform-functions #'gptel-agent-chat--localize t t)
           (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
-          (add-hook 'after-change-functions #'gptel-agent-session--mark-dirty nil t)
+          (unless external
+            (add-hook 'after-change-functions #'gptel-agent-session--mark-dirty nil t))
           (when-let* ((narrow (plist-get record :narrow)))
             (narrow-to-region (car narrow) (cdr narrow)))
           (goto-char (min (point-max) (max (point-min) (plist-get record :point))))
@@ -1036,10 +1042,11 @@ Saving this way works independently of `gptel-agent-session-mode'."
         (error "Invalid standalone gptel session record")))))
 
 ;;;###autoload
-(defun gptel-agent-session-buffer-from-record (record)
+(defun gptel-agent-session-buffer-from-record (record &optional external)
   "Restore one independent editable chat from native session RECORD.
 The returned buffer has its own identity.  Global session mode, when
-already enabled, tracks it as a new conversation.  Importing a chat
+already enabled, tracks it as a new conversation unless EXTERNAL is
+non-nil, in which case persistence belongs to the caller.  Importing a chat
 leaves it undisplayed and sends no requests."
   (setq record (gptel-agent-session--standalone-record record))
   (gptel-agent-session--check-standalone record)
@@ -1048,8 +1055,9 @@ leaves it undisplayed and sends no requests."
   (require 'gptel-agent)
   (let ((buffer (let ((gptel-agent-session--restoring t))
                   (gptel-agent-session--restore-buffer
-                   (plist-put record :id (gptel-agent-session--new-id))))))
-    (gptel-agent-session--track buffer)
+                   (if external record (plist-put record :id (gptel-agent-session--new-id)))
+                   external))))
+    (unless external (gptel-agent-session--track buffer))
     buffer))
 
 ;;;###autoload
@@ -1071,12 +1079,13 @@ session snapshot format.  Family autosaving is independent of this file."
   (gptel-agent-session-write-record (gptel-agent-session-buffer-record buffer) file))
 
 ;;;###autoload
-(defun gptel-agent-session-import-buffer (file)
+(defun gptel-agent-session-import-buffer (file &optional external)
   "Read local session snapshot FILE into a new ordinary gptel buffer.
-Return the editable buffer, preserving the archived chat and its draft."
+Return the editable buffer, preserving the archived chat and its draft.
+When EXTERNAL is non-nil, the caller owns the imported chat's persistence."
   (setq file (expand-file-name file))
   (when (file-remote-p file) (user-error "Session storage must be local"))
-  (gptel-agent-session-buffer-from-record (gptel-agent-session--read-record file)))
+  (gptel-agent-session-buffer-from-record (gptel-agent-session--read-record file) external))
 
 ;;;###autoload
 (defun gptel-agent-session-restore (id)

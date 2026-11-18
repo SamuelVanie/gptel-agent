@@ -998,7 +998,9 @@ Add this after loading =gptel-agent= in your init file:
 #+end_src
 
 The mode saves ordinary main chats and the discussions they create, including
-nested discussions. Temporary =Agent= worker buffers and file-review asides
+nested discussions. A host such as =gptel-runner= owns the sessions for
+its workflow node chats and their descendants. Open a saved pipeline
+with =M-x gptel-runner-open-session=. Temporary =Agent= worker buffers and file-review asides
 are excluded. Each chat has its own immutable snapshot and a persistent parent ID, so a
 restored main chat can list, read and message its existing discussions and
 create new ones. The child buffers remain ordinary editable gptel chats.
@@ -1156,8 +1158,17 @@ model and settings. For a standalone local file, use
 =(gptel-agent-session-import-buffer FILE)=. A host that already holds a
 record can save it with =(gptel-agent-session-write-record RECORD FILE)=,
 even after the chat closes. Imports return an undisplayed buffer with a
-fresh identity. Both forms work with session autosaving
-disabled. When autosaving is enabled it tracks the imported chat separately.
+fresh identity by default. Both forms work with session autosaving disabled.
+When the host owns persistence, pass =t= as the optional =EXTERNAL= argument
+to =gptel-agent-session-buffer-from-record= or =gptel-agent-session-import-buffer=.
+The host can then reopen the conversation with its own run history.
+
+In a new host-owned chat, set =gptel-agent-session-managed-externally=
+buffer-locally before enabling =gptel-mode=. The global agent session catalog
+excludes the chat and its descendants even when session autosaving is enabled
+later. To retain nested transcripts, install a function on
+=gptel-agent-child-buffer-functions=. It receives the parent buffer, new child
+buffer, and child kind (=agent= or =discussion=) before the first request.
 
 Before starting a host-owned invocation, call =gptel-agent-supervise= with
 its buffer. The returned opaque handle covers its agent workers, managed
