@@ -2756,6 +2756,7 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
     (TPRE ,#'gptel--handle-pre-tool ,#'gptel--fsm-transition)
     (TOOL ,#'gptel-agent--handle-task-tool)
     (TRET ,#'gptel-agent--handle-task-tool-result)
+    (TSTR ,#'gptel--handle-tool-steer)
     (ERRS ,#'gptel-agent--handle-task-error)
     (DONE ,#'gptel-agent--handle-task-done)
     (ABRT ,#'gptel-agent--handle-task-abort))
@@ -3718,7 +3719,7 @@ interaction."
 (defun gptel-agent--ask-select-choice (n)
   "Select choice N and update display."
   (interactive)
-  (when-let ((ov (gptel-agent--ask-overlay-at-point))
+  (when-let* ((ov (gptel-agent--ask-overlay-at-point))
              (choices (overlay-get ov 'gptel-ask--choices)))
     (when (< n (length choices))
       (when-let* ((selections (overlay-get ov 'gptel-ask--selections))
@@ -3869,7 +3870,7 @@ interaction."
 (defun gptel-agent--ask-cancel ()
   "Cancel ask interaction."
   (interactive)
-  (when-let ((ov (gptel-agent--ask-overlay-at-point)))
+  (when-let* ((ov (gptel-agent--ask-overlay-at-point)))
     (let ((cb (overlay-get ov 'gptel-ask--callback)))
       (gptel-agent--ask-teardown ov)
       (when cb (funcall cb "User cancelled interaction.")))))

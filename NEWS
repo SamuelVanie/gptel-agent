@@ -2,6 +2,17 @@
 
 * 0.0.5-pre
 
+** Compatibility fixes
+
+- Require gptel 0.9.9.6 or newer, matching the system-prompt and tool-steering
+  APIs used by the package. Subagents now continue after rejecting a tool with
+  steering instructions instead of stopping in the new steering state.
+
+- Compaction with extra instructions now preserves gptel's parsed directive
+  structure, including conversation templates and function-valued prompts.
+
+- Markdown agent files without YAML frontmatter retain their prompt text.
+
 ** New features and UI changes
 
 - Session titles now wait until at least one message has been sent. Autosaving

@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 Karthik Chikmagalur
 
 ;; Version: 0.0.1
-;; Package-Requires: ((emacs "29.1") (compat "30.1.0.0") (gptel "0.9.9") (yaml "1.2.0") (orderless "1.1"))
+;; Package-Requires: ((emacs "29.1") (compat "30.1.0.0") (gptel "0.9.9.6") (yaml "1.2.0") (orderless "1.1"))
 ;; Keywords: comm
 ;; URL: https://github.com/karthink/gptel-agent
 
@@ -1000,10 +1000,11 @@ Signals an error if:
       (if (not (looking-at-p "^---[ \t]*$"))
           ;; No frontmatter; return plist with :system key containing entire file
           ;; content.
-          (when templates               ;Apply template substitutions
-            (gptel-agent--expand-templates (point-min) templates))
-          (list :system (buffer-substring-no-properties
-                         (point-min) (point-max)))
+          (progn
+            (when templates             ;Apply template substitutions
+              (gptel-agent--expand-templates (point-min) templates))
+            (list :system (buffer-substring-no-properties
+                           (point-min) (point-max))))
         ;; Move past opening delimiter
         (forward-line 1)
         (let ((frontmatter-start (point)))
@@ -1176,8 +1177,10 @@ confirmation before proceeding."
          (fsm (gptel-request nil
                 :system
                 (if extra
-                    (concat (gptel--parse-directive gptel-agent-compact-prompt t)
-                            "\n\nAdditional instructions:\n\n" extra)
+                    (let ((parts (gptel--parse-directive gptel-agent-compact-prompt t)))
+                      (cons (concat (car parts)
+                                    "\n\nAdditional instructions:\n\n" extra)
+                            (cdr parts)))
                   gptel-agent-compact-prompt)
                 :transforms (list 'gptel-agent-instructions--skip
                                   'gptel--transform-add-context)
@@ -1200,7 +1203,7 @@ this session, which defaults to the default `gptel-agent'."
   (interactive
    (list (if current-prefix-arg
              (funcall project-prompter)
-           (if-let ((proj (project-current)))
+           (if-let* ((proj (project-current)))
                (project-root proj)
              default-directory))
          'gptel-agent))

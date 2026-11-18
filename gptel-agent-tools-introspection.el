@@ -68,7 +68,7 @@
 
 (defun gptel-agent--introspect-library-source (library-name)
   "Return the source code of LIBRARY-NAME as a string."
-  (if-let ((library (find-library-name library-name)))
+  (if-let* ((library (find-library-name library-name)))
       (with-temp-buffer
         (progn
           (insert-file-contents library)
@@ -219,7 +219,7 @@ style language anc content.")
 
 (gptel-make-tool
  :function (lambda (feature)
-             (if-let ((feature-symbol (intern-soft feature)))
+             (if-let* ((feature-symbol (intern-soft feature)))
                  (when (featurep feature-symbol)
                    feature)
                (find-library-name feature)))
@@ -286,7 +286,7 @@ docstring next and finally try to complete the prefix of the symbol .")
  :name "function_source"
  :include t
  :function (lambda (symbol)
-             (when-let ((symbol (intern-soft symbol)))
+             (when-let* ((symbol (intern-soft symbol)))
                (gptel-agent--introspect-source symbol)))
  :category "introspection"
  :args '(( :name "function"
@@ -314,7 +314,7 @@ using `library_source'.  This tool is cheap.  Use it liberally.")
 (gptel-make-tool
  :name "variable_source"
  :function (lambda (symbol)
-             (when-let ((symbol (intern-soft symbol)))
+             (when-let* ((symbol (intern-soft symbol)))
                (gptel-agent--introspect-source symbol 'defvar)))
  :category "introspection"
  :include t
@@ -338,7 +338,7 @@ Call it liberally.")
 (gptel-make-tool
  :name "variable_value"
  :function (lambda (symbol)
-             (when-let ((symbol (intern-soft symbol)))
+             (when-let* ((symbol (intern-soft symbol)))
                (default-value symbol)))
  :category "introspection"
  :confirm t
@@ -364,7 +364,7 @@ contained.")
 (gptel-make-tool
  :name "function_documentation"
  :function (lambda (symbol)
-             (when-let ((symbol (intern-soft symbol)))
+             (when-let* ((symbol (intern-soft symbol)))
                (documentation symbol)))
  :category "introspection"
  :include t

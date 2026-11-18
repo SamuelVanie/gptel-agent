@@ -67,7 +67,8 @@ Or from =use-package=:
 #+html: </details>
 *** How to use:
 
-- Important: ensure that gptel is up to date, and not just the latest stable release!
+- Requires gptel 0.9.9.6 or newer. Keep gptel up to date when using development
+  versions of gptel-agent.
 
 - Set =gptel-model= and =gptel-backend= to use your preferred LLM.  See [[https://github.com/karthink/gptel][gptel's
   README]] for details.
