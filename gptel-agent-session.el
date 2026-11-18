@@ -516,9 +516,14 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
 (defun gptel-agent-session--write (record)
   "Atomically write RECORD's payload, keeping the old file on failure."
   (gptel-agent-session--assert-writer)
-  (let* ((file (or gptel-agent-session--write-file
-                   (gptel-agent-session--file (plist-get record :id))))
-         (temporary (make-temp-file (expand-file-name ".snapshot-" gptel-agent-session-directory)))
+  (gptel-agent-session--write-record
+   record (or gptel-agent-session--write-file
+              (gptel-agent-session--file (plist-get record :id)))))
+
+(defun gptel-agent-session--write-record (record file)
+  "Atomically publish a private session RECORD at local FILE."
+  (let* ((temporary (make-temp-file
+                     (expand-file-name ".snapshot-" (file-name-directory file))))
          (coding-system-for-write 'utf-8-emacs)
          (print-length nil) (print-level nil) (print-circle nil)
          (print-escape-newlines t) (print-escape-control-characters t))
@@ -536,7 +541,8 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
             (prin1 record (current-buffer))
             (insert "\n")
             (write-region (point-min) (point-max) temporary nil 'silent))
-          (rename-file temporary file t))
+          (rename-file temporary file t)
+          file)
       (when (file-exists-p temporary) (delete-file temporary)))))
 
 (defun gptel-agent-session--save-buffer (buffer)
@@ -581,23 +587,32 @@ family after deleting its snapshots with `gptel-agent-session-delete'."
       (message "Saved %d chats; %d pending" count (hash-table-count gptel-agent-session--dirty)))
     count))
 
-(defun gptel-agent-session--read (id &optional header-only)
-  "Read ID's data without evaluation; HEADER-ONLY avoids its transcript."
+(defun gptel-agent-session--read-record (file &optional header-only)
+  "Read a native snapshot from FILE.  HEADER-ONLY skips its transcript."
   (with-temp-buffer
     (let ((coding-system-for-read 'utf-8-emacs) (read-circle nil))
-      (insert-file-contents (gptel-agent-session--file id) nil 0 (and header-only 8192))
+      (insert-file-contents file nil 0 (and header-only 8192))
       (goto-char (point-min))
       (let* ((header (read (current-buffer)))
              (record (if header-only header (read (current-buffer)))))
-        (unless (and (equal (plist-get record :version) 1)
-                     (equal id (plist-get record :id))
+        (unless (and (equal (plist-get header :version) 1)
+                     (equal (plist-get record :version) 1)
+                     (equal (plist-get header :id) (plist-get record :id))
                      (stringp (plist-get record :name)))
-          (error "Invalid or unsupported session snapshot %s" id))
-        (when-let* ((entry (gptel-agent-session-store--entry gptel-agent-session-directory id))
-                    ((string-prefix-p "snapshots/" (plist-get entry :file))))
-          (unless (equal (plist-get entry :parent) (plist-get record :parent))
-            (error "Session payload ownership disagrees with its committed family: %s" id)))
+          (error "Invalid or unsupported session snapshot %s" file))
         record))))
+
+(defun gptel-agent-session--read (id &optional header-only)
+  "Read ID's data without evaluation; HEADER-ONLY avoids its transcript."
+  (let ((record (gptel-agent-session--read-record
+                 (gptel-agent-session--file id) header-only)))
+    (unless (equal id (plist-get record :id))
+      (error "Invalid session identifier in snapshot %s" id))
+    (when-let* ((entry (gptel-agent-session-store--entry gptel-agent-session-directory id))
+                ((string-prefix-p "snapshots/" (plist-get entry :file))))
+      (unless (equal (plist-get entry :parent) (plist-get record :parent))
+        (error "Session payload ownership disagrees with its committed family: %s" id)))
+    record))
 
 (defun gptel-agent-session--catalog ()
   "Read committed family headers only; staged versions remain invisible."
@@ -942,6 +957,126 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
           buffer)
       (error (let ((kill-buffer-hook nil)) (kill-buffer buffer))
              (signal (car err) (cdr err))))))
+
+(defconst gptel-agent-session--standalone-fields
+  '(:version :name :title :buffer-name :sent-end :directory :mode :point
+    :narrow :updated :text :bounds :backend :tools :settings :draft)
+  "Native snapshot fields belonging to one standalone conversation.")
+
+(defun gptel-agent-session--standalone-record (record)
+  "Copy the conversation fields of RECORD, discarding family and peer state."
+  (unless (plistp record) (error "Expected a gptel session record"))
+  (cl-loop for key in gptel-agent-session--standalone-fields
+           append (list key (gptel-agent-session--data (plist-get record key)))))
+
+;;;###autoload
+(defun gptel-agent-session-buffer-record (buffer)
+  "Capture BUFFER as an independent, data-only gptel session record.
+The record contains the full chat, role boundaries, draft, view and
+session settings.  A workflow host can embed it in its own checkpoint.
+Saving this way works independently of `gptel-agent-session-mode'."
+  (unless (and (buffer-live-p buffer) (buffer-local-value 'gptel-mode buffer))
+    (user-error "A live gptel chat buffer is required"))
+  (with-current-buffer buffer
+    (let ((record (gptel-agent-session--standalone-record
+                   (gptel-agent-session--snapshot))))
+      ;; Keep executable settings local to the host that configured them.
+      (setf (plist-get record :settings)
+            (cl-remove-if
+             (lambda (entry)
+               (pcase (car entry)
+                 ('gptel-system-prompt (functionp (cdr entry)))
+                 ('gptel-use-curl (stringp (cdr entry)))))
+             (plist-get record :settings)))
+      record)))
+
+(defun gptel-agent-session--check-standalone (record)
+  "Check the structure and text positions of a standalone chat RECORD."
+  (let* ((text (plist-get record :text))
+         (end (and (stringp text) (1+ (length text))))
+         (directory (plist-get record :directory))
+         (bounds (plist-get record :bounds))
+         (narrow (plist-get record :narrow))
+         (settings (plist-get record :settings)))
+    (cl-flet ((position-p (x) (and (integerp x) (<= 1 x end))))
+      (unless
+          (and end (equal (plist-get record :version) 1)
+               (stringp (plist-get record :name))
+               (string-or-null-p (plist-get record :buffer-name))
+               (string-or-null-p (plist-get record :title))
+               (memq (plist-get record :mode) '(text-mode markdown-mode org-mode))
+               (stringp directory) (file-name-absolute-p directory)
+               (position-p (plist-get record :point))
+               (or (null narrow)
+                   (and (consp narrow) (position-p (car narrow))
+                        (position-p (cdr narrow)) (<= (car narrow) (cdr narrow))))
+               (cl-every (lambda (x) (or (null x) (position-p x)))
+                         (list (plist-get record :draft) (plist-get record :sent-end)))
+               (string-or-null-p (plist-get record :backend))
+               (proper-list-p (plist-get record :tools))
+               (cl-every #'stringp (plist-get record :tools))
+               (proper-list-p settings)
+               (cl-every (lambda (entry)
+                           (and (consp entry) (memq (car entry) gptel-agent-session--settings)))
+                         settings)
+               (let ((prompt (alist-get 'gptel-system-prompt settings)))
+                 (or (string-or-null-p prompt)
+                     (and (proper-list-p prompt) (cl-every #'string-or-null-p prompt))))
+               (booleanp (alist-get 'gptel-use-curl settings))
+               (proper-list-p bounds)
+               (cl-every
+                (lambda (role)
+                  (and (consp role) (symbolp (car role)) (proper-list-p (cdr role))
+                       (cl-every (lambda (range)
+                                   (and (memq (proper-list-p range) '(2 3))
+                                        (position-p (car range)) (position-p (cadr range))
+                                        (<= (car range) (cadr range))))
+                                 (cdr role))))
+                bounds))
+        (error "Invalid standalone gptel session record")))))
+
+;;;###autoload
+(defun gptel-agent-session-buffer-from-record (record)
+  "Restore one independent editable chat from native session RECORD.
+The returned buffer has its own identity.  Global session mode, when
+already enabled, tracks it as a new conversation.  Importing a chat
+leaves it undisplayed and sends no requests."
+  (setq record (gptel-agent-session--standalone-record record))
+  (gptel-agent-session--check-standalone record)
+  ;; Autoloaded imports need the agent registry used by prompt transforms,
+  ;; including when the user sends the next turn in this ordinary buffer.
+  (require 'gptel-agent)
+  (let ((buffer (let ((gptel-agent-session--restoring t))
+                  (gptel-agent-session--restore-buffer
+                   (plist-put record :id (gptel-agent-session--new-id))))))
+    (gptel-agent-session--track buffer)
+    buffer))
+
+;;;###autoload
+(defun gptel-agent-session-write-record (record file)
+  "Atomically save detached chat RECORD to local FILE and return its path.
+RECORD is a snapshot from `gptel-agent-session-buffer-record'.  Its
+source buffer may already be closed.  The parent directory must exist."
+  (setq file (expand-file-name file))
+  (when (file-remote-p file) (user-error "Session storage must be local"))
+  (setq record (gptel-agent-session--standalone-record record))
+  (gptel-agent-session--check-standalone record)
+  (gptel-agent-session--write-record record file))
+
+;;;###autoload
+(defun gptel-agent-session-export-buffer (buffer file)
+  "Atomically save one gptel chat BUFFER to local FILE and return its path.
+The parent directory must exist.  FILE is private and uses the native
+session snapshot format.  Family autosaving is independent of this file."
+  (gptel-agent-session-write-record (gptel-agent-session-buffer-record buffer) file))
+
+;;;###autoload
+(defun gptel-agent-session-import-buffer (file)
+  "Read local session snapshot FILE into a new ordinary gptel buffer.
+Return the editable buffer, preserving the archived chat and its draft."
+  (setq file (expand-file-name file))
+  (when (file-remote-p file) (user-error "Session storage must be local"))
+  (gptel-agent-session-buffer-from-record (gptel-agent-session--read-record file)))
 
 ;;;###autoload
 (defun gptel-agent-session-restore (id)

@@ -1147,6 +1147,18 @@ without advising internal worker functions. Configure the request buffer's
 preset and pass its =gptel-prompt-transform-functions= to =gptel-request= so
 agent tools receive their request-local dispatchers.
 
+Use =(gptel-agent-session-buffer-record BUFFER)= to include a chat in a
+workflow checkpoint. Pass that record to
+=(gptel-agent-session-buffer-from-record RECORD)= to reopen an editable
+chat with the original conversation, response and tool boundaries, draft,
+model and settings. For a standalone local file, use
+=(gptel-agent-session-export-buffer BUFFER FILE)= and
+=(gptel-agent-session-import-buffer FILE)=. A host that already holds a
+record can save it with =(gptel-agent-session-write-record RECORD FILE)=,
+even after the chat closes. Imports return an undisplayed buffer with a
+fresh identity. Both forms work with session autosaving
+disabled. When autosaving is enabled it tracks the imported chat separately.
+
 Before starting a host-owned invocation, call =gptel-agent-supervise= with
 its buffer. The returned opaque handle covers its agent workers, managed
 discussions, nested descendants and queued discussion follow-ups. Only

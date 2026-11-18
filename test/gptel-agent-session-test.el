@@ -53,6 +53,79 @@
   (setq gptel-agent-session--queue nil gptel-agent-session--queue-tail nil)
   (gptel-agent-session-mode 1))
 
+(ert-deftest gptel-agent-session-standalone-round-trip ()
+  (gptel-agent-session-test--with-store
+    (let* ((chat (gptel-agent-session-test--buffer "*workflow chat*" "Prompt\n"))
+           (file (expand-file-name "call.eld" gptel-agent-session-directory))
+           (draft "Unsent edit π") saved bounds)
+      (with-current-buffer chat
+        (insert (propertize "Answer" 'gptel 'response))
+        (insert "\n" draft)
+        (setq-local gptel-system-prompt "Review this code."
+                    gptel-temperature 0.42
+                    gptel-agent-session--id "source-session"
+                    gptel-agent-chat--id "source-peer"
+                    gptel-agent-chat--inbox '((:text "Peer message")))
+        (setq bounds (gptel--get-buffer-bounds))
+        (narrow-to-region 2 (point-max))
+        (goto-char 3)
+        (setq saved (gptel-agent-session-buffer-record chat))
+        (should (equal file (gptel-agent-session-export-buffer chat file))))
+      (kill-buffer chat)
+      (should (equal file (gptel-agent-session-write-record saved file)))
+      (should (= #o600 (file-modes file)))
+      (should-not (plist-get saved :id))
+      (should-not (plist-get saved :main-id))
+      (should-not (plist-get saved :main-inbox))
+      (cl-letf (((symbol-function 'gptel-request)
+                 (lambda (&rest _) (ert-fail "Opening an archive sent a request"))))
+        (let ((from-record (gptel-agent-session-buffer-from-record saved))
+              (from-file (gptel-agent-session-import-buffer file)))
+          (should-not gptel-agent-session-mode)
+          (should-not (equal (buffer-local-value 'gptel-agent-session--id from-record)
+                             (buffer-local-value 'gptel-agent-session--id from-file)))
+          (dolist (restored (list from-record from-file))
+            (with-current-buffer restored
+              (should gptel-mode)
+              (should-not buffer-read-only)
+              (should-not buffer-file-name)
+              (should-not gptel-agent-chat--id)
+              (should-not gptel-agent-chat--inbox)
+              (should (equal gptel-system-prompt "Review this code."))
+              (should (equal gptel-temperature 0.42))
+              (should (eq gptel-model 'test))
+              (should (= (point) 3))
+              (should (= (point-min) 2))
+              (widen)
+              (should (equal bounds (gptel--get-buffer-bounds)))
+              (should (equal (buffer-string) (concat "Prompt\nAnswer\n" draft))))))))))
+
+(ert-deftest gptel-agent-session-standalone-import-when-saving ()
+  (gptel-agent-session-test--with-store
+    (gptel-agent-session-mode 1)
+    (let* ((source (gptel-agent-session-test--buffer "*source chat*" "Source"))
+           (record (gptel-agent-session-buffer-record source))
+           (copy (gptel-agent-session-buffer-from-record record))
+           (source-id (buffer-local-value 'gptel-agent-session--id source))
+           (copy-id (buffer-local-value 'gptel-agent-session--id copy)))
+      (should-not (equal source-id copy-id))
+      (should (eq source (gethash source-id gptel-agent-session--buffers)))
+      (should (eq copy (gethash copy-id gptel-agent-session--buffers)))
+      (gptel-agent-session-save)
+      (should (equal "Source" (plist-get (gptel-agent-session--read copy-id) :text))))))
+
+(ert-deftest gptel-agent-session-standalone-rejects-invalid-records ()
+  (gptel-agent-session-test--with-store
+    (let* ((source (gptel-agent-session-test--buffer "*source chat*" "Prompt"))
+           (record (gptel-agent-session-buffer-record source)))
+      (dolist (entry '((:version . 2) (:mode . fundamental-mode)
+                       (:settings (gptel-system-prompt . kill-emacs))
+                       (:settings (gptel-use-curl . "/unknown/program"))
+                       (:bounds (response (1 99))) (:draft . -1)))
+        (should-error (gptel-agent-session-buffer-from-record
+                       (plist-put (copy-sequence record) (car entry) (cdr entry)))))
+      (should-not gptel-agent-session-mode))))
+
 (ert-deftest gptel-agent-session-roundtrip-nested-discussions-and-followup ()
   (gptel-agent-session-test--with-store
     (gptel-agent-discussion-test--with-chat
