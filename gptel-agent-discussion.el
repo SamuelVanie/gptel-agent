@@ -67,6 +67,38 @@ Keep this value when reloading the module, just like the counter.")
        (not (and-let* ((gate (gptel-agent--workers-for fsm)))
               (gptel-agent--workers-closed gate)))))
 
+(defun gptel-agent-discussion--owner ()
+  "Return the immediate owner of the current managed discussion."
+  (and gptel-agent-discussion--self
+       (gptel-agent-discussion--chat-owner gptel-agent-discussion--self)))
+
+(defun gptel-agent-discussion--inbox-p (buffer)
+  "Whether BUFFER has discussion messages awaiting delivery."
+  (and (buffer-live-p buffer)
+       (buffer-local-value 'gptel-agent-discussion--inbox buffer)))
+
+(defun gptel-agent-discussion--busy-p (buffer)
+  "Whether BUFFER owns active discussion turns or queued follow-ups."
+  (when (buffer-live-p buffer)
+    (cl-some
+     (lambda (chat)
+       (let ((child (gptel-agent-discussion--chat-buffer chat)))
+         (and (buffer-live-p child)
+              (not (eq (gptel-agent-discussion--chat-state chat) 'closed))
+              (or (gptel-agent-discussion--active-p
+                   (gptel-agent-discussion--chat-fsm chat))
+                  (gptel-agent-discussion--inbox-p child)
+                  (gptel-agent-discussion--busy-p child)))))
+     (buffer-local-value 'gptel-agent-discussion--children buffer))))
+
+(defun gptel-agent-discussion--cancel-descendants (buffer)
+  "Close BUFFER's discussion subtree, retaining editable transcripts."
+  (when (buffer-live-p buffer)
+    (dolist (chat (buffer-local-value 'gptel-agent-discussion--children buffer))
+      (gptel-agent-discussion--cancel-descendants
+       (gptel-agent-discussion--chat-buffer chat))
+      (gptel-agent-discussion--close chat))))
+
 (defun gptel-agent-discussion--live-p (chat fsm)
   "Whether CHAT still owns the active FSM."
   (and (buffer-live-p (gptel-agent-discussion--chat-buffer chat))
@@ -112,6 +144,8 @@ Keep this value when reloading the module, just like the counter.")
   "Schedule inbox delivery in BUFFER after the current handlers unwind."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
+      (when gptel-agent-discussion--fsm
+        (gptel-agent--supervision-notify gptel-agent-discussion--fsm))
       (unless (timerp gptel-agent-discussion--timer)
         (setq gptel-agent-discussion--timer
               (run-at-time 0 nil #'gptel-agent-discussion--flush buffer))))))
@@ -123,6 +157,8 @@ and can be inspected with DiscussionControl read without waking the owner."
   (when-let* ((owner (gptel-agent-discussion--chat-owner chat))
               ((buffer-live-p owner)))
     (with-current-buffer owner
+      (when gptel-agent-discussion--fsm
+        (gptel-agent--supervision-notify gptel-agent-discussion--fsm))
       (when (eq kind 'report)
         (setq gptel-agent-discussion--inbox
               (nconc gptel-agent-discussion--inbox
@@ -181,8 +217,15 @@ and can be inspected with DiscussionControl read without waking the owner."
         (when-let* ((end (plist-get info :tracking-marker)))
           ;; RAW insertion can inherit sticky response properties from the
           ;; previous model text.  Future sends must parse this as user input.
-          (with-current-buffer (marker-buffer end)
-            (remove-text-properties (- end (length text)) end '(gptel nil))))))))
+          ;; Custom callbacks can render elsewhere: Agent workers keep their
+          ;; confirmation marker in the parent but append reports to the child.
+          ;; Only change properties if this marker actually follows our text.
+          (when (marker-buffer end)
+            (with-current-buffer (marker-buffer end)
+              (let ((start (- end (length text))))
+                (when (and (<= (point-min) start) (<= end (point-max))
+                           (equal (buffer-substring-no-properties start end) text))
+                  (remove-text-properties start end '(gptel nil)))))))))))
 
 (defun gptel-agent-discussion--before-wait (fsm)
   "Install attention handling and inject queued messages into FSM."
@@ -342,8 +385,9 @@ and can be inspected with DiscussionControl read without waking the owner."
                 (gptel-agent-discussion--refresh-list)))))
         (setf (gptel-fsm-info fsm) (plist-put info :discussion-attached t))
         ;; Insert handlers inside the worker gate.  DONE runs only after any
-        ;; ordinary Agent descendants finish; discussions themselves never hold
-        ;; this gate open.  gptel's insertion and post-response hooks stay intact.
+        ;; ordinary Agent descendants finish.  Discussions hold the gate only
+        ;; under explicit host supervision.  gptel's insertion and
+        ;; post-response hooks stay intact.
         (let* ((gate (gptel-agent--workers-install fsm))
                (handlers (copy-tree (gptel-agent--workers-handlers gate))))
           (push #'gptel-agent-discussion--before-wait (alist-get 'WAIT handlers))

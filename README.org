@@ -1137,6 +1137,45 @@ Older flat snapshot files remain readable and migrate on the next family save.
 Migration preserves their known members; it cannot reconstruct children that
 were never saved by the older format.
 
+*** Embedding agents in workflow hosts
+
+Workflow packages can use agent tools in their own =gptel-request= calls
+without advising internal worker functions. Configure the request buffer's
+preset and pass its =gptel-prompt-transform-functions= to =gptel-request= so
+agent tools receive their request-local dispatchers.
+
+Before starting a host-owned invocation, call =gptel-agent-supervise= with
+its buffer. The returned opaque handle covers its agent workers, managed
+discussions, nested descendants and queued discussion follow-ups. Only
+supervised requests wait for discussion turns to settle. Ordinary interactive
+chats keep their independent discussion behavior. A silent child completion
+releases the held answer; an explicit =DiscussionReport= resumes the same
+request for synthesis. Sub-agent callbacks accept raw injected reports as
+transcript content without including them in the final result.
+
+| Public function | Purpose |
+|-----------------+---------|
+| =gptel-agent-supervise= | Establish buffer ownership before starting requests; accepts =:on-state-change= and =:on-tool-approval= callbacks |
+| =gptel-agent-supervision-request-live-p= | Check whether a retained request still belongs to the active handle and can advance |
+| =gptel-agent-supervision-retry= | Rearm a failed root request's completion gate before the host resumes that same FSM |
+| =gptel-agent-supervision-stop= | Idempotently release supervision and cancel descendants while retaining inspection buffers |
+
+The state callback receives =(handle fsm event)=, where =event= is
+=waiting-discussions= or =changed=. Notifications can repeat. The approval
+callback receives =(handle fsm calls)= with gptel's live tool/callback entries;
+return non-nil to handle the approval, or nil to keep native display. Before
+accepting saved calls, check =gptel-agent-supervision-request-live-p=, that the
+FSM still awaits tools, and that its request info is the same object that
+produced the approval. Approval callbacks and handles must never be persisted.
+Question forms and separate file-review interfaces retain their existing UI.
+
+The host owns the root transport, terminal handlers, retry policy and request
+budget. Stop supervision when an invocation ends, and abort the root transport
+when cancelling it. Start a fresh handle for a new invocation or feedback
+request. Child model calls remain internal to the host's invocation. Lifecycle
+notifications schedule deferred settlement; supervision never polls a model
+or runs a repeating timer.
+
 *** Using sub-agents
 
 gptel-agent can delegate tasks to "sub-agents".  Sub-agents can be specified in

@@ -57,6 +57,10 @@
 (declare-function gptel-agent--cached-read-file "gptel-agent")
 (declare-function gptel-agent--cached-read-skill-file "gptel-agent")
 (declare-function gptel-agent-discussion--localize "gptel-agent-discussion")
+(declare-function gptel-agent-discussion--owner "gptel-agent-discussion")
+(declare-function gptel-agent-discussion--busy-p "gptel-agent-discussion")
+(declare-function gptel-agent-discussion--inbox-p "gptel-agent-discussion")
+(declare-function gptel-agent-discussion--cancel-descendants "gptel-agent-discussion")
 (declare-function gptel-agent-chat--localize "gptel-agent-chat")
 (declare-function gptel-agent--agent-plist "gptel-agent")
 (declare-function gptel-agent--agent-enabled-p "gptel-agent")
@@ -1530,6 +1534,205 @@ file/query pair registered when an oversized tool result was persisted."
   "Return the sub-agent run owned by FSM."
   (plist-get (gptel-fsm-info fsm) :context))
 
+;;; Host-owned request supervision
+
+(cl-defstruct (gptel-agent--supervision
+               (:constructor gptel-agent--make-supervision))
+  "Private state behind the public supervision API."
+  buffer requests timer stopped on-state-change on-tool-approval)
+
+(defvar-local gptel-agent--supervision nil
+  "Host supervision rooted in this conversation, if any.")
+(put 'gptel-agent--supervision 'permanent-local t)
+
+(cl-defun gptel-agent-supervise (buffer &key on-state-change on-tool-approval)
+  "Supervise agent requests rooted in BUFFER and return an opaque handle.
+Call before starting requests.  One live supervisor is allowed per buffer.
+Agent workers and managed discussions inherit supervision, including nested
+work and queued follow-ups.  Requests retain their final answer until their
+discussions settle; explicit reports resume the request for synthesis.
+Ordinary conversations without supervision retain independent discussions.
+
+ON-STATE-CHANGE, when non-nil, receives (HANDLE FSM EVENT).  EVENT is
+`waiting-discussions' when a final answer is held, or `changed' after other
+lifecycle activity.  Notifications may repeat and must not signal errors.
+ON-TOOL-APPROVAL receives (HANDLE FSM CALLS) before native approval display.
+Return non-nil to handle CALLS, or nil to retain native UI.  CALLS are gptel's
+live tool/callback entries; a host must validate request liveness before
+accepting them with gptel's tool confirmation machinery.  Use
+`gptel-agent-supervision-request-live-p' to reject stopped or closed requests.
+
+The host still owns the root request, its completion callback, transport
+retries and cancellation.  Call `gptel-agent-supervision-stop' when that
+invocation ends, and `gptel-agent-supervision-retry' before retrying a failed
+root FSM.  Handles and callbacks are process-local, never persistent data."
+  (unless (buffer-live-p buffer) (user-error "Supervision needs a live buffer"))
+  (with-current-buffer buffer
+    (when (and gptel-agent--supervision
+               (not (gptel-agent--supervision-stopped gptel-agent--supervision)))
+      (user-error "Buffer already has an active agent supervisor"))
+    (setq gptel-agent--supervision
+          (gptel-agent--make-supervision
+           :buffer buffer :on-state-change on-state-change
+           :on-tool-approval on-tool-approval))
+    (add-hook 'kill-buffer-hook #'gptel-agent--supervision-kill nil t)
+    gptel-agent--supervision))
+
+(defun gptel-agent--supervision-owner (buffer)
+  "Find BUFFER's supervisor through agent and discussion ownership."
+  (let (seen scope)
+    (while (and (buffer-live-p buffer) (not scope) (not (memq buffer seen)))
+      (push buffer seen)
+      (with-current-buffer buffer
+        (setq scope gptel-agent--supervision
+              buffer (or (and (fboundp 'gptel-agent-discussion--owner)
+                              (gptel-agent-discussion--owner))
+                         (and gptel-agent--supervised-run
+                              (gptel-agent--run-parent-buffer
+                               gptel-agent--supervised-run))))))
+    scope))
+
+(defun gptel-agent--supervision-register (fsm)
+  "Attach FSM to its supervisor exactly once, before asynchronous work."
+  (let ((info (gptel-fsm-info fsm)))
+    (unless (plist-member info :agent-supervision)
+      (when-let* ((scope (gptel-agent--supervision-owner (plist-get info :buffer))))
+        (setf (gptel-fsm-info fsm) (plist-put info :agent-supervision scope))
+        (cl-pushnew fsm (gptel-agent--supervision-requests scope))))))
+
+(defun gptel-agent--supervision-notify (fsm &optional event)
+  "Notify FSM's host of EVENT and schedule deferred descendant settlement."
+  (when-let* ((scope (plist-get (gptel-fsm-info fsm) :agent-supervision))
+              ((not (gptel-agent--supervision-stopped scope))))
+    (unless (gptel-agent--supervision-timer scope)
+      (setf (gptel-agent--supervision-timer scope)
+            (run-at-time 0 nil #'gptel-agent--supervision-settle scope)))
+    (when-let* ((callback (gptel-agent--supervision-on-state-change scope)))
+      (funcall callback scope fsm (or event 'changed)))))
+
+(defun gptel-agent--supervision-settle (scope)
+  "Resume held requests in SCOPE after lifecycle callbacks unwind."
+  (when-let* ((timer (gptel-agent--supervision-timer scope))) (cancel-timer timer))
+  (setf (gptel-agent--supervision-timer scope) nil)
+  (unless (gptel-agent--supervision-stopped scope)
+    ;; Newest requests first: settling a child can release its parent here.
+    (dolist (fsm (gptel-agent--supervision-requests scope))
+      (let* ((info (gptel-fsm-info fsm)) (buffer (plist-get info :buffer)))
+        (when (and (not (gptel-agent--supervision-stopped scope))
+                   (plist-get info :agent-discussion-wait)
+                   (eq (gptel-fsm-state fsm) 'AGWT)
+                   (buffer-live-p buffer)
+                   (not (gptel-agent--workers-closed (gptel-agent--workers-for fsm))))
+          (with-current-buffer buffer
+            (cond
+             ((gptel-agent-discussion--inbox-p buffer)
+              (gptel--fsm-transition fsm 'WAIT))
+             ((not (gptel-agent-discussion--busy-p buffer))
+              (gptel--fsm-transition fsm 'DONE)))))))))
+
+(defun gptel-agent--supervision-hold (gate)
+  "Hold GATE's final answer while supervised discussions are unsettled."
+  (let* ((fsm (gptel-agent--workers-fsm gate)) (info (gptel-fsm-info fsm))
+         (scope (plist-get info :agent-supervision))
+         (buffer (plist-get info :buffer)))
+    (if (and scope (not (gptel-agent--supervision-stopped scope))
+             (fboundp 'gptel-agent-discussion--busy-p)
+             (or (gptel-agent-discussion--busy-p buffer)
+                 (gptel-agent-discussion--inbox-p buffer)))
+        (progn
+          (setf (gptel-fsm-info fsm) (plist-put info :agent-discussion-wait t)
+                (gptel-fsm-state fsm) 'AGWT)
+          (gptel-agent--workers-status gate "Waiting for discussions")
+          (gptel-agent--supervision-notify fsm 'waiting-discussions)
+          t)
+      (setf (gptel-fsm-info fsm) (plist-put info :agent-discussion-wait nil))
+      nil)))
+
+(defun gptel-agent--supervision-stop-discussions (fsm)
+  "Cancel discussions owned by supervised FSM before its gate stops."
+  (when (and (plist-get (gptel-fsm-info fsm) :agent-supervision)
+             (fboundp 'gptel-agent-discussion--cancel-descendants))
+    (gptel-agent-discussion--cancel-descendants
+     (plist-get (gptel-fsm-info fsm) :buffer))))
+
+(defun gptel-agent-supervision-request-live-p (scope fsm)
+  "Whether FSM is still a live request belonging to SCOPE.
+Use this when replying to a retained approval.  A host should also verify
+that the request is awaiting tools and that its saved INFO is still current."
+  (and (not (gptel-agent--supervision-stopped scope))
+       (memq fsm (gptel-agent--supervision-requests scope))
+       (buffer-live-p (plist-get (gptel-fsm-info fsm) :buffer))
+       (not (memq (gptel-fsm-state fsm) '(DONE ERRS ABRT)))
+       (when-let* ((gate (gptel-agent--workers-for fsm)))
+         (not (gptel-agent--workers-closed gate)))))
+
+(defun gptel-agent-supervision-stop (scope)
+  "Release SCOPE and cancel its descendants, retaining inspection buffers.
+This is idempotent.  The host remains responsible for aborting the root
+transport.  Pending descendant callbacks and automatic sends are invalidated."
+  (unless (gptel-agent--supervision-stopped scope)
+    (setf (gptel-agent--supervision-stopped scope) t)
+    (when-let* ((timer (gptel-agent--supervision-timer scope))) (cancel-timer timer))
+    (setf (gptel-agent--supervision-timer scope) nil)
+    (dolist (fsm (gptel-agent--supervision-requests scope))
+      (gptel-agent--supervision-stop-discussions fsm)
+      (when-let* ((gate (gptel-agent--workers-for fsm)))
+        (dolist (run (gptel-agent--workers-active gate))
+          (gptel-agent--run-finish
+           run 'cancelled "Error: Owning supervisor stopped." 'parent-stopped t))))
+    (when-let* ((buffer (gptel-agent--supervision-buffer scope))
+                ((buffer-live-p buffer)))
+      (with-current-buffer buffer
+        (when (eq gptel-agent--supervision scope)
+          (setq gptel-agent--supervision nil))))
+    (setf (gptel-agent--supervision-requests scope) nil
+          (gptel-agent--supervision-on-state-change scope) nil
+          (gptel-agent--supervision-on-tool-approval scope) nil)))
+
+(defun gptel-agent--supervision-kill ()
+  "Release this buffer's host supervisor when it is killed."
+  (when gptel-agent--supervision
+    (gptel-agent-supervision-stop gptel-agent--supervision)))
+(put 'gptel-agent--supervision-kill 'permanent-local-hook t)
+
+(defun gptel-agent-supervision-retry (scope fsm)
+  "Rearm SCOPE's failed root FSM before the host resumes its transport.
+Return FSM without sending a request.  Its callback, history and inner
+handlers are preserved; cancelled descendants are never restarted."
+  (unless (and (not (gptel-agent--supervision-stopped scope))
+               (eq (plist-get (gptel-fsm-info fsm) :buffer)
+                   (gptel-agent--supervision-buffer scope))
+               (or (not (plist-member (gptel-fsm-info fsm) :agent-supervision))
+                   (eq (plist-get (gptel-fsm-info fsm) :agent-supervision) scope))
+               (eq (gptel-fsm-state fsm) 'ERRS))
+    (user-error "Cannot retry a stopped supervisor or a non-failed root request"))
+  (when-let* ((gate (gptel-agent--workers-for fsm))
+              ((gptel-agent--workers-closed gate)))
+    (setf (gptel-fsm-handlers fsm) (gptel-agent--workers-handlers gate)
+          (plist-get (gptel-fsm-info fsm) :callback)
+          (gptel-agent--workers-callback gate)
+          (plist-get (gptel-fsm-info fsm) :agent-workers) nil)
+    ;; The retained discussion WAIT handler must wrap the new callback too.
+    (setf (plist-get (gptel-fsm-info fsm) :discussion-callback) nil)
+    (gptel-agent--workers-install fsm))
+  fsm)
+
+(defun gptel-agent--supervision-display-approval (original calls info &rest args)
+  "Route supervised CALLS in INFO to a host, or ORIGINAL with ARGS."
+  (let* ((scope (plist-get info :agent-supervision))
+         (fsm (and scope (cl-find info (gptel-agent--supervision-requests scope)
+                                  :key #'gptel-fsm-info :test #'eq))))
+    (cond
+     ((and scope (not (and fsm (gptel-agent-supervision-request-live-p scope fsm)))) nil)
+     ((and fsm (gptel-agent--supervision-on-tool-approval scope)
+           (funcall (gptel-agent--supervision-on-tool-approval scope) scope fsm calls)))
+     (t (apply original calls info args)))))
+
+;; Keep this inside the discussion guard so routed approvals retain its
+;; one-shot execution checks.  Unsupervised display is unchanged.
+(advice-add 'gptel--display-tool-calls :around
+            #'gptel-agent--supervision-display-approval '((depth . 100)))
+
 ;;; Request-local worker orchestration
 
 (defun gptel-agent--workers-for (fsm)
@@ -1702,6 +1905,7 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
   (let ((fsm (gptel-agent--workers-fsm gate)))
     (cond
      ((gptel-agent--ask-before-done gate))
+     ((gptel-agent--supervision-hold gate))
      ((or (gptel-agent--workers-active gate)
           (gptel-agent--workers-events gate)
           (gptel-agent--workers-steering gate)
@@ -1737,6 +1941,7 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
 
 (defun gptel-agent--workers-stop (gate)
   "Close GATE and cancel its entire worker subtree without delivering results."
+  (gptel-agent--supervision-stop-discussions (gptel-agent--workers-fsm gate))
   (gptel-agent--workers-close gate)
   (dolist (run (gptel-agent--workers-active gate))
     (gptel-agent--run-finish
@@ -1754,6 +1959,10 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
               ((or 'DONE 'AGCK) (gptel-agent--workers-done gate))
               (_
                (when (eq state 'WAIT)
+                 (when (plist-get info :agent-discussion-wait)
+                   (gptel-agent--workers-save-answer gate)
+                   (setf (gptel-agent--workers-interim gate) t
+                         (plist-get info :agent-discussion-wait) nil))
                  (gptel-agent--workers-wrap-callback gate)
                  (gptel-agent--workers-inject gate)
                  (let ((data (plist-get info :data)))
@@ -1793,7 +2002,8 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
            (setf (gptel-fsm-state fsm) 'ERRS
                  (plist-get (gptel-fsm-info fsm) :error) (error-message-string err))
            (mapc (lambda (handler) (funcall handler fsm))
-                 (alist-get 'ERRS (gptel-agent--workers-handlers gate)))))))))
+                 (alist-get 'ERRS (gptel-agent--workers-handlers gate))))))
+      (gptel-agent--supervision-notify fsm))))
 
 (defun gptel-agent--workers-wrap-callback (gate)
   "Capture GATE's response after gptel has resolved streaming support."
@@ -1814,6 +2024,7 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
 
 (defun gptel-agent--workers-install (fsm)
   "Install a completion gate on FSM without changing global gptel handlers."
+  (gptel-agent--supervision-register fsm)
   (or (gptel-agent--workers-for fsm)
       (let* ((info (gptel-fsm-info fsm))
              (buffer (plist-get info :buffer))
@@ -3030,24 +3241,27 @@ the child's current directory."
                           (append transforms
                                   (list #'gptel-agent--localize-agent-tool))))
                        (task-callback
-                        (lambda (resp info)
+                        (lambda (resp info &optional raw)
                           (condition-case callback-error
                               (when (gptel-agent--run-active-p run)
-                                (pcase resp
-                                  ((pred stringp)
-                                   (setf (gptel-agent--run-response run)
-                                         (concat
-                                          (gptel-agent--run-response run) resp))
-                                   (gptel-agent--run-append-model-output run resp))
-                                  (`(tool-call . ,calls)
-                                   (unless (plist-get info :tracking-marker)
-                                     (plist-put info :tracking-marker where))
-                                   (gptel--display-tool-calls calls info))
-                                  (`(tool-result . ,_results)
-                                   (gptel-agent--begin-finalization run info))
-                                  ;; ERRS, DONE and ABRT handlers own terminal
-                                  ;; completion.  Other callback events are data.
-                                  (_ nil)))
+                                (if raw
+                                    (when (stringp resp)
+                                      (gptel-agent--run-append-model-output run resp))
+                                  (pcase resp
+                                    ((pred stringp)
+                                     (setf (gptel-agent--run-response run)
+                                           (concat
+                                            (gptel-agent--run-response run) resp))
+                                     (gptel-agent--run-append-model-output run resp))
+                                    (`(tool-call . ,calls)
+                                     (unless (plist-get info :tracking-marker)
+                                       (plist-put info :tracking-marker where))
+                                     (gptel--display-tool-calls calls info))
+                                    (`(tool-result . ,_results)
+                                     (gptel-agent--begin-finalization run info))
+                                    ;; ERRS, DONE and ABRT handlers own terminal
+                                    ;; completion.  Other callback events are data.
+                                    (_ nil))))
                             (error
                              (gptel-agent--run-finish
                               run 'failed
