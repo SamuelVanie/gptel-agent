@@ -1012,7 +1012,9 @@ members of a larger family.
 
 Run =M-x gptel-agent-session-restore= and choose a saved main chat to reopen its
 discussion family. Only that family is loaded; existing live buffers are
-reused without replacing their edits. Use =M-x gptel-agent-discussions= and
+reused without replacing their edits. Tool blocks start folded in newly
+restored chats; press =TAB= on a block's opening line to expand it.
+Use =M-x gptel-agent-discussions= and
 =RET= to visit the children as usual. Restoring never starts model requests.
 Send a new message normally, or use =gptel-agent-discussion-resume= in a chat
 without an unsent draft to resume delivery of queued discussion messages.

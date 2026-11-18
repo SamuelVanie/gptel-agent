@@ -14,6 +14,8 @@
 (require 'gptel-agent-chat)
 (require 'gptel-agent-session-checkpoint)
 
+(declare-function org-fold-hide-block-toggle "org-fold")
+
 (defcustom gptel-agent-session-directory
   (locate-user-emacs-file "gptel-agent/sessions/")
   "Local directory containing private chat snapshots.
@@ -851,6 +853,28 @@ with a prefix argument to `gptel-agent-session-save'."
     (unless choices (user-error "No saved discussion sessions"))
     (cdr (assoc (completing-read (or prompt "Restore discussion family: ") choices nil t) choices))))
 
+(defun gptel-agent-session--fold-tool-blocks (bounds)
+  "Fold restored tool blocks identified by gptel BOUNDS.
+Restore Markdown fence keymaps too, so TAB can reopen the blocks."
+  (save-excursion
+    (with-silent-modifications
+      (dolist (bound (alist-get 'tool bounds))
+        (goto-char (car bound))
+        (beginning-of-line)
+        (if (derived-mode-p 'org-mode)
+            (when (looking-at-p "[ \t]*#\\+begin_tool\\_>")
+              (org-fold-hide-block-toggle t t))
+          (when (looking-at-p "``` ?tool\\_>")
+            (put-text-property (point) (line-end-position)
+                               'keymap gptel--markdown-block-map)
+            (unless (get-char-property (line-end-position) 'invisible)
+              (gptel-markdown-cycle-block))
+            (goto-char (cadr bound))
+            (forward-line 1)
+            (when (looking-at-p "```[ \t]*$")
+              (put-text-property (point) (line-end-position)
+                                 'keymap gptel--markdown-block-map))))))))
+
 (defun gptel-agent-session--restore-buffer (record)
   "Restore RECORD as an ordinary buffer; do not connect or send requests yet."
   (let ((buffer (generate-new-buffer (or (plist-get record :buffer-name)
@@ -881,6 +905,7 @@ with a prefix argument to `gptel-agent-session-save'."
           (setq default-directory (plist-get record :directory))
           (gptel-mode 1)
           (gptel--restore-props (plist-get record :bounds))
+          (gptel-agent-session--fold-tool-blocks (plist-get record :bounds))
           (setq gptel-agent-session--id (plist-get record :id)
                 gptel-agent-session--title (plist-get record :title)
                 gptel-agent-session--sent-end
@@ -922,7 +947,8 @@ with a prefix argument to `gptel-agent-session-save'."
 (defun gptel-agent-session-restore (id)
   "Reopen ID's saved family with ownership, drafts and queued messages.
 Existing live buffers are reused without overwriting their edits.  Only this
-family is loaded.  All restored delivery is paused: send normally or use
+family is loaded, with tool blocks folded in newly restored buffers.
+All restored delivery is paused: send normally or use
 `gptel-agent-discussion-resume'.  Active requests, workers, questions and
 approval callbacks cannot survive a restart and are never replayed."
   (interactive (list (gptel-agent-session--choose)))
