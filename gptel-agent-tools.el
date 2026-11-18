@@ -1733,6 +1733,41 @@ handlers are preserved; cancelled descendants are never restarted."
 (advice-add 'gptel--display-tool-calls :around
             #'gptel-agent--supervision-display-approval '((depth . 100)))
 
+(defun gptel-agent--display-owned-approval (original calls info &rest args)
+  "Keep approval CALLS rendered by ORIGINAL local to their request INFO.
+ARGS are forwarded unchanged.  Ordinary gptel approval overlays span from
+the start of the response, which can enclose other agents' approval slots.
+Limit managed inline previews to their insertion boundary so accepting one
+request cannot consume another request's prompts or streamed output."
+  (let* ((position (or (plist-get info :tracking-marker)
+                       (plist-get info :position)))
+         (buffer (and (markerp position) (marker-buffer position))))
+    (if (or (not (plist-get info :agent-workers)) (car args)
+            (not (buffer-live-p buffer))
+            (with-current-buffer buffer
+              (or buffer-read-only
+                  (get-char-property (max (point-min) (1- position)) 'read-only)
+                  (get-char-property position 'read-only))))
+        (apply original calls info args)
+      (with-current-buffer buffer
+        (save-excursion
+          (save-restriction
+            (narrow-to-region position (point-max))
+            (let ((display-info (copy-sequence info)))
+              ;; Leave the request's response start untouched: subsequent
+              ;; chunks and post-response hooks still need the original span.
+              (plist-put display-info :position (copy-marker position))
+              (prog1 (apply original calls display-info args)
+                ;; Inspection and steering must operate on the live request,
+                ;; not on the short-lived plist used to place its preview.
+                (dolist (ov (overlays-in (point-min) (point-max)))
+                  (when (eq (overlay-get ov 'info) display-info)
+                    (overlay-put ov 'info info)))))))))))
+
+;; Run inside the approval guards so they retain the original INFO identity.
+(advice-add 'gptel--display-tool-calls :around
+            #'gptel-agent--display-owned-approval '((depth . 200)))
+
 ;;; Request-local worker orchestration
 
 (defun gptel-agent--workers-for (fsm)
@@ -2866,9 +2901,9 @@ button for its live diagnostic buffer."
           (save-excursion
             (goto-char where)
             (when (bobp) (insert "\n"))
-            (if (and (bolp) (eolp))
-                (cons (1- (point)) (point))
-              (cons (line-beginning-position) (line-end-position)))))
+            ;; WHERE is the request boundary, which can precede an unsent
+            ;; draft on the same line.  Never anchor beyond that boundary.
+            (cons (1- (point)) (point))))
          (ov (make-overlay (car bounds) (cdr bounds) nil t))
          (configuration (and run (gptel-agent--run-configuration run)))
          (model
@@ -2914,6 +2949,35 @@ button for its live diagnostic buffer."
                                 gptel-curl--stream-insert-response)))
       (funcall callback "" info t))
     (or (plist-get info :tracking-marker) (plist-get info :position))))
+
+(defun gptel-agent--task-approval-position (fsm)
+  "Reserve an independent inline approval slot for a new child of FSM.
+The parent continues after the slot, even if it has no response text yet.
+Use the output marker's buffer, including for nested worker approvals."
+  (let* ((info (gptel-fsm-info fsm))
+         (where (gptel-agent--task-response-position fsm))
+         (worker (or (gptel-agent--run-p (plist-get info :context))
+                     (gptel-agent--run-p
+                      (buffer-local-value 'gptel-agent--supervised-run
+                                          (plist-get info :buffer)))))
+         (buffer (if (markerp where) (marker-buffer where)
+                   (plist-get info :buffer))))
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char where)
+        (let* ((beg (point))
+               (start (plist-get info :position))
+               (move-start (and (markerp start)
+                                (eq (marker-buffer start) buffer)
+                                (= start beg)))
+               (inhibit-read-only (or inhibit-read-only worker)))
+          ;; The first newline anchors the task card.  The second separates
+          ;; child previews from the parent's output and any unsent draft.
+          (insert "\n\n")
+          (when (and (markerp where) (eq (marker-buffer where) buffer))
+            (set-marker where (point)))
+          (when move-start (set-marker start (point)))
+          (copy-marker (1+ beg)))))))
 
 (defun gptel-agent--copy-parent-request-config (parent-buffer child-buffer &optional fsm)
   "Copy owned settings from PARENT-BUFFER to CHILD-BUFFER.
@@ -3107,13 +3171,8 @@ the child's current directory."
       (with-current-buffer parent-buffer
         (funcall main-cb (concat "Error: " directory-error))))
      (t
-      (let* ((where (gptel-agent--task-response-position parent-fsm))
+      (let* ((parent-position (gptel-agent--task-approval-position parent-fsm))
              task-timeout max-request-rounds
-             (parent-position
-              (if (markerp where)
-                  (copy-marker where)
-                (with-current-buffer parent-buffer
-                  (set-marker (make-marker) where))))
              (child-buffer
               (if previous (gptel-agent--run-child-buffer previous)
                 (generate-new-buffer
@@ -3211,10 +3270,11 @@ the child's current directory."
                 (setq buffer-read-only t))
               (with-current-buffer parent-buffer
                 (gptel--update-status " Calling Agent..."
-                                      'font-lock-escape-face)
+                                      'font-lock-escape-face))
+              (with-current-buffer (marker-buffer parent-position)
                 (setf (gptel-agent--run-overlay run)
                       (gptel-agent--task-overlay
-                       where agent-type description run)))
+                       parent-position agent-type description run)))
               (puthash (gptel-agent--run-id run) run gptel-agent--runs)
               (when previous
                 (gptel-agent--task-cleanup-overlay
@@ -3256,7 +3316,8 @@ the child's current directory."
                                      (gptel-agent--run-append-model-output run resp))
                                     (`(tool-call . ,calls)
                                      (unless (plist-get info :tracking-marker)
-                                       (plist-put info :tracking-marker where))
+                                       (plist-put info :tracking-marker
+                                                  (copy-marker parent-position)))
                                      (gptel--display-tool-calls calls info))
                                     (`(tool-result . ,_results)
                                      (gptel-agent--begin-finalization run info))

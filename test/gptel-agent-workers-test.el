@@ -285,6 +285,120 @@
           (should-not (text-property-not-all 0 (length display) 'line-prefix "" display))
           (should-not (text-property-not-all 0 (length display) 'wrap-prefix "" display)))))))
 
+(ert-deftest gptel-agent-workers-overlay-stays-before-unsent-draft ()
+  (dolist (stream '(nil t))
+    (let ((gptel-agent-workers-test--stream stream)
+          (gptel-response-prefix-alist '((fundamental-mode . "ASSISTANT> "))))
+      (gptel-agent-workers-test--with-chat
+        (with-current-buffer parent (insert "UNSENT-DRAFT"))
+        (gptel-agent-workers-test--tool
+         fsm "Agent" '(:subagent_type "researcher" :description "Research"
+                                     :prompt "Investigate" :background t))
+        (let* ((run (car (hash-table-values gptel-agent--runs)))
+               (ov (gptel-agent--run-overlay run)))
+          (with-current-buffer parent
+            (goto-char (point-min))
+            (search-forward "UNSENT-DRAFT")
+            (should (<= (overlay-end ov) (match-beginning 0)))))))))
+
+(ert-deftest gptel-agent-workers-approvals-do-not-share-parent-output ()
+  (dolist (mode '(fundamental-mode org-mode))
+    (dolist (stream '(nil t))
+      (dolist (child-first '(nil t))
+        (ert-info ((format "mode=%s stream=%s child-first=%s" mode stream child-first))
+          (let ((gptel-agent-workers-test--mode mode)
+                (gptel-agent-workers-test--stream stream)
+                (gptel-response-prefix-alist `((,mode . "ASSISTANT> "))))
+            (gptel-agent-workers-test--with-chat
+              (with-current-buffer parent
+                (setq-local gptel-prompt-prefix-alist `((,mode . "USER> ")))
+                (insert "UNSENT-DRAFT"))
+              (gptel-agent-workers-test--tool
+               fsm "Agent" '(:subagent_type "researcher" :description "Research"
+                                           :prompt "Investigate" :background t))
+              (let* ((run (car (hash-table-values gptel-agent--runs)))
+                     (child (gptel-agent--run-fsm run))
+                     (info (gptel-fsm-info fsm))
+                     (child-info (gptel-fsm-info child))
+                     (card (gptel-agent--run-overlay run))
+                     (anchor (overlay-end card)))
+                (with-current-buffer parent (setq-local gptel-confirm-tool-calls t))
+                (with-current-buffer (gptel-agent--run-child-buffer run)
+                  (setq-local gptel-confirm-tool-calls t))
+                (dolist (request (if child-first (list child fsm) (list fsm child)))
+                  (gptel-agent-workers-test--tool request "WorkerTestTool" nil))
+                ;; Each approval must retain its own request and callbacks.
+                (let* ((approvals (with-current-buffer parent
+                                    (cl-remove-if-not
+                                     (lambda (ov) (overlay-get ov 'gptel-tool))
+                                     (overlays-in (point-min) (point-max)))))
+                       (parent-ov (cl-find info approvals
+                                           :key (lambda (ov) (overlay-get ov 'info))))
+                       (child-ov (cl-find child-info approvals
+                                          :key (lambda (ov) (overlay-get ov 'info)))))
+                  (should (= 2 (length approvals)))
+                  (should parent-ov)
+                  (should child-ov)
+                  (should (= 1 (length (overlay-get parent-ov 'gptel-tool))))
+                  (should (= 1 (length (overlay-get child-ov 'gptel-tool))))
+                  (should-not (eq (plist-get info :tracking-marker)
+                                  (plist-get child-info :tracking-marker)))
+                  (with-current-buffer parent
+                    (gptel--accept-tool-calls (overlay-get parent-ov 'gptel-tool) parent-ov))
+                  (funcall tool-callback "PARENT-TOOL-RESULT")
+                  ;; Parent output continues while the child's approval stays
+                  ;; visible, and must survive accepting that approval later.
+                  (gptel-agent-workers-test--answer fsm "PARENT-INTERIM" stream)
+                  (should (eq (gptel-fsm-state fsm) 'AGWT))
+                  (should (eq (marker-buffer (plist-get info :position)) parent))
+                  (should (eq (overlay-buffer child-ov) parent))
+                  (with-current-buffer parent
+                    (should-not (string-match-p "USER> " (buffer-string)))
+                    (gptel--accept-tool-calls (overlay-get child-ov 'gptel-tool) child-ov))
+                  (funcall tool-callback "CHILD-TOOL-RESULT")
+                  (gptel-agent-workers-test--answer child "CHILD-FINISHED" stream)
+                  (gptel-agent-workers-test--wake fsm)
+                  (gptel-agent-workers-test--answer fsm "PARENT-FINAL" stream)
+                  (should (eq (gptel-fsm-state fsm) 'DONE))
+                  (should (= anchor (overlay-end card)))
+                  (with-current-buffer parent
+                    (dolist (text '("ASSISTANT> " "USER> " "PARENT-TOOL-RESULT"
+                                    "PARENT-INTERIM" "PARENT-FINAL" "UNSENT-DRAFT"))
+                      (should (= 1 (gptel-agent-workers-test--count text (buffer-string)))))
+                    (should (string-suffix-p "UNSENT-DRAFT" (buffer-string)))))))))))))
+
+(ert-deftest gptel-agent-workers-sibling-and-nested-approvals-stay-independent ()
+  (gptel-agent-workers-test--with-chat
+    (let* ((first (gptel-agent-workers-test--launch fsm))
+           (second (gptel-agent-workers-test--launch fsm))
+           (nested (gptel-agent-workers-test--launch
+                    (gptel-agent--run-fsm first) "test-worker"))
+           (runs (list first second nested)))
+      (dolist (run runs)
+        (with-current-buffer (gptel-agent--run-child-buffer run)
+          (setq-local gptel-confirm-tool-calls t))
+        (gptel-agent-workers-test--tool
+         (gptel-agent--run-fsm run) "WorkerTestTool" nil)
+        (should (eq (overlay-buffer (gptel-agent--run-overlay run)) parent)))
+      (let ((approvals (with-current-buffer parent
+                         (cl-remove-if-not
+                          (lambda (ov) (overlay-get ov 'gptel-tool))
+                          (overlays-in (point-min) (point-max))))))
+        (should (= 3 (length approvals)))
+        ;; Complete them in a different order from their creation.  Removing
+        ;; one preview must leave the other two available for user approval.
+        (dolist (run (list second nested first))
+          (let* ((info (gptel-fsm-info (gptel-agent--run-fsm run)))
+                 (ov (cl-find info approvals
+                              :key (lambda (ov) (overlay-get ov 'info)))))
+            (should (eq (overlay-buffer ov) parent))
+            (should (= 1 (length (overlay-get ov 'gptel-tool))))
+            (with-current-buffer parent
+              (gptel--accept-tool-calls (overlay-get ov 'gptel-tool) ov))
+            (funcall tool-callback "WORKER-TOOL-RESULT")
+            (setq approvals (delq ov approvals))
+            (should (seq-every-p #'overlay-buffer approvals))))))))
+
 (ert-deftest gptel-agent-workers-parent-uses-tools-before-worker-finishes ()
   (gptel-agent-workers-test--with-chat
     ;; Agent's immediate acknowledgement goes through the normal tool pipeline.

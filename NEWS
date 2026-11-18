@@ -4,6 +4,11 @@
 
 ** Compatibility fixes
 
+- Concurrent sub-agent tool approvals now have independent insertion markers
+  and preview regions. Approving a worker no longer merges prompts with the
+  main agent or disturbs its response text and prefixes. Task cards remain at
+  the delegation point, before any unsent draft.
+
 - Require gptel 0.9.9.6 or newer, matching the system-prompt and tool-steering
   APIs used by the package. Subagents now continue after rejecting a tool with
   steering instructions instead of stopping in the new steering state.
