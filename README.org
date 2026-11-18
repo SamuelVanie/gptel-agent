@@ -1184,6 +1184,8 @@ gptel-agent can delegate tasks to "sub-agents".  Sub-agents can be specified in
 Markdown or Org files in a directory.  To see how to specify agents, examine the
 "agents" directory in this package (or see below).  You can add your directory
 of agents to =gptel-agent-dirs=, which see.
+You can also define them directly in Elisp with =gptel-agent-register= and
+extend a parent's allowlist with =gptel-agent-add-subagent= (see below).
 
 The following sub-agents are bundled:
 - =researcher= is read-only and can search the web or through local files for
@@ -1470,6 +1472,48 @@ Saved Bash logs contain the decoded stdout and stderr; a failed command's exit
 status appears in the tool response. Completed oversized logs remain in the
 temporary directory for inspection and consume disk space proportional to their
 output. A log write failure stops the command and returns a tool error.
+
+#+html: </details>
+#+html: <details><summary>
+**** Agents from Elisp
+#+html: </summary>
+
+Use =gptel-agent-register= to define an agent without a Markdown or Org file,
+then =gptel-agent-add-subagent= to allow a parent to delegate to it:
+
+#+begin_src emacs-lisp
+(with-eval-after-load 'gptel-agent
+  (gptel-agent-register 'code-reviewer
+    :description "Reviews code for correctness and missing tests"
+    :system "Review the requested code and report concrete findings with file references."
+    :tools '("Read" "Grep" "Glob")
+    :agents nil)
+
+  (gptel-agent-add-subagent 'gptel-agent 'code-reviewer)
+  (gptel-agent-add-subagent 'gptel-plan 'code-reviewer))
+#+end_src
+
+Names may be strings or symbols.  Registration accepts the same keyword/value
+pairs as =gptel-make-preset=, plus =:agents=, =:task-timeout= and
+=:max-request-rounds=.  Supply a nonempty =:description= and use =:system= for
+the prompt.  Values are ordinary Elisp values: for example, =:model= takes a
+symbol and =:pre= / =:post= take functions.  An omitted =:agents= permits all
+otherwise available sub-agents; =:agents nil= disables delegation.
+
+Registering the same name again replaces its Elisp definition.  Elisp
+definitions take precedence over same-named files.  Allowlist additions
+preserve the parent's existing entries, ignore duplicates, and work with
+file-defined agents too, for example
+=(gptel-agent-add-subagent 'ask 'introspector)=.  Both names must already be
+defined; main presets and self-delegation cannot be added as sub-agents.
+A parent without an explicit =:agents= list stays unrestricted.
+
+Definitions and allowlist additions survive registry refreshes and last for
+the current Emacs session; put the calls in your init file for future sessions.
+Additions also survive replacing the parent's definition and do not edit
+its source file.  Existing chats pick them up after =M-x gptel-agent-update=
+or reapplying a main preset.  Interactive selections and inherited restrictions
+still apply, and requests already in flight retain their captured definitions.
 
 #+html: </details>
 #+html: <details><summary>

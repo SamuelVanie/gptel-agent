@@ -762,6 +762,7 @@
          (gptel-agent-skill-dirs nil)
          (gptel--known-presets (copy-tree gptel--known-presets))
          gptel-agent--agents gptel-agent--agent-files gptel-agent--file-cache
+         gptel-agent--registered-agents gptel-agent--additional-subagents
          gptel-agent--skills)
      (with-temp-buffer
        (gptel-agent-update)

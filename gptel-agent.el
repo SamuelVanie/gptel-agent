@@ -58,6 +58,8 @@
 ;; in Markdown or Org files in a directory.  To see how to specify agents,
 ;; examine the "agents" directory in this package.  You can add your directory
 ;; of agents to `gptel-agent-dirs', which see.
+;; To define agents in Elisp instead, use `gptel-agent-register' and
+;; `gptel-agent-add-subagent'.
 ;;
 ;; Please note: gptel-agent uses significantly more tokens than the average
 ;; gptel LLM interaction.
@@ -164,6 +166,14 @@ Can be a string or a function that returns a string."
 
 Alist mapping agent names to a plist of agent properties.")
 
+(defvar gptel-agent--registered-agents nil
+  "Elisp agent definitions, taking precedence over file definitions.
+Use `gptel-agent-register' to populate this alist.")
+
+(defvar gptel-agent--additional-subagents nil
+  "Alist of parent names and sub-agent names added from Elisp.
+Use `gptel-agent-add-subagent' to extend a parent's declaration.")
+
 (defvar gptel-agent--skills nil
   "Known skills alist.
 
@@ -236,11 +246,119 @@ or AGENT-FILE has changed since it was cached."
                   new-entry)))
         parsed))))
 
+(defun gptel-agent--with-additional-subagents (name plist)
+  "Return a copy of PLIST including NAME's Elisp allowlist additions.
+An absent :agents key already allows all sub-agents and stays absent."
+  (let ((result (copy-tree plist)))
+    (when (plist-member result :agents)
+      (setf (plist-get result :agents)
+            (cl-remove-duplicates
+             (append (plist-get result :agents)
+                     (copy-sequence
+                      (alist-get name gptel-agent--additional-subagents
+                                 nil nil #'equal)))
+             :test #'equal :from-end t)))
+    result))
+
 (defun gptel-agent--agent-plist (agent-name)
   "Return the full plist for AGENT-NAME, loading it if needed."
-  (when-let* ((agent-file (alist-get agent-name gptel-agent--agent-files
-                                     nil nil #'equal)))
-    (cdr (gptel-agent--cached-read-file agent-file t))))
+  (when-let* ((plist
+              (or (alist-get agent-name gptel-agent--registered-agents
+                             nil nil #'equal)
+                  (when-let* ((agent-file
+                               (alist-get agent-name gptel-agent--agent-files
+                                          nil nil #'equal)))
+                    (cdr (gptel-agent--cached-read-file agent-file t))))))
+    (gptel-agent--with-additional-subagents agent-name plist)))
+
+(defun gptel-agent--normalize-agent-name (name)
+  "Return NAME as a nonempty string, or signal a user error."
+  (when (and name (symbolp name) (not (keywordp name)))
+    (setq name (symbol-name name)))
+  (unless (and (stringp name) (not (string-blank-p name)))
+    (user-error "gptel-agent: Agent name must be a nonempty string or symbol"))
+  name)
+
+;;;###autoload
+(defun gptel-agent-register (name &rest properties)
+  "Register an agent NAME defined by PROPERTIES and return its name string.
+
+NAME is a nonempty string or symbol.  PROPERTIES are keyword/value pairs
+as in `gptel-make-preset', with a required nonempty :description string.
+Use :system for the system prompt, :tools for tool names or categories,
+and optionally :agents for a list of allowed sub-agent names (strings or
+symbols).  An absent :agents allows all sub-agents; :agents nil allows
+none.  The agent-specific :task-timeout and :max-request-rounds keys are
+also supported.  Values are Elisp values, including functions for :pre
+and :post; they are not parsed as file metadata.
+
+Registration replaces any previous Elisp definition of NAME and takes
+precedence over a same-named file definition.  It lasts for this Emacs
+session and survives registry refreshes.  Put calls in your init file
+to keep them across sessions.  Use `gptel-agent-add-subagent' to add NAME
+to a parent's allowlist.
+
+Existing chats pick up changes with `gptel-agent-update' or by reapplying
+a main preset.  Requests already in flight retain their definitions."
+  (declare (indent 1))
+  (setq name (gptel-agent--normalize-agent-name name))
+  (unless (and (cl-evenp (length properties))
+               (cl-loop for (key _value) on properties by #'cddr
+                        always (and (keywordp key) (not (eq key :name)))))
+    (user-error "gptel-agent: Expected keyword/value pairs; pass the name as NAME"))
+  (let ((description (plist-get properties :description)))
+    (unless (and (stringp description) (not (string-blank-p description)))
+      (user-error "gptel-agent: Agent %s needs a nonempty :description" name)))
+  (setq properties (copy-tree properties))
+  (when (plist-member properties :agents)
+    (unless (proper-list-p (plist-get properties :agents))
+      (user-error "gptel-agent: :agents must be a list of agent names"))
+    (setf (plist-get properties :agents)
+          (mapcar #'gptel-agent--normalize-agent-name
+                  (plist-get properties :agents))))
+  (setf (alist-get name gptel-agent--registered-agents nil nil #'equal)
+        properties
+        (alist-get name gptel-agent--agents nil nil #'equal)
+        (gptel-agent--with-additional-subagents
+         name (gptel-agent--plist-without-system properties)))
+  (setq gptel-agent--agent-files
+        (assoc-delete-all name gptel-agent--agent-files))
+  name)
+
+;;;###autoload
+(defun gptel-agent-add-subagent (parent subagent)
+  "Allow PARENT to delegate to SUBAGENT, and return SUBAGENT's name string.
+
+PARENT and SUBAGENT are nonempty strings or symbols naming agents defined
+in `gptel-agent-dirs' or with `gptel-agent-register'.  Refresh discovery
+before checking their names.  Signal a user error for unknown agents,
+self-delegation, or a main preset used as SUBAGENT.
+
+The addition preserves PARENT's existing :agents list and is idempotent.
+A parent with no :agents key continues to allow all sub-agents.  The
+addition lasts for this Emacs session and survives registry refreshes
+and re-registration of PARENT; no definition file is edited.
+
+Refresh existing chats with `gptel-agent-update' or by reapplying a main
+preset.  Interactive selections and inherited delegation restrictions
+still apply, and requests already in flight retain their definitions."
+  (setq parent (gptel-agent--normalize-agent-name parent)
+        subagent (gptel-agent--normalize-agent-name subagent))
+  (unless (gptel-agent--subagent-p subagent parent)
+    (user-error "gptel-agent: %s cannot delegate to %s" parent subagent))
+  (gptel-agent--update-agents)
+  (dolist (name (list parent subagent))
+    (unless (assoc name gptel-agent--agents)
+      (user-error "gptel-agent: Unknown agent %s" name)))
+  (let ((additional (alist-get parent gptel-agent--additional-subagents
+                               nil nil #'equal)))
+    (unless (member subagent additional)
+      (setf (alist-get parent gptel-agent--additional-subagents nil nil #'equal)
+            (append additional (list subagent)))))
+  (setf (alist-get parent gptel-agent--agents nil nil #'equal)
+        (gptel-agent--with-additional-subagents
+         parent (alist-get parent gptel-agent--agents nil nil #'equal)))
+  subagent)
 
 (defvar gptel-agent--skill-file-cache nil
   "Data-only skill parses, separate from evaluated agent definitions.")
@@ -314,8 +432,8 @@ both non-nil, TEMPLATES will be ignored."
       (cons name agent-plist))))
 
 (defun gptel-agent--update-agents ()
-  "Update agent definitions from `gptel-agent-dirs'.
-Returns an alist of (agent-name . file-path)."
+  "Update file and Elisp agent definitions and allowlist additions.
+Return an alist of file-discovered (agent-name . file-path) entries."
   (setq gptel-agent--agents nil)
   (setq gptel-agent--agent-files nil)
   (let ((agent-files nil))               ; Alist of (agent-name . file-path)
@@ -332,6 +450,17 @@ Returns an alist of (agent-name . file-path)."
                           agent-file)
                     (push (cons name agent-file) agent-files))))))
           gptel-agent-dirs)
+    (dolist (entry gptel-agent--registered-agents)
+      (setf (alist-get (car entry) gptel-agent--agents nil nil #'equal)
+            (gptel-agent--plist-without-system (cdr entry)))
+      (setq gptel-agent--agent-files
+            (assoc-delete-all (car entry) gptel-agent--agent-files)))
+    (setq gptel-agent--agents
+          (mapcar (lambda (entry)
+                    (cons (car entry)
+                          (gptel-agent--with-additional-subagents
+                           (car entry) (cdr entry))))
+                  gptel-agent--agents))
     agent-files))
 
 (defun gptel-agent--skill-files (dir &optional ancestors)
@@ -444,7 +573,7 @@ AGENTS is an alist of agent names and associated plist as value
      (gptel-agent--snapshot-agent-definitions))))
 
 (defun gptel-agent--refresh-registry ()
-  "Read current agent files and return a fresh full registry snapshot."
+  "Read file and Elisp definitions and return a fresh full registry snapshot."
   (gptel-agent--update-agents)
   (gptel-agent--full-agent-definitions))
 
