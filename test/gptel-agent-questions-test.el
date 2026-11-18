@@ -240,6 +240,86 @@
       (should (equal (overlay-get ov 'gptel-ask--custom-responses) ["My custom color" nil]))
       (should (= 1 (overlay-get ov 'gptel-ask--index))))))
 
+(ert-deftest gptel-agent-questions-update-reopens-only-changed-questions ()
+  (gptel-agent-questions-test--with-chat
+    (gptel-agent-workers-test--tool
+     fsm "AskUserQuestion"
+     '(:questions [(:question "Color?")
+                   (:question "Finish?" :choices [(:value "Glossy") (:value "Matte")])]))
+    (should (string-match-p "added: 1, 2" (gptel-agent-workers-test--data fsm)))
+    (let* ((ov (gptel-agent-questions-test--add fsm "Accent?"))
+           (buffer (overlay-buffer ov)))
+      (should (string-match-p "added: 3" (gptel-agent-workers-test--data fsm)))
+      (with-current-buffer buffer
+        (goto-char (overlay-start ov))
+        (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "Teal")))
+          (gptel-agent--ask-confirm-choice))
+        (gptel-agent--ask-select-choice 1)
+        (gptel-agent--ask-confirm-choice)
+        (gptel-agent--ask-select-choice 1)
+        (gptel-agent--ask-confirm-choice)
+        (gptel-agent--ask-goto-question ov 0))
+      (should (equal (overlay-get ov 'gptel-ask--answers) ["Teal" "Matte" "Red"]))
+      (gptel-agent-workers-test--tool
+       fsm "AskUserQuestion"
+       '(:action "update"
+         :questions [(:question_number 3 :question "Trim?")
+                     (:question_number 1 :question "Color?"
+                      :choices [(:value "Gold" :description "Metallic")])]))
+      (should (eq (gptel-fsm-state fsm) 'WAIT))
+      (should (equal (overlay-get ov 'gptel-ask--answers) [nil "Matte" nil]))
+      (should (equal (overlay-get ov 'gptel-ask--custom-responses) [nil nil nil]))
+      (should (equal (overlay-get ov 'gptel-ask--selections) [0 1 0]))
+      (with-current-buffer buffer
+        (should (string-match-p "Answered 1/3 • Not saved" (buffer-string)))
+        (should (string-match-p "Gold" (buffer-string)))
+        (gptel-agent--ask-confirm-choice)
+        (should (string-match-p "Answered 2/3 • Current answer saved" (buffer-string))))
+      ;; Retrying an identical update after the user answered keeps the answer.
+      (gptel-agent-workers-test--tool
+       fsm "AskUserQuestion"
+       '(:action "update" :questions [(:question_number 1 :question "Color?"
+                                      :choices [(:description "Metallic" :value "Gold")])]))
+      (should (equal (overlay-get ov 'gptel-ask--answers) ["Gold" "Matte" nil]))
+      (gptel-agent-workers-test--tool fsm "AskUserQuestion" '(:action "wait"))
+      (let ((call (car (plist-get (gptel-fsm-info fsm) :tool-use))))
+        (with-current-buffer buffer
+          (gptel-agent--ask-submit)
+          (should (= 2 (overlay-get ov 'gptel-ask--index)))
+          (should-not (plist-get call :result))
+          (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "Ivory")))
+            (gptel-agent--ask-confirm-choice))
+          (gptel-agent--ask-submit))
+        (should (equal (plist-get call :result)
+                       "Q1: Color?\nR1: Gold\n\nQ2: Finish?\nR2: Matte\n\nQ3: Trim?\nR3: Ivory"))))))
+
+(ert-deftest gptel-agent-questions-update-during-custom-answer ()
+  (dolist (target '(1 2))
+    (gptel-agent-questions-test--with-chat
+      (let ((ov (gptel-agent-questions-test--add fsm)))
+        (gptel-agent-questions-test--add fsm "Another question")
+        (with-current-buffer (overlay-buffer ov)
+          (goto-char (overlay-start ov))
+          (gptel-agent--ask-select-choice 2)
+          (cl-letf (((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       (gptel-agent-workers-test--tool
+                        fsm "AskUserQuestion"
+                        (list :action "update"
+                              :questions (vector (list :question_number target
+                                                       :question "Revised question"))))
+                       "My custom color")))
+            (gptel-agent--ask-confirm-choice)))
+        (if (= target 1)
+            (progn
+              (should (equal (overlay-get ov 'gptel-ask--answers) [nil nil]))
+              (should (equal (overlay-get ov 'gptel-ask--custom-responses) [nil nil]))
+              (should (equal (overlay-get ov 'gptel-ask--selections) [0 0]))
+              (should (= 0 (overlay-get ov 'gptel-ask--index))))
+          (should (equal (overlay-get ov 'gptel-ask--answers) ["My custom color" nil]))
+          (should (equal (overlay-get ov 'gptel-ask--custom-responses) ["My custom color" nil]))
+          (should (= 1 (overlay-get ov 'gptel-ask--index))))))))
+
 (ert-deftest gptel-agent-questions-cancel-before-or-after-wait ()
   (dolist (waiting '(nil t))
     (dolist (kill-ui '(nil t))
@@ -458,7 +538,9 @@
       (should (string-match-p "status: empty" result))
       (dolist (args '((nil "add") ([] "add") ([(:question "")] "add")
                       ([(:question "Bad choices" :choices [(:value 7)])] "add")
-                      (nil "unknown")))
+                      ([(:question_number 1 :question "Number on add")] "add")
+                      (nil "unknown")
+                      ([(:question_number 1 :question "Missing queue")] "update")))
         (apply dispatch (lambda (value) (setq result value)) args)
         (should (string-prefix-p "Error:" result))
         (should-not (plist-get (gptel-fsm-info fsm) :agent-questions)))
@@ -466,11 +548,47 @@
         (funcall dispatch (lambda (value) (setq result value)) [(:question "Unqueued")] "wait")
         (should (string-prefix-p "Error:" result))
         (gptel-agent-workers-test--tool fsm "AskUserQuestion" '(:action "wait"))
-        (dolist (args '((nil "wait") ([(:question "Too late")] "add")))
+        (dolist (args '((nil "wait") ([(:question "Too late")] "add")
+                        ([(:question_number 1 :question "Too late")] "update")))
           (apply dispatch (lambda (value) (setq result value)) args)
           (should (string-prefix-p "Error:" result)))
         (should (eq (gptel-fsm-state fsm) 'TOOL))
         (should (= 1 (length (overlay-get ov 'gptel-ask--questions))))))))
+
+(ert-deftest gptel-agent-questions-update-validates-whole-batch ()
+  (gptel-agent-questions-test--with-chat
+    (let* ((ov (gptel-agent-questions-test--add fsm))
+           (dispatch (gptel-tool-function
+                      (cl-find "AskUserQuestion" (plist-get (gptel-fsm-info fsm) :tools)
+                               :key #'gptel-tool-name :test #'equal)))
+           (replacement '(:question_number 1 :question "Replacement?"))
+           result)
+      (gptel-agent-questions-test--add fsm "Second?")
+      (with-current-buffer (overlay-buffer ov)
+        (goto-char (overlay-start ov))
+        (gptel-agent--ask-confirm-choice))
+      (dolist (invalid '((:question "Missing number")
+                         (:question_number 1 :question "Duplicate number")
+                         (:question_number 0 :question "Zero")
+                         (:question_number 3 :question "Out of range")
+                         (:question_number "2" :question "Not an integer")
+                         (:question_number 2 :question " ")
+                         (:question_number 2 :question "Bad" :choices [(:value 7)])))
+        (funcall dispatch (lambda (value) (setq result value))
+                 (vector replacement invalid) "update")
+        (should (string-prefix-p "Error:" result))
+        (should (equal (mapcar (lambda (item) (plist-get item :question))
+                               (overlay-get ov 'gptel-ask--questions))
+                       '("Which color?" "Second?")))
+        (should (equal (overlay-get ov 'gptel-ask--answers) ["Blue" nil])))
+      (with-current-buffer (overlay-buffer ov)
+        (goto-char (overlay-start ov))
+        (gptel-agent--ask-cancel))
+      (funcall dispatch (lambda (value) (setq result value)) (vector replacement) "update")
+      (should (string-match-p "cancel" result))
+      (funcall dispatch (lambda (value) (setq result value)) nil "wait")
+      (should (equal result "User cancelled interaction."))
+      (should-not (plist-get (gptel-fsm-info fsm) :agent-questions)))))
 
 (provide 'gptel-agent-questions-test)
 ;;; gptel-agent-questions-test.el ends here

@@ -3567,6 +3567,20 @@ Deliver the result as harness context, without fabricating a model tool call."
                     (car names))))
      t)))
 
+(defun gptel-agent--ask-valid-item-p (item)
+  "Return non-nil for a question ITEM with valid text and choices."
+  (let ((question (plist-get item :question))
+        (choices (plist-get item :choices)))
+    (and (stringp question) (not (string-empty-p (string-trim question)))
+         (or (listp choices) (vectorp choices))
+         (seq-every-p
+          (lambda (choice)
+            (and (stringp (plist-get choice :value))
+                 (or (null (plist-get choice :description))
+                     (stringp (plist-get choice :description)))
+                 (memq (plist-get choice :recommended) '(nil t :json-false))))
+          choices))))
+
 (defun gptel-agent--ask-normalize (questions)
   "Copy QUESTIONS and append the free-text choice to each one."
   (mapcar
@@ -3578,9 +3592,45 @@ Deliver the result as harness context, without fabricating a model tool call."
                                         :recommended :json-false)))))
    (append questions nil)))
 
+(defun gptel-agent--ask-question-content (item)
+  "Return ITEM's visible text and choices, ignoring JSON object key order."
+  (cons (plist-get item :question)
+        (mapcar (lambda (choice)
+                  (list (plist-get choice :value)
+                        (or (plist-get choice :description) "")
+                        (eq (plist-get choice :recommended) t)))
+                (plist-get item :choices))))
+
+(defun gptel-agent--ask-update-questions (ov questions)
+  "Replace numbered QUESTIONS in OV and return a tool acknowledgement."
+  (let* ((queued (overlay-get ov 'gptel-ask--questions))
+         (total (length queued))
+         (numbers (mapcar (lambda (item) (plist-get item :question_number))
+                          questions))
+         changed)
+    ;; Check the entire batch before invalidating any saved answers.
+    (if (not (and (seq-every-p (lambda (n) (and (integerp n) (<= 1 n total))) numbers)
+                  (= (length numbers) (length (seq-uniq numbers)))))
+        (format "Error: Each update needs a distinct question_number between 1 and %d." total)
+      (cl-loop for number in numbers
+               for item in (gptel-agent--ask-normalize questions)
+               for idx = (1- number)
+               unless (equal (gptel-agent--ask-question-content item)
+                             (gptel-agent--ask-question-content (nth idx queued)))
+               do (setq changed t)
+                  (setf (nth idx queued) item)
+                  (aset (overlay-get ov 'gptel-ask--answers) idx nil)
+                  (aset (overlay-get ov 'gptel-ask--custom-responses) idx nil)
+                  (aset (overlay-get ov 'gptel-ask--selections) idx 0))
+      (when changed
+        (with-current-buffer (overlay-buffer ov)
+          (gptel-agent--ask-goto-question ov (overlay-get ov 'gptel-ask--index))))
+      (format "status: collecting\nquestions: %d\nupdated: %s\nCall action=wait when ready for answers."
+              total (mapconcat #'number-to-string numbers ", ")))))
+
 (defun gptel-agent--ask-dispatch (callback fsm questions action)
-  "Add QUESTIONS to FSM's queue or explicitly wait, according to ACTION.
-CALLBACK receives an acknowledgement for add, or the user's result for wait."
+  "Add or update QUESTIONS in FSM's queue, or wait, according to ACTION.
+CALLBACK receives an acknowledgement for edits, or the user's result for wait."
   (let* ((source (plist-get (gptel-fsm-info fsm) :buffer))
          (queue (plist-get (gptel-fsm-info fsm) :agent-questions))
          (action (or action "add"))
@@ -3589,23 +3639,22 @@ CALLBACK receives an acknowledgement for add, or the user's result for wait."
      ((or (not (buffer-live-p source))
           (memq (gptel-fsm-state fsm) '(DONE ABRT ERRS)))
       (setq result "Error: This question request is no longer active."))
-     ((equal action "add")
+     ((member action '("add" "update"))
       (cond
        ((and queue (gptel-agent--question-queue-callback queue))
-        (setq result "Error: Already waiting for answers; add questions before wait."))
+        (setq result "Error: Already waiting for answers. Add or update questions before wait."))
        ((and queue (gptel-agent--question-queue-result queue))
-        (setq result "User cancelled interaction. Call AskUserQuestion with action=wait to collect the result before adding more questions."))
-       ((not (and (sequencep questions) (> (length questions) 0)
-                  (seq-every-p
-                   (lambda (item)
-                     (and (stringp (plist-get item :question))
-                          (not (string-empty-p (string-trim (plist-get item :question))))
-                          (sequencep (plist-get item :choices))
-                          (seq-every-p (lambda (choice)
-                                         (stringp (plist-get choice :value)))
-                                       (plist-get item :choices))))
-                   questions)))
-        (setq result "Error: add requires nonempty questions with question text and optional choices containing value strings."))
+        (setq result "User cancelled interaction. Call AskUserQuestion with action=wait to collect the result."))
+       ((not (and (or (listp questions) (vectorp questions)) (> (length questions) 0)
+                  (seq-every-p #'gptel-agent--ask-valid-item-p questions)))
+        (setq result (format "Error: %s requires nonempty question text and valid choices." action)))
+       ((equal action "update")
+        (setq result (if queue
+                         (gptel-agent--ask-update-questions
+                          (gptel-agent--question-queue-overlay queue) questions)
+                       "Error: No questions are queued to update.")))
+       ((seq-some (lambda (item) (plist-member item :question_number)) questions)
+        (setq result "Error: Use action=update to replace a numbered question."))
        (t
         (unless queue
           (let* ((owner (with-current-buffer source
@@ -3639,9 +3688,12 @@ CALLBACK receives an acknowledgement for add, or the user's result for wait."
                                                    (and (eq property 'gptel-ask--selections) 0)))))
               (gptel-agent--ask-update-overlay ov)))
           (gptel-agent--ask-display queue)
-          (setq result
-                (format "status: collecting\nquestions: %d\nQuestions queued; no answers returned yet. Continue independent work and add further questions with AskUserQuestion. When ready, call AskUserQuestion with action=wait and omit questions; wait for its result before dependent work or finishing."
-                        (length (overlay-get ov 'gptel-ask--questions))))))))
+          (let ((total (length (overlay-get ov 'gptel-ask--questions))))
+            (setq result
+                  (format "status: collecting\nquestions: %d\nadded: %s\nUse these question numbers with action=update. When ready, call action=wait without questions for the answers."
+                          total (mapconcat #'number-to-string
+                                           (number-sequence (1+ (- total (length questions))) total)
+                                           ", "))))))))
      ((equal action "wait")
       (cond
        ((and questions (> (length questions) 0))
@@ -3663,7 +3715,7 @@ CALLBACK receives an acknowledgement for add, or the user's result for wait."
             (run-hook-with-args 'gptel-agent-question-functions
                                 ov (overlay-get ov 'gptel-ask--questions) source))
           (when (overlay-buffer ov) (gptel-agent--ask-display queue))))))
-     (t (setq result "Error: action must be add or wait.")))
+     (t (setq result "Error: action must be add, update or wait.")))
     (unless deferred (funcall callback result))
     nil))
 
@@ -3892,7 +3944,8 @@ interaction."
               (val (plist-get choice :value)))
     (if-let* ((answers (overlay-get ov 'gptel-ask--answers))
               (idx (overlay-get ov 'gptel-ask--index)))
-        (let* ((custom-p (= sel-idx (1- (length choices))))
+        (let* ((item (nth idx (overlay-get ov 'gptel-ask--questions)))
+               (custom-p (= sel-idx (1- (length choices))))
                (custom-responses
                 (overlay-get ov 'gptel-ask--custom-responses))
                (answer
@@ -3900,18 +3953,20 @@ interaction."
                     (read-string "Enter your custom response: "
                                  (aref custom-responses idx))
                   val)))
-          ;; More questions can arrive while the minibuffer is active.
-          ;; Fetch the current vectors, and ignore an expired interaction.
+          ;; A tool call can append questions or replace this particular
+          ;; item while the user is typing in the minibuffer.
           (when (overlay-buffer ov)
             (with-current-buffer (overlay-buffer ov)
-              (when custom-p
-                (aset (overlay-get ov 'gptel-ask--custom-responses) idx answer))
-              (aset (overlay-get ov 'gptel-ask--selections) idx sel-idx)
-              (aset (overlay-get ov 'gptel-ask--answers) idx answer)
-              (if (< idx (1- (length (overlay-get ov 'gptel-ask--answers))))
-                  (gptel-agent--ask-goto-question ov (1+ idx))
-                (gptel-agent--ask-update-overlay ov)
-                (message "Answer saved; review with M-p/← or submit with C-c C-c")))))
+              (if (not (eq item (nth idx (overlay-get ov 'gptel-ask--questions))))
+                  (message "Question %d changed while you were typing. Please answer it again." (1+ idx))
+                (when custom-p
+                  (aset (overlay-get ov 'gptel-ask--custom-responses) idx answer))
+                (aset (overlay-get ov 'gptel-ask--selections) idx sel-idx)
+                (aset (overlay-get ov 'gptel-ask--answers) idx answer)
+                (if (< idx (1- (length (overlay-get ov 'gptel-ask--answers))))
+                    (gptel-agent--ask-goto-question ov (1+ idx))
+                  (gptel-agent--ask-update-overlay ov)
+                  (message "Answer saved; review with M-p/← or submit with C-c C-c"))))))
       ;; Treat the appended custom option (always the last in CHOICES)
       ;; as the free-text sentinel, instead of relying on VAL being \"Custom\".
       (if (= sel-idx (1- (length choices)))
@@ -4803,14 +4858,20 @@ automatically appended.")
  :description "Accumulate questions while working, then explicitly wait for answers.
 
 action=add (default) appends QUESTIONS to this request's live question queue
-and returns immediately with an acknowledgement, not answers. Call add again
-as new questions arise. Continue useful work that does not depend on the answers.
+and returns their numbers immediately, in input order, starting at 1.
+Continue independent work and add more questions as they arise.
+
+Before waiting, use action=update to revise any subset of the queue.
+For each replacement, supply its question_number from add, the full question
+text and the complete choices, omitting choices for free text. Each number
+can occur once per call. A change to the text or choices clears that
+question's saved answer. Identical replacements preserve saved answers.
 
 When you have no more questions to add, call action=wait with questions omitted
 or empty. This pauses your turn until the user submits all answers or cancels.
 You MUST wait and read the result before dependent work or finishing your turn.
-Call wait separately after all add calls finish. A cancelled queue is collected
-by wait too. After wait returns, add starts a fresh queue if more input is needed.
+Call wait separately after all add and update calls finish. Use wait to collect
+a cancellation too. After wait returns, add starts a fresh queue.
 
 The user can revisit and change saved answers before submitting the complete
 response list. New questions preserve existing answers. Submission becomes
@@ -4828,7 +4889,9 @@ none of the predefined options are suitable."
  :args '(( :name "questions"
            :type array :optional t
            :items (:type object
-                   :properties (:question (:type string)
+                   :properties (:question_number (:type integer :minimum 1
+                                                  :description "Required for update. Use the number returned by add. Omit when adding.")
+                                :question (:type string)
                                 :choices (:type array
                                           :items (:type object
                                                   :properties (:value (:type string)
@@ -4836,8 +4899,8 @@ none of the predefined options are suitable."
                                                                       :recommended (:type boolean))
                                                   :required ["value"])))
                    :required ["question"]))
-         (:name "action" :type string :optional t :enum ["add" "wait"]
-          :description "add queues questions and returns immediately (default); wait pauses for the complete answers, with questions omitted or empty."))
+         (:name "action" :type string :optional t :enum ["add" "update" "wait"]
+          :description "add queues new questions (default). update replaces numbered questions. Both return immediately. wait pauses for answers and takes no questions."))
  :category "gptel-agent"
  :async t
  :include t)

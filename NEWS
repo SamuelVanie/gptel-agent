@@ -147,7 +147,9 @@
 
 - ~AskUserQuestion~ now queues questions with ~action: "add"~ (the default)
   and returns immediately. Repeated calls extend one live question buffer,
-  preserving saved answers. ~action: "wait"~ explicitly pauses the turn and
+  preserving saved answers. Before waiting, the agent can revise questions
+  by number with ~action: "update"~. Each changed question returns to
+  unanswered and requires a fresh response. ~action: "wait"~ pauses the turn and
   collects all answers or cancellation. Users can save answers while the agent
   works and submit when it waits. ~gptel-agent-questions~ reopens the queue.
   If the model tries to finish with an uncollected batch, the runtime keeps the
