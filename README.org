@@ -1018,6 +1018,43 @@ Send a new message normally, or use =gptel-agent-discussion-resume= in a chat
 without an unsent draft to resume delivery of queued discussion messages.
 =M-x gptel-agent-session-save= saves changed chats immediately.
 
+The first save of a chat with message content automatically requests a short
+conversation title. By default, the title model sees the first and last
+nonempty user or assistant messages, shortened to 4000 characters each. If
+there is only one message, that message alone is used. Tool output and
+reasoning are excluded. The title appears in the session browser and restore
+picker and renames the current buffer to =*gptel:TITLE*=, matching spawned
+discussions. The title and buffer name survive restarting Emacs. Until a title
+is available, the session uses its existing buffer name.
+
+Title generation runs as a separate, non-streaming request using the chat's
+backend and model by default. Configure =gptel-agent-session-title-preset= just
+like =gptel-agent-preset= to use a smaller model: either a preset name created
+with =gptel-make-preset=, or a preset plist. For example, if you already have a
+preset named =lite=:
+
+#+begin_src emacs-lisp
+(setq gptel-agent-session-title-preset 'lite)
+;; A plist also works; substitute your registered backend and model:
+;; (setq gptel-agent-session-title-preset
+;;       '(:backend "My backend" :model small-model))
+#+end_src
+
+Once generated, the title stays unchanged through later messages, saves and
+restores. Set =gptel-agent-session-auto-title= to =nil= to disable automatic
+generation. =M-x gptel-agent-session-generate-title= explicitly generates or
+refreshes the current chat's title, including for an older restored session.
+It also works when automatic generation is disabled. Title failures preserve
+the previous name; an untitled chat can retry on a later save. Browsing and
+restoring do not themselves trigger title requests. Title generation runs in
+the background; its result is queued for autosaving like other metadata.
+
+To change which messages inform the title, customize
+=gptel-agent-session-title-context-function=. It takes no arguments and returns
+a string from the widened current chat buffer, or =nil= to skip generation.
+Title requests always use a dedicated system prompt with tools, attached
+context and prompt transforms disabled.
+
 Use =M-x gptel-agent-sessions= to browse saved families, their chat counts,
 open buffers and last-save times. =RET= restores the selected family, =d=
 deletes it after confirmation, and =g= refreshes the list. Browsing reads only

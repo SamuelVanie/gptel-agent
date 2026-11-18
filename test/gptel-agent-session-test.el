@@ -9,6 +9,7 @@
   (declare (indent 0))
   `(let ((gptel-agent-session-directory (make-temp-file "gptel-session-test-" t))
          (gptel-agent-session-mode nil)
+         (gptel-agent-session-auto-title nil)
          (gptel-agent-session-save-interval 0)
          (gptel-agent-session-idle-delay 3600)
          (gptel-agent-session-time-budget 10)

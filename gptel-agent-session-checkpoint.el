@@ -44,6 +44,7 @@
 (declare-function gptel-agent-session--eligible-p "gptel-agent-session")
 (declare-function gptel-agent-session--ensure-timer "gptel-agent-session")
 (declare-function gptel-agent-session--stop-if-clean "gptel-agent-session")
+(declare-function gptel-agent-session--auto-title "gptel-agent-session")
 
 (defun gptel-agent-session-checkpoint--reset ()
   "Release in-memory generations after flushing or before loading a store."
@@ -193,6 +194,8 @@
     (let ((pending (gptel-agent-session-checkpoint--transaction-pending transaction)))
       (setf (gptel-agent-session-checkpoint--transaction-pending transaction)
             (if (equal id (car pending)) (cdr pending) (delete id pending))))
+    (when live
+      (with-current-buffer buffer (gptel-agent-session--auto-title)))
     t))
 
 (defun gptel-agent-session-checkpoint--publish (transaction)

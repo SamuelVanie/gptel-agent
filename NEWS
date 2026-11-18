@@ -4,6 +4,15 @@
 
 ** New features and UI changes
 
+- Saved sessions now generate a short conversation title on their first save
+  with message content, using the first and last messages (or the sole message).
+  The title also renames the buffer to ~*gptel:TITLE*~ and remains unchanged
+  through later saves and restores. Configure the title model with
+  ~gptel-agent-session-title-preset~, using a named preset or plist just like
+  ~gptel-agent-preset~. ~gptel-agent-session-generate-title~ refreshes a title
+  on demand; ~gptel-agent-session-auto-title~ disables automatic generation.
+  Browsing and restoring sessions never start title requests themselves.
+
 - Discussion reporting instructions now exclude notices about asking or waiting
   for user input, permission, tool approval or file review. These interactions
   use the child's local controls and echo-area notices without requesting an
