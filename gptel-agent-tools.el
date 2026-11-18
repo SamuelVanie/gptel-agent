@@ -48,6 +48,7 @@
 (require 'gptel-agent-edit)
 (require 'gptel-agent-instructions)
 (require 'gptel-agent-access)
+(require 'gptel-agent-policy-request)
 (require 'gptel-agent-process)
 (require 'gptel-agent-read)
 (require 'gptel-agent-search)
@@ -1293,8 +1294,7 @@ separate from grants so discussions can inherit tools without pre-approvals."
     (setq-local gptel-tools
                 (gptel-agent--skill-merge-tools
                  (mapcar #'gptel-agent--skill-copy-tool gptel-tools) active))
-    (when-let* ((tool (cl-find "Skill" gptel-tools
-                               :key #'gptel-tool-name :test #'equal)))
+    (when-let* ((tool (gptel-agent--find-builtin-tool "Skill" gptel-tools)))
       (setf (gptel-tool-description tool)
             (let ((gptel-agent--enabled-skills enabled))
               (concat gptel-agent--skill-tool-base-desc "\n\n"
@@ -1559,7 +1559,7 @@ file/query pair registered when an oversized tool result was persisted."
 (cl-defstruct (gptel-agent--supervision
                (:constructor gptel-agent--make-supervision))
   "Private state behind the public supervision API."
-  buffer requests timer stopped on-state-change on-tool-approval)
+  buffer requests timer stopped on-state-change on-tool-approval allow-outside-reads)
 
 (defvar-local gptel-agent--supervision nil
   "Host supervision rooted in this conversation, if any.")
@@ -1685,6 +1685,23 @@ that the request is awaiting tools and that its saved INFO is still current."
        (not (memq (gptel-fsm-state fsm) '(DONE ERRS ABRT)))
        (when-let* ((gate (gptel-agent--workers-for fsm)))
          (not (gptel-agent--workers-closed gate)))))
+
+(defun gptel-agent-supervision-allow-outside-reads (scope fsm)
+  "Attach root request FSM to SCOPE and allow local outside reads.
+Call during request setup, after FSM has its source buffer and before
+the first send.  The setting applies to live requests owned by SCOPE.
+This covers Read, Glob, Grep and PathInfo in the root request and its
+supervised descendants.  Ordinary tool confirmations still apply."
+  (let ((buffer (plist-get (gptel-fsm-info fsm) :buffer)))
+    (unless (and (eq (gptel-fsm-state fsm) 'INIT)
+                 (buffer-live-p buffer)
+                 (eq buffer (gptel-agent--supervision-buffer scope))
+                 (eq scope (buffer-local-value 'gptel-agent--supervision buffer)))
+      (user-error "Expected a new root request for the active supervisor")))
+  (gptel-agent--workers-install fsm)
+  (unless (gptel-agent-supervision-request-live-p scope fsm)
+    (user-error "Cannot allow outside reads for an inactive request"))
+  (setf (gptel-agent--supervision-allow-outside-reads scope) t))
 
 (defun gptel-agent-supervision-stop (scope)
   "Release SCOPE and cancel its descendants, retaining inspection buffers.
@@ -2217,6 +2234,8 @@ steers current work without creating a run or resetting supervision budgets."
               (funcall callback "Error: Worker is complete. Use Agent with agent_id for a follow-up task."))
              ((not (and (stringp message) (not (string-blank-p message))))
               (funcall callback "Error: send requires a nonempty message."))
+             ((not (gptel-agent-policy-request-covers-p (gptel-agent--run-fsm run) fsm))
+              (funcall callback "Error: Worker is still running under a different tool policy."))
              (t
               ;; An asynchronous prompt transform can still be preparing this
               ;; request, before our normal localization transform has run.
@@ -2743,7 +2762,7 @@ leaving the same sub-agent, system prompt and complete evidence context intact."
         ;; pending tool calls or callbacks from this invocation.
         (let ((info (gptel-fsm-info fsm)) saved)
           (dolist (key '(:backend :model :stream :tools :skill-base-tools :include-reasoning
-                        :transformer :data))
+                        :agent-tool-policy-ceiling :agent-tool-policy-snapshot :transformer :data))
             (when (plist-member info key)
               (setq saved (plist-put saved key (plist-get info key)))))
           (setq saved (plist-put saved :data
@@ -3081,6 +3100,7 @@ The value must be nil (unlimited) or a non-negative integer."
                         (cons :callback callback)))
       (setq info (plist-put info (car entry) (cdr entry))))
     (setf (gptel-fsm-info fsm) info)
+    (gptel-agent-policy-request-capture fsm)
     (setq-local gptel-tools (copy-sequence
                             (if (plist-member info :skill-base-tools)
                                 (plist-get info :skill-base-tools)
@@ -3260,6 +3280,9 @@ the child's current directory."
                  parent-buffer child-buffer parent-fsm))
               (with-current-buffer child-buffer
                 (setq default-directory directory)
+                (gptel-agent-policy-inherit
+                 (gptel-agent-policy-request-ceiling parent-fsm)
+                 (plist-get (gptel-fsm-info parent-fsm) :agent-tool-policy-snapshot))
                 (unless previous
                   (setq-local gptel-agent--current-agent agent-type
                               gptel-agent--agent-snapshot agent-snapshot
@@ -3272,7 +3295,7 @@ the child's current directory."
                 ;; A custom preset may omit localizers.  Never carry a
                 ;; main-chat sender closure into a worker's request.
                 (setq-local gptel-tools (cl-remove "MainChat" gptel-tools
-                                                   :key #'gptel-tool-name :test #'equal))
+                                                   :key #'gptel-agent--builtin-tool-name :test #'equal))
                 (gptel-agent--reset-tool-call-counts)
                 (setf (gptel-agent--run-configuration run)
                       (if previous (gptel-agent--run-configuration previous)
@@ -3719,8 +3742,7 @@ CALLBACK receives an acknowledgement for edits, or the user's result for wait."
 
 (defun gptel-agent--localize-ask-tool (fsm)
   "Give AskUserQuestion a request-owned queue and lifecycle in FSM."
-  (when-let* ((base (cl-find "AskUserQuestion" gptel-tools
-                            :key #'gptel-tool-name :test #'equal)))
+  (when-let* ((base (gptel-agent--find-builtin-tool "AskUserQuestion" gptel-tools)))
     (gptel-agent--workers-install fsm)
     (let ((tool (gptel--copy-tool base)))
       (setf (gptel-tool-function tool)
@@ -4585,7 +4607,7 @@ How to use:
 
 (defun gptel-agent--update-skill-tool ()
   "Update the Skill tool's description with currently discoverable skills."
-  (let* ((tool (gptel-get-tool "Skill"))
+  (let* ((tool (gptel-agent--registered-builtin-tool "Skill"))
          (skills-msg (gptel-agent--skills-system-message gptel-agent--skills)))
     (setf (gptel-tool-description tool)
           (concat gptel-agent--skill-tool-base-desc "\n\n" skills-msg))))
@@ -4692,8 +4714,7 @@ The clone captures FSM and a snapshot of the allowed agent registry.  Its
 schema and dispatcher therefore cannot change when another project updates
 the global registry while this request is in flight."
   (gptel-agent--localize-ask-tool fsm)
-  (when-let* ((base-tool (cl-find "Bash" gptel-tools
-                                :key #'gptel-tool-name :test #'equal)))
+  (when-let* ((base-tool (gptel-agent--find-builtin-tool "Bash" gptel-tools)))
     (let ((tool (gptel--copy-tool base-tool)))
       (setf (gptel-tool-function tool)
             (lambda (callback command query &optional background)
@@ -4705,8 +4726,7 @@ the global registry while this request is in flight."
   (gptel-agent--localize-result-search fsm)
   (gptel-agent--localize-repository-search fsm)
   (gptel-agent--localize-web-tools fsm)
-  (when-let* ((base-tool (cl-find "Process" gptel-tools
-                                :key #'gptel-tool-name :test #'equal)))
+  (when-let* ((base-tool (gptel-agent--find-builtin-tool "Process" gptel-tools)))
     (let ((tool (gptel--copy-tool base-tool)))
       (setf (gptel-tool-function tool)
             (lambda (callback action &optional process-id input offset max-chars
@@ -4725,8 +4745,7 @@ the global registry while this request is in flight."
                         gptel-tools))
     (gptel-agent--workers-install fsm))
   (when-let* ((base-tool
-               (cl-find "Agent" gptel-tools
-                        :key #'gptel-tool-name :test #'string=)))
+               (gptel-agent--find-builtin-tool "Agent" gptel-tools)))
     (let* ((source-buffer (plist-get (gptel-fsm-info fsm) :buffer))
            (prompt-agent (and (local-variable-p 'gptel-agent--current-agent)
                               gptel-agent--current-agent))
@@ -4765,23 +4784,24 @@ the global registry while this request is in flight."
          (remq base-tool gptel-tools)))))
   ;; Make control available wherever delegation is available, including custom
   ;; presets that listed only Agent before background workers existed.
-  (when (or (cl-find "Agent" gptel-tools :key #'gptel-tool-name :test #'equal)
-            (cl-find "AgentControl" gptel-tools :key #'gptel-tool-name :test #'equal))
-    (let ((control (gptel--copy-tool (gptel-get-tool "AgentControl"))))
+  (let* ((selected (cl-find "AgentControl" gptel-tools :key #'gptel-tool-name :test #'equal))
+         (base (if selected
+                   (and (gptel-agent--builtin-tool-name selected) selected)
+                 (when (gptel-agent--find-builtin-tool "Agent" gptel-tools)
+                   (gptel-agent--registered-builtin-tool "AgentControl")))))
+    (when-let* ((control (and base (gptel--copy-tool base))))
       (setf (gptel-tool-function control)
             (lambda (callback action &optional agent-id agent-ids message)
               (gptel-agent--control callback fsm action agent-id agent-ids message)))
       (setq-local gptel-tools
-                  (append (cl-remove "AgentControl" gptel-tools
-                                     :key #'gptel-tool-name :test #'equal)
-                          (list control))))))
+                  (append (remq selected gptel-tools) (list control))))))
 
 (defun gptel-agent--update-agent-tool ()
   "Retain compatibility; Agent schemas are now built per request.
 
 The registered tool is deliberately immutable.  See
 `gptel-agent--localize-agent-tool'."
-  (gptel-get-tool "Agent"))
+  (gptel-agent--registered-builtin-tool "Agent"))
 
 (defun gptel-agent--task-tool-dispatch
     (main-cb agent-type description prompt &optional result-file query agent-id background directory)

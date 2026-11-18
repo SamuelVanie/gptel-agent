@@ -18,6 +18,7 @@
 (require 'subr-x)
 (require 'project)
 (require 'gptel)
+(require 'gptel-agent-tool-identity)
 (require 'gptel-agent-edit)
 
 (defvar gptel-agent--result-file-scope)
@@ -427,7 +428,8 @@ Used before every send and before saving a retained worker's conversation."
             (dolist (call (plist-get info :tool-use))
               (when (and (not (plist-get call :result))
                          (not (plist-get call :agent-access-pending))
-                         (member (plist-get call :name) gptel-agent-instructions--file-tools))
+                         (member (plist-get call :name) gptel-agent-instructions--file-tools)
+                         (gptel-agent--find-builtin-tool (plist-get call :name) (plist-get info :tools)))
                 (push call calls)
                 (condition-case err
                     (let ((dirs (gptel-agent-instructions--tool-targets
@@ -500,7 +502,7 @@ Used before every send and before saving a retained worker's conversation."
       (setf (plist-get info :tools)
             (mapcar
              (lambda (tool)
-               (if (or (not (member (gptel-tool-name tool) gptel-agent-instructions--file-tools))
+               (if (or (not (member (gptel-agent--builtin-tool-name tool) gptel-agent-instructions--file-tools))
                        (memq (gptel-tool-function tool) (plist-get info :agent-instructions-wrapped))) tool
                  (let* ((copy (gptel--copy-tool tool))
                         (function (gptel-tool-function tool)) (name (gptel-tool-name tool)))

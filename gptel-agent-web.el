@@ -9,7 +9,12 @@
 ;;; Code:
 (require 'cl-lib)
 (require 'gptel)
+(require 'gptel-agent-tool-identity)
 (require 'eww)
+(require 'url-expand)
+
+(autoload 'gptel-agent-web-worker--headers "gptel-agent-web-worker")
+(defvar gptel-agent-policy--active-check)
 
 (defcustom gptel-agent-web-search-default-count 10
   "Default number of results returned by WebSearch."
@@ -39,7 +44,7 @@ Oversized responses fail explicitly instead of parsing a partial document."
 
 (cl-defstruct (gptel-agent--web-job (:constructor gptel-agent--make-web-job))
   callback source fsm cleanup kind url options directory buffer process
-  stderr-process timer done max-bytes max-chars timeout (stderr ""))
+  stderr-process timer done max-bytes max-chars timeout check-url (redirects 0) (stderr ""))
 
 (defvar gptel-agent--web-active nil "Web calls occupying a worker slot.")
 (defvar gptel-agent--web-queue nil "Web calls waiting for a worker slot.")
@@ -218,42 +223,69 @@ Oversized responses fail explicitly instead of parsing a partial document."
            (error (gptel-agent--web-finish
                    job (concat "Error: Web extraction failed: " (error-message-string err))))))))))
 
+(defun gptel-agent--web-download-done (job)
+  "Extract JOB's response or follow a checked HTTP redirect."
+  (let* ((check (gptel-agent--web-job-check-url job))
+         (headers (and check (gptel-agent-web-worker--headers
+                              (expand-file-name "headers" (gptel-agent--web-job-directory job)))))
+         (status (plist-get headers :status))
+         (location (plist-get headers :location)))
+    (if (and status (<= 300 status 399) location)
+        (progn
+          (when (>= (gptel-agent--web-job-redirects job) 5)
+            (error "WebFetch exceeded its redirect limit"))
+          (cl-incf (gptel-agent--web-job-redirects job))
+          (setf (gptel-agent--web-job-url job)
+                (url-expand-file-name location (gptel-agent--web-job-url job)))
+          (gptel-agent--web-stop-process job)
+          (with-current-buffer (gptel-agent--web-job-buffer job) (erase-buffer))
+          (gptel-agent--web-download job))
+      (gptel-agent--web-extract job))))
+
+(defun gptel-agent--web-download (job)
+  "Start one download for JOB, checking the next URL before launching curl."
+  (let ((check (gptel-agent--web-job-check-url job))
+        (curl (or (executable-find "curl")
+                  (error "Web tools require curl; install it or use an available browser tool"))))
+    (when (and check (not (funcall check (list :url (gptel-agent--web-job-url job)))))
+      (error "WebFetch target denied by tool policy"))
+    (gptel-agent--web-launch
+     job
+     (append (list curl "--disable" "--silent" "--show-error")
+             (if check '("--globoff") '("--location" "--max-redirs" "5"))
+             (list "--proto" "=http,https" "--proto-redir" "=http,https"
+                   "--compressed" "--max-time" (number-to-string (gptel-agent--web-job-timeout job))
+                   "--max-filesize" (number-to-string (gptel-agent--web-job-max-bytes job))
+                   "--dump-header" (expand-file-name "headers" (gptel-agent--web-job-directory job))
+                   "--header" "Accept: text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5"
+                   "--header" "Accept-Language: en-US,en;q=0.8"
+                   "--url" (gptel-agent--web-job-url job)))
+     (lambda (process output) (gptel-agent--web-filter job process output))
+     (lambda (process _event)
+       (when (memq (process-status process) '(exit signal))
+         (condition-case err
+             (cond
+              ((not (gptel-agent--web-live-p job)) (gptel-agent--web-dispose job))
+              ((zerop (process-exit-status process)) (gptel-agent--web-download-done job))
+              (t (gptel-agent--web-finish
+                  job (format "Error: Web download failed (curl %d): %s%s"
+                              (process-exit-status process)
+                              (gptel-agent--web-job-stderr job)
+                              (if (= (process-exit-status process) 63)
+                                  " Response exceeded gptel-agent-web-max-response-bytes; use a more specific URL or raise that limit." "")))))
+           (error (gptel-agent--web-finish
+                   job (concat "Error: Web download failed: " (error-message-string err))))))))))
+
 (defun gptel-agent--web-start (job)
   "Start JOB's download, or its isolated YouTube worker."
   (let ((default-directory temporary-file-directory))
     (setf (gptel-agent--web-job-directory job) (make-temp-file "gptel-web-" t))
     (if (eq (gptel-agent--web-job-kind job) 'youtube)
         (gptel-agent--web-extract job)
-      (let ((curl (or (executable-find "curl")
-                      (error "Web tools require curl; install it or use an available browser tool"))))
-        (setf (gptel-agent--web-job-buffer job) (generate-new-buffer " *gptel-web-body*"))
-        (with-current-buffer (gptel-agent--web-job-buffer job)
-          (set-buffer-multibyte nil) (buffer-disable-undo))
-        (gptel-agent--web-launch
-         job
-         (list curl "--disable" "--silent" "--show-error" "--location"
-               "--max-redirs" "5" "--proto" "=http,https" "--proto-redir" "=http,https"
-               "--compressed" "--max-time" (number-to-string (gptel-agent--web-job-timeout job))
-               "--max-filesize" (number-to-string (gptel-agent--web-job-max-bytes job))
-               "--dump-header" (expand-file-name "headers" (gptel-agent--web-job-directory job))
-               "--header" "Accept: text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5"
-               "--header" "Accept-Language: en-US,en;q=0.8"
-               "--url" (gptel-agent--web-job-url job))
-         (lambda (process output) (gptel-agent--web-filter job process output))
-         (lambda (process _event)
-           (when (memq (process-status process) '(exit signal))
-             (condition-case err
-                 (cond
-                  ((not (gptel-agent--web-live-p job)) (gptel-agent--web-dispose job))
-                  ((zerop (process-exit-status process)) (gptel-agent--web-extract job))
-                  (t (gptel-agent--web-finish
-                      job (format "Error: Web download failed (curl %d): %s%s"
-                                  (process-exit-status process)
-                                  (gptel-agent--web-job-stderr job)
-                                  (if (= (process-exit-status process) 63)
-                                      " Response exceeded gptel-agent-web-max-response-bytes; use a more specific URL or raise that limit." "")))))
-               (error (gptel-agent--web-finish
-                       job (concat "Error: Web download failed: " (error-message-string err))))))))))))
+      (setf (gptel-agent--web-job-buffer job) (generate-new-buffer " *gptel-web-body*"))
+      (with-current-buffer (gptel-agent--web-job-buffer job)
+        (set-buffer-multibyte nil) (buffer-disable-undo))
+      (gptel-agent--web-download job))))
 
 (defun gptel-agent--web-enqueue (callback kind url options &optional fsm)
   "Queue a bounded Web call of KIND for URL with OPTIONS, owned by FSM.
@@ -270,6 +302,7 @@ Deliver via CALLBACK.  Return its job, or nil for invalid arguments."
       (let* ((job (gptel-agent--make-web-job
                    :callback callback :source (current-buffer) :fsm fsm
                    :kind kind :url url :options options
+                   :check-url (and (eq kind 'fetch) (bound-and-true-p gptel-agent-policy--active-check))
                    :max-bytes (max 1 gptel-agent-web-max-response-bytes)
                    :max-chars (min 200000 (max 1000 (or (plist-get options :max-chars)
                                                        gptel-agent-web-fetch-max-chars)))
@@ -314,7 +347,10 @@ FSM optionally owns cancellation.  Download and parsing are asynchronous."
 
 (defun gptel-agent--read-url (callback url &optional max-chars fsm)
   "Fetch URL asynchronously, limiting text to MAX-CHARS, owned by FSM."
-  (let ((video-id (gptel-agent--yt-video-id url)))
+  ;; The transcript worker contacts the player and caption endpoints itself.
+  ;; Guarded calls fetch the requested page through the checked redirect path.
+  (let ((video-id (unless (bound-and-true-p gptel-agent-policy--active-check)
+                    (gptel-agent--yt-video-id url))))
     (gptel-agent--web-enqueue callback (if video-id 'youtube 'fetch) url
                               (list :max-chars max-chars :video-id video-id) fsm)))
 
@@ -323,7 +359,7 @@ FSM optionally owns cancellation.  Download and parsing are asynchronous."
   (setq-local gptel-tools
               (mapcar
                (lambda (base)
-                 (if (not (member (gptel-tool-name base) '("WebFetch" "WebSearch"))) base
+                 (if (not (member (gptel-agent--builtin-tool-name base) '("WebFetch" "WebSearch"))) base
                    (let ((tool (gptel--copy-tool base)))
                      (setf (gptel-tool-function tool)
                            (if (equal (gptel-tool-name base) "WebFetch")

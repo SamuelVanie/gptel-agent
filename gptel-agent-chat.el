@@ -168,7 +168,7 @@ Never retain an inherited sender closure in a generated child.  This runs
 even without MainChat in the recipient's tools, allowing one-way messages."
   (let* ((info (gptel-fsm-info fsm))
          (source (plist-get info :buffer))
-         (base (cl-find "MainChat" gptel-tools :key #'gptel-tool-name :test #'equal)))
+         (base (gptel-agent--find-builtin-tool "MainChat" gptel-tools)))
     (if (or (not (gptel-agent-chat--main-p source))
             (gptel-agent--run-p (plist-get info :context))
             (plist-get info :dry-run))

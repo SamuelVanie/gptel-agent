@@ -163,6 +163,11 @@ unchanged, and subsequent outside calls ask again. Changed arguments, redirected
 symlinks, cancellation of the request, or a manual directory change invalidate
 pending approvals. File review hooks run only after outside access is approved.
 
+A host running an autonomous workflow can enable outside reads for its
+supervised requests with =gptel-agent-supervision-allow-outside-reads=.
+This covers =Read=, =Glob=, =Grep= and =PathInfo= for local paths during the
+invocation. Mutating file tools still use the outside approval controls.
+
 To allow subsequent outside file operations, choose the
 =Run tools + allow all outside paths= action in the approval panel, or press
 =C-c C-a= there. The minibuffer
@@ -180,6 +185,109 @@ approval again. =C-c C-c= continues to approve just the pending calls.
 
 A =cd= inside =Bash= affects only that shell invocation. File-tool approval is
 not an operating-system sandbox for arbitrary shell commands or Elisp evaluation.
+
+*** Tool argument policies
+
+A trusted Emacs configuration can restrict which tool calls a preset admits.
+For example, an unattended merge-request review can read its workspace and
+a shared specifications directory, fetch from one origin, and run three
+specific forms of a GitLab command.
+
+#+begin_src emacs-lisp
+(require 'gptel-agent)
+
+(gptel-agent-define-tool-policy 'mr-review
+  :allow
+  '((:tool "Read" :args (:file_path (under workspace "~/shared/specifications/")))
+    (:tool "Grep" :args (:path (under workspace "~/shared/specifications/")))
+    (:tool "WebFetch" :args (:url (url-origin "https://gitlab.example.com")))
+    (:tool "Bash"
+     :args (:background (optional false)
+            :command (rx "glab mr "
+                         (or "list"
+                             (seq (or "view" "diff") " "
+                                  (in "1-9") (* (in "0-9"))))
+                         " -R https://gitlab.example.com/team/project")))
+    (:tool "Eval" :args (:expression (rx (or "(buffer-name)" "(point)")))))
+  :deny '((:tool "Read" :args (:file_path (under ".git/")))
+          (:tool "Grep" :args (:path (under ".git/")))))
+
+(gptel-make-preset 'review-merge-request
+  :use-tools t
+  :tools '("Read" "Grep" "WebFetch" "Bash" "Eval")
+  :agent-tool-policy 'mr-review)
+#+end_src
+
+The =:tool= string is the exact name of a tool in the request. Every key
+inside =:args= names a parameter in that tool's schema, including parameters
+actually named =tool= or =args=. Fields in a rule must all match. A policy
+requires one matching allow and rejects any matching deny. Omitting =:args=
+matches every call to that tool. Unmentioned arguments remain unrestricted.
+A missing policy definition or an unknown top-level argument denies the call.
+Nested field names are checked when the tool declares a closed object schema.
+Open objects support dynamic keys, so the author supplies their spelling.
+Rules can be defined before the tools register. If two packages register
+the same name, select the intended tool by category in the preset, for
+example =:tools '(("catalog" "Read"))=. The policy checks that selected
+tool's arguments, and the package's own dispatcher handles the call.
+
+| Value pattern | Matching behavior |
+|---------------+-------------------|
+| A string, number, =true=, =false=, =null=, vector or keyword plist | Typed literal equality. Arrays match in order. Objects match their exact keys and values. A string containing ="false"= differs from JSON false. |
+| =(rx FORM ...)= | Case-sensitive Emacs =rx= over the entire string. Added flags, a newline, or a shell suffix fail the example command rule. |
+| =(one-of PATTERN ...)= | At least one alternative matches. |
+| =(object :KEY PATTERN ...)= | All named fields of a JSON object match. Additional fields are allowed. |
+| =(every PATTERN)= | Every element of a JSON array matches. The empty array satisfies this condition. |
+| =(optional PATTERN)= | The field is absent or its supplied value matches. All other field constraints require presence. |
+| =(under ROOT ...)= | The canonical local path equals or lies inside one of the directories. The symbol =workspace= refers to the selecting conversation's working directory. String roots can be absolute, home-relative, or workspace-relative. |
+| =(url-origin ORIGIN ...)= | An absolute URL has one of the listed schemes, hostnames and effective ports. The path and query may vary. |
+
+The matcher uses gptel's decoded values. Some backend parsers represent
+both JSON null and an empty object as Lisp =nil=. An ambiguous =nil= cannot
+satisfy a null or object allow pattern and can trigger a deny for either
+interpretation. A present false stays distinguishable from an omitted field.
+
+A preset containing only a locally registered or MCP tool uses the same
+grammar. For example, if =CatalogSearch= takes a request object and an array
+of collection names, these rules admit query =MR-12= on the catalog origin
+with collections =["design", "engineering"]=.
+
+#+begin_src emacs-lisp
+(gptel-agent-define-tool-policy 'catalog-review
+  :allow '((:tool "CatalogSearch"
+            :args (:request (object :endpoint (url-origin "https://catalog.example.org")
+                                    :query (rx "MR-" (+ (in "0-9"))))
+                   :collections (every (one-of "design" "engineering"))))))
+
+(gptel-make-preset 'catalog-only :use-tools t :tools '("CatalogSearch")
+                   :agent-tool-policy 'catalog-review)
+#+end_src
+
+In an agent definition file, use =agent-tool-policy: mr-review= in Markdown
+YAML frontmatter or =:AGENT-TOOL-POLICY: mr-review= in an Org property drawer.
+An ordinary conversation with no selected policy uses its usual confirmations.
+Applying a later preset that omits the key preserves the current setting.
+An explicit nil selection clears the top-level choice for later requests.
+A protected request retains its ceiling through prompt presets,
+skill activation and retries. Workers and managed discussions inherit each
+parent policy with its original workspace. A child policy can narrow those
+permissions further. Agent session records retain the names and roots for
+restoration, so load the corresponding trusted definitions in the restoring
+Emacs. A confirmation, outside-access grant, or runner's
+=:allow-unconfirmed-tools t= can never approve a policy denial.
+
+A matching path constraint can authorize an individual built-in outside read.
+Use =under= for directory trees. Guarded recursive searches also check the
+canonical targets they encounter. Guarded =WebFetch= checks each redirect
+before contacting its destination and reads a YouTube URL as an ordinary
+web page. The automatic project-instruction loader is separately controlled
+by =:agent-use-project-instructions=.
+
+The policy inspects the call submitted to the tool. The tool implementation
+still determines its subprocesses, network requests and filesystem effects.
+For =Bash= and =Eval=, admit only strings whose behavior you intend to allow.
+=Eval= runs in the requesting conversation's Emacs, including the batch
+worker for scheduled jobs. Trusted workflow Lisp executes as configured.
 
 *** Scoped project instructions
 
@@ -1194,6 +1302,7 @@ transcript content without including them in the final result.
 |-----------------+---------|
 | =gptel-agent-supervise= | Establish buffer ownership before starting requests; accepts =:on-state-change= and =:on-tool-approval= callbacks |
 | =gptel-agent-supervision-request-live-p= | Check whether a retained request still belongs to the active handle and can advance |
+| =gptel-agent-supervision-allow-outside-reads= | Attach the initializing root request to its handle and allow local outside reads during supervision |
 | =gptel-agent-supervision-retry= | Rearm a failed root request's completion gate before the host resumes that same FSM |
 | =gptel-agent-supervision-stop= | Idempotently release supervision and cancel descendants while retaining inspection buffers |
 

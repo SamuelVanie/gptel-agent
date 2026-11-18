@@ -6,6 +6,8 @@
 (require 'cl-lib)
 (require 'gptel-agent-web)
 
+(defvar gptel-agent-policy--active-check)
+
 (defun gptel-agent-web-test--wait (predicate &optional seconds)
   "Wait up to SECONDS for PREDICATE while servicing Emacs events."
   (let ((deadline (+ (float-time) (or seconds 10))))
@@ -59,6 +61,41 @@
         (should-not gptel-agent--web-active)
         (should-not gptel-agent--web-queue)
         (should (equal (nreverse results) '("second" "first" "third" "fourth")))))))
+
+(ert-deftest gptel-agent-web-policy-redirects-checked-before-download ()
+  (gptel-agent-web-test--with-queue
+    (let ((first "https://youtu.be/test")
+          (second "https://youtu.be/second")
+          (outside "https://elsewhere.example/private")
+          checked launched result)
+      (cl-letf (((symbol-function 'executable-find)
+                 (lambda (_program &rest _) (expand-file-name invocation-name invocation-directory)))
+                ((symbol-function 'gptel-agent--web-launch)
+                 (lambda (job command _filter sentinel)
+                   (let ((url (cadr (member "--url" command))))
+                     (push url launched)
+                     (should (member "--globoff" command))
+                     (should-not (member "--location" command))
+                     (with-temp-file (cadr (member "--dump-header" command))
+                       (insert "HTTP/1.1 302 Found\r\nLocation: "
+                               (cond ((equal url first) "/second")
+                                     ((equal url second) outside)
+                                     (t (ert-fail "Downloaded denied URL")))
+                               "\r\n\r\n"))
+                     (setf (gptel-agent--web-job-process job)
+                           (make-process :name "mock-http" :command (list (car command) "-Q" "--batch")
+                                         :noquery t :sentinel sentinel))))))
+        ;; Only the initial call runs in this dynamic binding. Queued hops
+        ;; must use the request-owned checker captured by the WebFetch job.
+        (let ((gptel-agent-policy--active-check
+               (lambda (args)
+                 (let ((url (plist-get args :url)))
+                   (push url checked) (member url (list first second))))))
+          (gptel-agent--read-url (lambda (value) (setq result value)) first))
+        (gptel-agent-web-test--wait (lambda () result))
+        (should (string-match-p "denied by tool policy" result))
+        (should (equal (nreverse checked) (list first second outside)))
+        (should (equal (nreverse launched) (list first second)))))))
 
 (ert-deftest gptel-agent-web-async-completes-once-in-owning-buffer ()
   (gptel-agent-web-test--with-queue
@@ -223,8 +260,8 @@
 (ert-deftest gptel-agent-web-async-localization-captures-owner-and-search-prefix ()
   (gptel-agent-web-test--with-queue
     (let* ((fsm (gptel-make-fsm :state 'TOOL :info nil))
-           (fetch (gptel--make-tool-internal :name "WebFetch" :function #'ignore))
-           (search (gptel--make-tool-internal :name "WebSearch" :function #'ignore))
+           (fetch (gptel--make-tool-internal :name "WebFetch" :category "gptel-agent" :function #'ignore))
+           (search (gptel--make-tool-internal :name "WebSearch" :category "gptel-agent" :function #'ignore))
            (unrelated (gptel--make-tool-internal :name "Other" :function #'ignore))
            fetched searched)
       (setq-local gptel-tools (list fetch search unrelated)

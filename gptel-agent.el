@@ -818,6 +818,12 @@ Substitution happens in-place in the buffer."
                                           ("ignore" 'ignore)
                                           (_ val))))
             ;; Symbol properties (always a symbol or nil)
+            (:agent-tool-policy
+             (plist-put parsed-yaml key
+                        (pcase val
+                          ((or :null 'nil) nil)
+                          ((pred stringp) (intern val))
+                          (_ (error "Expected a tool policy name or null in YAML")))))
             ((or :use-context :include-tool-results :confirm-tool-calls
                  :use-tools :cache :model)
              (plist-put parsed-yaml key
@@ -898,7 +904,7 @@ opening delimiter '---' found but no closing delimiter" file-path))))))
                          (_ value))))
           ;; Symbol properties
           ((or :use-context :include-tool-results :confirm-tool-calls
-               :use-tools :cache :model)
+               :use-tools :cache :model :agent-tool-policy)
            (setq value (intern value))))
         ;; Skip CATEGORY property (added automatically by Org)
         (unless (string-equal key-str "category")

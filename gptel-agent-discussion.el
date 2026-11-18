@@ -343,7 +343,7 @@ and can be inspected with DiscussionControl read without waking the owner."
   "Attach conversation ownership and Discussion tools to request FSM."
   (let* ((info (gptel-fsm-info fsm)) (buffer (plist-get info :buffer))
          (enabled (cl-find-if (lambda (tool)
-                                (member (gptel-tool-name tool)
+                                (member (gptel-agent--builtin-tool-name tool)
                                         '("Discussion" "DiscussionControl")))
                               gptel-tools)))
     ;; Snapshot settings even before Discussion is enabled: a later Skill call
@@ -362,7 +362,7 @@ and can be inspected with DiscussionControl read without waking the owner."
     ;; when management tools were enabled through a parent-only skill grant.
     (setq-local gptel-tools
                 (cl-remove "DiscussionReport" gptel-tools
-                           :key #'gptel-tool-name :test #'equal))
+                           :key #'gptel-agent--builtin-tool-name :test #'equal))
     (when (and (buffer-live-p buffer)
                (or enabled (buffer-local-value 'gptel-agent-discussion--self buffer)
                    (buffer-local-value 'gptel-agent-discussion--children buffer)
@@ -397,14 +397,14 @@ and can be inspected with DiscussionControl read without waking the owner."
                           (list #'gptel-agent-discussion--terminal))))
           (setf (gptel-agent--workers-handlers gate) handlers)))
       (dolist (name '("Discussion" "DiscussionControl"))
-        (when-let* ((base (cl-find name gptel-tools :key #'gptel-tool-name :test #'equal)))
+        (when-let* ((base (gptel-agent--find-builtin-tool name gptel-tools)))
           (let ((tool (gptel--copy-tool base)))
             (when (equal name "Discussion")
               ;; Advertise registered gptel presets and backend/model pairs,
               ;; independently of the Agent tool's configuration.  Start from the
               ;; registered schema so repeated localization cannot append the
               ;; catalog again or mutate another request's tool.
-              (let* ((args (copy-tree (gptel-tool-args (gptel-get-tool name))))
+              (let* ((args (copy-tree (gptel-tool-args (gptel-agent--registered-builtin-tool name))))
                      (preset (cl-find "preset" args
                                       :key (lambda (arg) (plist-get arg :name))
                                       :test #'equal))
@@ -444,8 +444,9 @@ and can be inspected with DiscussionControl read without waking the owner."
             (setq-local gptel-tools (cons tool (remq base gptel-tools))))))
       (when-let* ((chat (buffer-local-value 'gptel-agent-discussion--self buffer))
                   ((buffer-live-p (gptel-agent-discussion--chat-owner chat)))
+                  ((not (cl-find "DiscussionReport" gptel-tools :key #'gptel-tool-name :test #'equal)))
                   ((not (eq (gptel-agent-discussion--chat-state chat) 'closed))))
-        (let ((tool (gptel--copy-tool (gptel-get-tool "DiscussionReport"))))
+        (let ((tool (gptel--copy-tool (gptel-agent--registered-builtin-tool "DiscussionReport"))))
           (setf (gptel-tool-function tool)
                 (lambda (message) (gptel-agent-discussion--report chat fsm message)))
           (push tool gptel-tools))))))
@@ -653,13 +654,15 @@ SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
                ;; original (even when only arguments were changed).  Reapply the
                ;; same execution guard at acceptance, retaining the user's edits.
                (puthash finish
-                        (lambda (selected)
-                          (if (eq selected tool) selected
-                            (let ((copy (gptel--copy-tool selected))
-                                  (function (gptel-tool-function selected)))
-                              (setf (gptel-tool-function copy)
-                                    (lambda (&rest args) (funcall execute function args)))
-                              copy)))
+                        (lambda (selected args)
+                          (let* ((source (if (eq selected tool) (car call) selected))
+                                 (guarded (gptel-agent-policy-request-confirmation-tool
+                                           source args callback))
+                                 (copy (gptel--copy-tool guarded))
+                                 (function (gptel-tool-function guarded)))
+                            (setf (gptel-tool-function copy)
+                                  (lambda (&rest supplied) (funcall execute function supplied)))
+                            copy))
                         gptel-agent-discussion--approval-guards)
                (list tool (cadr call) finish)))
            calls))
@@ -674,7 +677,7 @@ SOURCE-FSM is a descendant worker's request when its UI is presented in CHAT."
   (funcall original
            (mapcar (lambda (call)
                      (if-let* ((guard (gethash (nth 2 call) gptel-agent-discussion--approval-guards)))
-                         (list (funcall guard (car call)) (cadr call) (nth 2 call))
+                         (list (funcall guard (car call) (cadr call)) (cadr call) (nth 2 call))
                        call))
                    calls)
            ov))
@@ -899,14 +902,15 @@ their metadata instead of interning their names."
                                          backend model))))
 
 (defun gptel-agent-discussion--create
-    (owner config title prompt preset directory &optional worktree model)
+    (owner config title prompt preset directory &optional worktree model parent-fsm)
   "Create an independent chat for OWNER using CONFIG, TITLE and PROMPT.
 Omitted or empty PRESET keeps inherited request settings.  Otherwise any
 registered gptel PRESET overrides the settings it specifies.
 MODEL, when nonempty, is a registered backend:model choice applied after
 PRESET, including its hooks, overriding both backend and model.
 DIRECTORY selects its working directory.  When WORKTREE is t, create a
-new Git worktree from that directory and start the chat in its root."
+new Git worktree from that directory and start the chat in its root.
+PARENT-FSM supplies the managing request's tool policy ceiling."
   (gptel-agent-discussion--nonempty title "title")
   (gptel-agent-discussion--nonempty prompt "prompt")
   (unless (memq worktree '(nil t :json-false :null))
@@ -954,6 +958,10 @@ new Git worktree from that directory and start the chat in its root."
               (gptel--apply-preset spec
                                    (lambda (symbol value)
                                      (set (make-local-variable symbol) value))))
+            (when parent-fsm
+              (gptel-agent-policy-inherit
+               (gptel-agent-policy-request-ceiling parent-fsm)
+               (plist-get (gptel-fsm-info parent-fsm) :agent-tool-policy-snapshot)))
             (when selection
               (setq-local gptel-backend (car selection)
                           gptel-model (cadr selection)))
@@ -970,7 +978,7 @@ new Git worktree from that directory and start the chat in its root."
                         ;; Strip parent-only closures even if a custom preset
                         ;; replaces the normal prompt transforms.
                         gptel-tools (cl-remove "MainChat" gptel-tools
-                                               :key #'gptel-tool-name :test #'equal))
+                                               :key #'gptel-agent--builtin-tool-name :test #'equal))
             (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
             (insert (gptel-prompt-prefix-string))
             (when worktree
@@ -1027,7 +1035,7 @@ CONFIG, TITLE, PROMPT, PRESET, DIRECTORY, WORKTREE and MODEL describe the chat."
                      (gptel-agent-discussion--inherited-tools fsm))
                (let ((chat (gptel-agent-discussion--create
                             (plist-get (gptel-fsm-info fsm) :buffer)
-                            config title prompt preset directory worktree model)))
+                            config title prompt preset directory worktree model fsm)))
                  (concat (gptel-agent-discussion--status chat)
                          "\nReplies and attention alerts stay in the discussion. Only an explicit DiscussionReport notifies you. Use send to ask for a report, or read to inspect its work and pending interactions. The user can open this buffer or M-x gptel-agent-discussions.")))
            (error (concat "Error: " (error-message-string err))))))
@@ -1187,6 +1195,20 @@ DELETE-BRANCH optionally deletes the generated branch during cleanup."
                        (gptel-agent-discussion--wait callback fsm ids)))
                     (_
                      (let ((chat (gptel-agent-discussion--owned id)))
+                       (when (member action '("send" "answer"))
+                         (when-let* ((ceiling (gptel-agent-policy-request-ceiling fsm))
+                                     (child (gptel-agent-discussion--chat-buffer chat))
+                                     ((buffer-live-p child)))
+                           (with-current-buffer child
+                             ;; A pending approval in an older turn may already
+                             ;; hold its dispatch closure.  Let it settle before
+                             ;; accepting instructions from a narrower parent.
+                             (when (and (gptel-agent-discussion--active-p gptel-agent-discussion--fsm)
+                                        (not (gptel-agent-policy-request-covers-p
+                                              gptel-agent-discussion--fsm fsm)))
+                               (user-error "Discussion is still running under a different tool policy"))
+                             (gptel-agent-policy-inherit
+                              ceiling (plist-get (gptel-fsm-info fsm) :agent-tool-policy-snapshot)))))
                        (pcase action
                          ("read" (gptel-agent-discussion--read chat offset))
                          ("send" (gptel-agent-discussion--send chat message))
@@ -1194,9 +1216,12 @@ DELETE-BRANCH optionally deletes the generated branch during cleanup."
                          ("cleanup" (gptel-agent-discussion--cleanup-worktree chat delete-branch))
                          ("answer"
                           (gptel-agent-discussion--nonempty message "message")
-                          (funcall (gptel-agent-discussion--interaction-callback
-                                    (gptel-agent-discussion--find-interaction chat request-id 'question))
-                                   message)
+                          (let* ((interaction (gptel-agent-discussion--find-interaction
+                                               chat request-id 'question))
+                                 (worker (gptel-agent-discussion--interaction-source-fsm interaction)))
+                            (when (and worker (not (gptel-agent-policy-request-covers-p worker fsm)))
+                              (user-error "Worker is still running under a different tool policy"))
+                            (funcall (gptel-agent-discussion--interaction-callback interaction) message))
                           "Question answered.")
                          ;; Old request schemas may still contain these actions.
                          ;; Neither may resolve or relocate a child's approval.

@@ -14,11 +14,13 @@
 (require 'ediff)
 (require 'seq)
 (require 'gptel-agent-review)
+(require 'gptel-agent-tool-identity)
 
 (declare-function lsp-mode "lsp-mode")
 (declare-function gptel-agent-edit-prepare "gptel-agent-edit")
 (declare-function gptel-agent-edit-apply "gptel-agent-edit")
 (defvar gptel-confirm-tool-calls)
+(defvar gptel-agent-instructions--request)
 
 (defvar smv/gptel-ediff-tool-names '("Edit" "Write" "Insert")
   "File tools previewed via Ediff; Edit also supports mixed operation batches.")
@@ -352,7 +354,10 @@ Updates reuse the same buffers and control window; no recursive edit is used."
 (defun smv/gptel-ediff-tool-call (plist)
   "Prepare file tool PLIST without waiting for review, or read staged content.
 Return an immediate :result so gptel can continue with more proposals."
-  (let* ((name (plist-get plist :name))
+  (let* ((name (if-let* ((fsm (bound-and-true-p gptel-agent-instructions--request)))
+                   (gptel-agent--builtin-tool-name
+                    (gptel-agent--find-builtin-tool (plist-get plist :name) (plist-get (gptel-fsm-info fsm) :tools)))
+                 (plist-get plist :name)))
          (owner (gptel-agent-review--owner (plist-get plist :buffer)))
          (queue (buffer-local-value 'gptel-agent-review--queue owner)))
     (condition-case err

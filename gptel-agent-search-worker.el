@@ -16,11 +16,13 @@
   (princ (json-encode value))
   (princ "\n"))
 
-(defun gptel-agent-search-worker-walk (root depth limit)
-  "Enumerate ROOT to DEPTH, examining at most LIMIT directory entries.
+(defun gptel-agent-search-worker-walk (roots depth limit)
+  "Enumerate ROOTS to DEPTH, examining at most LIMIT directory entries.
+ROOTS may also be a single directory.
 Emit lstat modification times and followed types, without following directory
 symlinks.  Bound even one wide directory's allocation before sorting."
-  (let ((pending (list (cons root 1))) (count 0) (status "complete"))
+  (let ((pending (mapcar (lambda (root) (cons root 1)) (if (stringp roots) (list roots) roots)))
+        (count 0) (status "complete"))
     (condition-case err
         (catch 'limited
           (while pending

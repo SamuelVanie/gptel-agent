@@ -112,6 +112,7 @@ only one message, that message alone supplies the context."
     gptel-org-convert-response gptel-track-media gptel--request-params
     gptel-prompt-prefix-alist gptel-response-prefix-alist gptel-response-separator
     gptel-agent-use-project-instructions gptel-agent--current-agent
+    gptel-agent-tool-policy gptel-agent-policy--inherited
     gptel-agent--enabled-agents gptel-agent--enabled-skills gptel-agent--todos)
   "Data settings persisted without request closures, grants or credentials.
 The selected preset name is retained without reapplying its definition.
@@ -461,17 +462,32 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
                            (gptel-agent-session--data item (1+ (or depth 0)))) value)))
         (t (error "Non-data value in session"))))
 
-(defun gptel-agent-session--snapshot ()
-  "Capture this chat's durable state, never its workers or active request."
+(defun gptel-agent-session--snapshot (&optional fsm)
+  "Capture this chat's durable state including an active FSM's policy ceiling."
   (save-restriction
     (let ((narrow (and (buffer-narrowed-p) (cons (point-min) (point-max))))
           (position (point)) settings)
       (widen)
       (dolist (symbol gptel-agent-session--settings)
-        (when (boundp symbol)
+        (when (and (boundp symbol)
+                   ;; Older readers reject unknown settings.  Ordinary
+                   ;; records keep working with them.
+                   (or (not (memq symbol '(gptel-agent-tool-policy gptel-agent-policy--inherited)))
+                       (symbol-value symbol)))
           (condition-case nil
               (push (cons symbol (gptel-agent-session--data (symbol-value symbol))) settings)
             (error nil))))
+      (when-let* ((request (or fsm
+                               (and (gptel-agent-discussion--active-p gptel-agent-discussion--fsm)
+                                    gptel-agent-discussion--fsm)
+                               (and (gptel-fsm-p gptel--fsm-last)
+                                    (gptel-agent-discussion--active-p gptel--fsm-last)
+                                    gptel--fsm-last)))
+                  ((eq (plist-get (gptel-fsm-info request) :buffer) (current-buffer)))
+                  (ceiling (gptel-agent-policy-request-ceiling request)))
+        (setf (alist-get 'gptel-agent-policy--inherited settings)
+              (cl-union (copy-tree ceiling)
+                        (alist-get 'gptel-agent-policy--inherited settings) :test #'equal)))
       (let ((chat gptel-agent-session--chat))
         (list :version 1 :id gptel-agent-session--id
               :parent gptel-agent-session--parent-id :name (gptel-agent-session--name)
@@ -909,7 +925,9 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
           (insert (plist-get record :text))
           (dolist (entry (plist-get record :settings))
             (when (memq (car entry) gptel-agent-session--settings)
-              (set (make-local-variable (car entry)) (cdr entry))))
+              (if (eq (car entry) 'gptel-agent-policy--inherited)
+                  (gptel-agent-policy-inherit (cdr entry))
+                (set (make-local-variable (car entry)) (cdr entry)))))
           (setq-local gptel-backend (cdr (assoc (plist-get record :backend) gptel--known-backends))
                       gptel-tools
                       (delq nil (mapcar (lambda (name)
@@ -976,16 +994,19 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
            append (list key (gptel-agent-session--data (plist-get record key)))))
 
 ;;;###autoload
-(defun gptel-agent-session-buffer-record (buffer)
+(defun gptel-agent-session-buffer-record (buffer &optional fsm)
   "Capture BUFFER as an independent, data-only gptel session record.
 The record contains the full chat, role boundaries, draft, view and
 session settings.  A workflow host can embed it in its own checkpoint.
-Saving this way works independently of `gptel-agent-session-mode'."
+If supplied, FSM is the host-owned request whose policy ceiling should
+survive restoration.  Saving works independently of `gptel-agent-session-mode'."
   (unless (and (buffer-live-p buffer) (buffer-local-value 'gptel-mode buffer))
     (user-error "A live gptel chat buffer is required"))
+  (when (and fsm (not (eq buffer (plist-get (gptel-fsm-info fsm) :buffer))))
+    (error "Tool policy request belongs to a different conversation"))
   (with-current-buffer buffer
     (let ((record (gptel-agent-session--standalone-record
-                   (gptel-agent-session--snapshot))))
+                   (gptel-agent-session--snapshot fsm))))
       ;; Keep executable settings local to the host that configured them.
       (setf (plist-get record :settings)
             (cl-remove-if

@@ -6,6 +6,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'gptel)
+(require 'gptel-agent-tool-identity)
 (require 'gptel-agent-path)
 
 (defvar gptel-agent-tool-result-max-chars)
@@ -34,8 +35,8 @@ This also bounds candidate paths and metadata before sorting or searching."
 
 (defconst gptel-agent--repo-python-walk
   "import json, os, stat, sys
-root, depth, limit = json.loads(sys.argv[1])
-pending = [(root, 1)]
+roots, depth, limit = json.loads(sys.argv[1])
+pending = [(root, 1) for root in reversed(roots)]
 count = 0
 status = 'complete'
 def emit(value):
@@ -128,13 +129,13 @@ emit({'status': status, 'examined': count})
 
 (defun gptel-agent--localize-repository-search (fsm)
   "Capture repository search contracts before serializing FSM's tools."
-  (when (cl-find-if (lambda (tool) (member (gptel-tool-name tool) '("Glob" "Grep"))) gptel-tools)
+  (when (cl-find-if (lambda (tool) (member (gptel-agent--builtin-tool-name tool) '("Glob" "Grep"))) gptel-tools)
     (let ((backend (or (plist-get (gptel-fsm-info fsm) :agent-repo-search-backend)
                        (gptel-agent--repo-select-backend))))
       (setf (gptel-fsm-info fsm) (plist-put (gptel-fsm-info fsm) :agent-repo-search-backend backend))
       (setq-local gptel-tools
                   (mapcar (lambda (tool)
-                            (if (member (gptel-tool-name tool) '("Glob" "Grep"))
+                            (if (member (gptel-agent--builtin-tool-name tool) '("Glob" "Grep"))
                                 (gptel-agent--repo-tool tool fsm backend) tool)) gptel-tools)))))
 
 (defun gptel-agent--refresh-repository-search (fsm)
@@ -144,7 +145,7 @@ emit({'status': status, 'examined': count})
       (let ((backend (gptel-agent--repo-select-backend)))
         (unless (equal old backend)
           (let ((tools (mapcar (lambda (tool)
-                                 (if (member (gptel-tool-name tool) '("Glob" "Grep"))
+                                 (if (member (gptel-agent--builtin-tool-name tool) '("Glob" "Grep"))
                                      (gptel-agent--repo-tool tool fsm backend) tool))
                                (plist-get info :tools))))
             (setf (plist-get info :tools) tools
@@ -155,11 +156,13 @@ emit({'status': status, 'examined': count})
 
 (cl-defstruct (gptel-agent--repo (:constructor gptel-agent--make-repo))
   name source callback fsm cleanup backend root regex glob depth type context
+  check-path directories next-directories (walk-level 1) (walk-base 0)
   max-results max-entries limit traversal-limit process stderr-process timer timeout
   stage walk-status status done (pending "") (stderr "") (entries nil) (files nil)
   (output nil) (used 0) (count 0) (examined 0) (walk-bytes 0))
 
 (defvar-local gptel-agent--repository-searches nil "Searches owned by this buffer.")
+(defvar gptel-agent-policy--active-check)
 (put 'gptel-agent--repository-searches 'permanent-local t)
 
 (defun gptel-agent--repo-stop-process (job)
@@ -260,16 +263,24 @@ emit({'status': status, 'examined': count})
            (entry (plist-get object :entry)))
       (if (not entry)
           (setf (gptel-agent--repo-walk-status job) (plist-get object :status)
-                (gptel-agent--repo-examined job) (plist-get object :examined))
+                (gptel-agent--repo-examined job) (+ (gptel-agent--repo-walk-base job)
+                                                     (plist-get object :examined)))
         (cl-incf (gptel-agent--repo-examined job))
         (when (> (gptel-agent--repo-examined job) (gptel-agent--repo-max-entries job))
           (error "traversal entry limit"))
+        (when (and (gptel-agent--repo-check-path job) (equal (cadr entry) "directory")
+                   (not (nth 2 entry))
+                   (or (null (gptel-agent--repo-depth job))
+                       (< (gptel-agent--repo-walk-level job) (gptel-agent--repo-depth job))))
+          (push (car entry) (gptel-agent--repo-next-directories job)))
         (let ((case-fold-search t))
           (with-case-table (standard-case-table)
             (when (and (or (null (gptel-agent--repo-glob job))
                            (string-match-p (gptel-agent--repo-glob job) (file-name-nondirectory (car entry))))
                        (or (equal (gptel-agent--repo-type job) "all")
-                           (equal (cadr entry) (if (equal (gptel-agent--repo-type job) "directories") "directory" "file"))))
+                           (equal (cadr entry) (if (equal (gptel-agent--repo-type job) "directories") "directory" "file")))
+                       (or (not (equal (gptel-agent--repo-name job) "Glob"))
+                           (gptel-agent--repo-permitted-path job (car entry))))
               (push entry (gptel-agent--repo-entries job))
               (when (equal (gptel-agent--repo-name job) "Glob")
                 (cl-incf (gptel-agent--repo-count job))
@@ -373,10 +384,7 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
                             job (format "incomplete: subprocess failed (exit %d): %s"
                                         (process-exit-status process) (gptel-agent--repo-stderr job)))
                          (gptel-agent--repo-stop-process job)
-                         (cond (walk
-                                (setf (gptel-agent--repo-used job) 0)
-                                (gptel-agent--repo-walk-end job (or (gptel-agent--repo-walk-status job)
-                                                                    "incomplete: missing traversal status")))
+                         (cond (walk (gptel-agent--repo-walk-continue job))
                                ((gptel-agent--repo-files job) (gptel-agent--repo-schedule job #'gptel-agent--repo-grep-batch))
                                (t (gptel-agent--repo-finish job "complete")))))
                    (error (gptel-agent--repo-finish job (concat "incomplete: " (error-message-string err))))))))))
@@ -389,28 +397,90 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
         "-l" gptel-agent--repo-worker "--eval"
         (prin1-to-string `(let ((coding-system-for-write 'utf-8-unix)) ,form))))
 
+(defun gptel-agent--repo-walk-directories (job directories)
+  "Enumerate DIRECTORIES for JOB within the remaining entry budget.
+Guarded walkers examine one level of admitted directories in each batch."
+  (let* ((base (gptel-agent--repo-examined job))
+         (remaining (- (gptel-agent--repo-max-entries job) base))
+         (depth (if (gptel-agent--repo-check-path job) 1 (gptel-agent--repo-depth job)))
+         (backend (gptel-agent--repo-backend job)))
+    (setf (gptel-agent--repo-walk-base job) base
+          (gptel-agent--repo-walk-status job) nil)
+    (gptel-agent--repo-launch
+     job (if (eq (plist-get backend :walker) 'python)
+             (list (plist-get backend :walk-program) "-I" "-u" "-c" gptel-agent--repo-python-walk
+                   (json-encode (vector (vconcat directories) depth remaining)))
+           (gptel-agent--repo-emacs-command
+            job `(gptel-agent-search-worker-walk ',directories ,depth ,remaining))))))
+
+(defun gptel-agent--repo-walk-next (job)
+  "Check the next batch of JOB's child directories before listing them."
+  (let ((examined 0) (bytes 0) admitted)
+    ;; Bound work in the owner even if many directories are denied. Leave
+    ;; room for encoding/escaping paths in the worker's command argument.
+    (while (and (gptel-agent--repo-directories job) (< examined 128) (< bytes 16384))
+      (cl-incf examined)
+      (let* ((path (pop (gptel-agent--repo-directories job)))
+             (target (gptel-agent--repo-permitted-path job path)))
+        (when (and target (not (file-symlink-p path)))
+          (push target admitted)
+          (cl-incf bytes (string-bytes target)))))
+    (if admitted
+        (gptel-agent--repo-walk-directories job (nreverse admitted))
+      (gptel-agent--repo-walk-continue job))))
+
+(defun gptel-agent--repo-walk-continue (job)
+  "Continue guarded enumeration or search the entries collected for JOB."
+  (let ((status (or (gptel-agent--repo-walk-status job) "incomplete: missing traversal status")))
+    (when (and (null (gptel-agent--repo-directories job)) (gptel-agent--repo-next-directories job))
+      (setf (gptel-agent--repo-directories job) (gptel-agent--repo-next-directories job)
+            (gptel-agent--repo-next-directories job) nil)
+      (cl-incf (gptel-agent--repo-walk-level job)))
+    (if (and (equal status "complete") (gptel-agent--repo-directories job))
+        (gptel-agent--repo-schedule job #'gptel-agent--repo-walk-next)
+      (gptel-agent--repo-walk-end job status))))
+
+(defun gptel-agent--repo-permitted-path (job file)
+  "Return the verified target of a recursive FILE read, or nil if denied."
+  (if-let* ((check (gptel-agent--repo-check-path job)))
+      (let* ((target (let (file-name-handler-alist) (file-truename file)))
+             (field (if (equal (gptel-agent--repo-name job) "Glob") :root_directory :path)))
+        ;; A broad rule for the directory does not grant outside access via
+        ;; a child symlink. Require a matching path constraint for that target.
+        (if (and (not (file-remote-p target))
+                 (or (equal file target) (funcall check (list field file)))
+                 (funcall check (list field target)
+                          (unless (file-in-directory-p target (gptel-agent--repo-root job)) field)))
+            target
+          (setf (gptel-agent--repo-status job) "incomplete: paths excluded by tool policy")
+          nil))
+    file))
+
 (defun gptel-agent--repo-grep-batch (job)
   "Search the next bounded batch of explicit filenames for JOB."
-  (let ((size 0) files (backend (gptel-agent--repo-backend job)))
-    (while (and (gptel-agent--repo-files job) (< (length files) 64) (< size 32768))
-      (let ((file (pop (gptel-agent--repo-files job))))
+  (let ((size 0) (examined 0) files (backend (gptel-agent--repo-backend job)))
+    (while (and (gptel-agent--repo-files job) (< examined 64) (< size 32768))
+      (cl-incf examined)
+      (when-let* ((file (gptel-agent--repo-permitted-path job (pop (gptel-agent--repo-files job)))))
         (cl-incf size (string-bytes file)) (push file files)))
     (setq files (nreverse files))
-    (gptel-agent--repo-launch
-     job
-     (if (eq (plist-get backend :name) 'emacs)
-         (gptel-agent--repo-emacs-command
-          job `(gptel-agent-search-worker-grep ,(gptel-agent--repo-regex job) ',files ,(gptel-agent--repo-context job)))
-       (append (list (plist-get backend :program))
-               (if (eq (plist-get backend :name) 'rg)
-                   ;; Parallel rg buffers output per file; stream one file at
-                   ;; a time so the parent can stop even a prolific match.
-                   '("--no-config" "--no-heading" "--color=never" "--no-mmap"
-                     "--threads=1" "--line-buffered" "--text" "--null" "-H" "-n")
-                 '("-E" "-a" "--line-buffered" "--null" "-H" "-n"))
-               (list (format "-C%d" (gptel-agent--repo-context job)) "-e" (gptel-agent--repo-regex job) "--")
-               ;; With no candidates, validate the regexp against empty stdin.
-               files)))))
+    (if (and (null files) (gptel-agent--repo-files job))
+        (gptel-agent--repo-schedule job #'gptel-agent--repo-grep-batch)
+      (gptel-agent--repo-launch
+       job
+       (if (eq (plist-get backend :name) 'emacs)
+           (gptel-agent--repo-emacs-command
+            job `(gptel-agent-search-worker-grep ,(gptel-agent--repo-regex job) ',files ,(gptel-agent--repo-context job)))
+         (append (list (plist-get backend :program))
+                 (if (eq (plist-get backend :name) 'rg)
+                     ;; Parallel rg buffers output per file; stream one file at
+                     ;; a time so the parent can stop even a prolific match.
+                     '("--no-config" "--no-heading" "--color=never" "--no-mmap"
+                       "--threads=1" "--line-buffered" "--text" "--null" "-H" "-n")
+                   '("-E" "-a" "--line-buffered" "--null" "-H" "-n"))
+                 (list (format "-C%d" (gptel-agent--repo-context job)) "-e" (gptel-agent--repo-regex job) "--")
+                 ;; With no candidates, validate the regexp against empty stdin.
+                 files))))))
 
 (defun gptel-agent--repo-pattern (pattern &optional glob)
   "Validate PATTERN and return its glob regexp when GLOB is non-nil."
@@ -442,6 +512,8 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
   (gptel-agent--make-repo
    :name name :source (current-buffer) :callback callback :fsm fsm
    :backend (or backend (gptel-agent--repo-select-backend)) :root path :regex pattern
+   :check-path (and (bound-and-true-p gptel-agent-policy--active-check)
+                    (file-directory-p path) gptel-agent-policy--active-check)
    :glob (and glob (wildcard-to-regexp glob)) :context context :depth depth :type type
    :max-results (gptel-agent--repo-checked-limit max-results gptel-agent-search-max-results "max_results")
    :max-entries (gptel-agent--repo-checked-limit max-entries gptel-agent-search-max-entries "max_entries")
@@ -466,7 +538,6 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
   "Start resources for a validated JOB and register cancellation cleanup."
   (let ((cleanup (lambda (&rest _) (gptel-agent--repo-dispose job)))
         (path (gptel-agent--repo-root job))
-        (depth (gptel-agent--repo-depth job))
         (fsm (gptel-agent--repo-fsm job)))
     (push job gptel-agent--repository-searches)
     (add-hook 'kill-buffer-hook #'gptel-agent--repository-searches-cleanup nil t)
@@ -479,13 +550,7 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
         (if (file-directory-p path)
             (progn
               (setf (gptel-agent--repo-stage job) 'walk)
-              (gptel-agent--repo-launch
-               job (if (eq (plist-get (gptel-agent--repo-backend job) :walker) 'python)
-                       (list (plist-get (gptel-agent--repo-backend job) :walk-program)
-                             "-I" "-u" "-c" gptel-agent--repo-python-walk
-                             (json-encode (vector path depth (gptel-agent--repo-max-entries job))))
-                     (gptel-agent--repo-emacs-command
-                      job `(gptel-agent-search-worker-walk ,path ,depth ,(gptel-agent--repo-max-entries job))))))
+              (gptel-agent--repo-walk-directories job (list path)))
           (setf (gptel-agent--repo-stage job) 'grep
                 (gptel-agent--repo-examined job) 1
                 (gptel-agent--repo-files job) (list path))

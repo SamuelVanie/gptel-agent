@@ -11,6 +11,10 @@
 ;;; Code:
 
 (require 'gptel-agent-instructions)
+(require 'gptel-agent-policy-request)
+
+(declare-function gptel-agent--supervision-allow-outside-reads "gptel-agent-tools")
+(declare-function gptel-agent-supervision-request-live-p "gptel-agent-tools")
 
 (defvar gptel-agent-access--approved nil
   "Exact canonical paths authorized while executing one outside operation.")
@@ -64,8 +68,9 @@ Ordinary tool confirmations and file reviews still apply."
                   (member path gptel-agent-access--approved))
         (error "Outside file operation requires approval; submit a fresh tool call: %s" path)))))
 
-(defun gptel-agent-access--paths (name args)
-  "Return canonical local paths for file tool NAME and ARGS."
+(defun gptel-agent-access--paths (name args &optional guarded)
+  "Return canonical local paths for file tool NAME and ARGS.
+GUARDED requests also resolve the final symlink of shared instruction files."
   (dolist (key '(:path :file_path :root_directory :directory_path))
     (when-let* ((path (plist-get args key)))
       (when (and (stringp path) (file-remote-p path))
@@ -84,21 +89,37 @@ Ordinary tool confirmations and file reviews still apply."
      ("Read"
       (let ((path (plist-get args :file_path)))
         ;; Shared instruction symlinks retain their containing local scope.
-        (list (if (and gptel-agent-use-project-instructions (stringp path)
+        (list (if (and (not guarded) gptel-agent-use-project-instructions (stringp path)
                        (equal (file-name-nondirectory path) "AGENTS.md"))
                   (file-name-directory (expand-file-name path)) path))))
      ("Glob" (list (or (plist-get args :root_directory) ".")))
      ((or "Mkdir" "Rmdir") (list (plist-get args :directory_path)))
      (_ (list (plist-get args :path))))))
 
-(defun gptel-agent-access--outside-p (name args)
-  "Whether NAME/ARGS requires outside access approval in this conversation."
+(defun gptel-agent-access--outside-p (name args &optional fsm)
+  "Whether NAME/ARGS requires outside access approval for request FSM."
   (when (and (member name gptel-agent-instructions--file-tools)
+             (or (null fsm) (gptel-agent--find-builtin-tool name (plist-get (gptel-fsm-info fsm) :tools)))
              (not (bound-and-true-p gptel-agent--result-file-scope)))
     (gptel-agent-instructions--initialize)
     ;; Validate targets even when outside access has already been granted.
-    (let ((paths (gptel-agent-access--paths name args)))
+    (let* ((guarded (and fsm (gptel-agent-policy-request-ceiling fsm)))
+           (paths (gptel-agent-access--paths name args guarded))
+           (read-field (pcase name
+                         ("Read" :file_path) ("Glob" :root_directory)
+                         ((or "Grep" "PathInfo") :path)))
+           (scope (and fsm (plist-get (gptel-fsm-info fsm) :agent-supervision))))
       (and (not (gptel-agent-access--granted-p))
+           (not (and guarded read-field
+                     (gptel-agent-policy-request-allows-p fsm name args read-field)
+                     (let ((target (car paths)))
+                       (or (equal (expand-file-name (plist-get args read-field)) target)
+                           (gptel-agent-policy-request-allows-p
+                            fsm name (plist-put (copy-sequence args) read-field target)
+                            read-field)))))
+           (not (and scope read-field
+                     (gptel-agent--supervision-allow-outside-reads scope)
+                     (gptel-agent-supervision-request-live-p scope fsm)))
            (cl-some (lambda (path)
                       (not (gptel-agent-instructions--inside-p
                             path gptel-agent-instructions--boundary)))
@@ -112,7 +133,7 @@ Ordinary tool confirmations and file reviews still apply."
         (unless (plist-get call :result)
           (condition-case err
               (when (gptel-agent-access--outside-p
-                     (plist-get call :name) (plist-get call :args))
+                     (plist-get call :name) (plist-get call :args) fsm)
                 (dolist (key '(:confirm :agent-access-pending :agent-access-used))
                   (unless (plist-member call key) (nconc call (list key nil))))
                 (setf (plist-get call :confirm) t
@@ -124,9 +145,13 @@ Ordinary tool confirmations and file reviews still apply."
                     (when-let* ((path (plist-get args key))
                                 ((and (stringp path) (not (string-empty-p path)))))
                       (setf (plist-get args key) (expand-file-name path))))
-                  (gptel--inject-tool-call (plist-get info :backend) (plist-get info :data)
-                                           call (list :args args))
-                  (setf (plist-get call :args) args)))
+                  ;; Keep a permitted literal relative argument when converting
+                  ;; it for display would change the policy's admission.
+                  (when (or (not (gptel-agent-policy-request-ceiling fsm))
+                            (gptel-agent-policy-request-allows-p fsm (plist-get call :name) args))
+                    (gptel--inject-tool-call (plist-get info :backend) (plist-get info :data)
+                                             call (list :args args))
+                    (setf (plist-get call :args) args))))
             (error
              (gptel--process-tool-call
               fsm (cl-find (plist-get call :name) (plist-get info :tools)
@@ -145,7 +170,7 @@ Ordinary tool confirmations and file reviews still apply."
             (mapcar (lambda (hook)
                       (lambda (call)
                         (unless (gptel-agent-access--outside-p
-                                 (plist-get call :name) (plist-get call :args))
+                                 (plist-get call :name) (plist-get call :args) fsm)
                           (funcall hook call))))
                     hooks)))
       (funcall original fsm))))
@@ -178,7 +203,8 @@ Ordinary tool confirmations and file reviews still apply."
          (owner (plist-get (gptel-fsm-info fsm) :buffer))
          (directory (buffer-local-value 'default-directory owner))
          (source (file-truename directory))
-         (paths (with-current-buffer owner (gptel-agent-access--paths name args)))
+         (guarded (gptel-agent-policy-request-ceiling fsm))
+         (paths (with-current-buffer owner (gptel-agent-access--paths name args guarded)))
          used)
     (setf (gptel-tool-function copy)
           (lambda (&rest supplied)
@@ -196,7 +222,7 @@ Ordinary tool confirmations and file reviews still apply."
                       (with-current-buffer owner
                         (unless (and (equal supplied values) (equal default-directory directory)
                                      (equal (file-truename directory) source)
-                                     (equal (gptel-agent-access--paths name args) paths))
+                                     (equal (gptel-agent-access--paths name args guarded) paths))
                           (error "Approved operation or target changed; submit a fresh call"))
                         ;; Remember only after validating the live approval,
                         ;; but before instruction discovery can defer the call.

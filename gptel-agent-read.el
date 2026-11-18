@@ -11,6 +11,7 @@
 
 (require 'cl-lib)
 (require 'gptel)
+(require 'gptel-agent-tool-identity)
 (require 'gptel-agent-path)
 
 (defvar gptel-agent-read-file-size-threshold)
@@ -198,7 +199,7 @@ file, subject to `gptel-agent-read-file-size-threshold'."
 
 (defun gptel-agent--localize-result-search (fsm)
   "Advertise and capture ResultGrep's selected backend before serializing FSM."
-  (when-let* ((base (cl-find "ResultGrep" gptel-tools :key #'gptel-tool-name :test #'equal)))
+  (when-let* ((base (gptel-agent--find-builtin-tool "ResultGrep" gptel-tools)))
     ;; Skill activation can localize tools during a tool batch.  Only WAIT may
     ;; change an already advertised contract; pending queries keep its dialect.
     (let* ((backend (or (plist-get (gptel-fsm-info fsm) :agent-result-search-backend)
@@ -212,8 +213,7 @@ file, subject to `gptel-agent-read-file-size-threshold'."
 The dispatcher used by an existing tool batch is never reinterpreted."
   (let* ((info (gptel-fsm-info fsm))
          (old (plist-get info :agent-result-search-backend))
-         (base (and old (cl-find "ResultGrep" (plist-get info :tools)
-                                 :key #'gptel-tool-name :test #'equal))))
+         (base (and old (gptel-agent--find-builtin-tool "ResultGrep" (plist-get info :tools)))))
     (when base
       (let ((backend (gptel-agent--result-search-backend)))
         (unless (equal backend old)

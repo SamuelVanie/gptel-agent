@@ -280,22 +280,24 @@ MAX-CHARS bounds the serialized result while preserving a readable plist."
   (plist-get (gptel-agent-web-worker--headers headers-file) :content-type))
 
 (defun gptel-agent-web-worker--headers (headers-file)
-  "Read status and content type from HEADERS-FILE's final HTTP block."
+  "Read status, content type and redirect location from the final HTTP block."
   (when headers-file
     (when (> (file-attribute-size (file-attributes headers-file)) 65536)
       (error "Response headers exceeded 65536 bytes; final HTTP status cannot be determined safely"))
     (with-temp-buffer
       (insert-file-contents headers-file nil 0 65536)
       (goto-char (point-min))
-      (let ((case-fold-search t) content-type status)
+      (let ((case-fold-search t) content-type location status)
         (while (not (eobp))
           (cond
            ((looking-at "HTTP/[0-9.]+[ \t]+\\([0-9]+\\)")
-            (setq content-type nil status (string-to-number (match-string 1))))
+            (setq content-type nil location nil status (string-to-number (match-string 1))))
+           ((looking-at "Location:[ \t]*\\([^\r\n]+\\)")
+            (setq location (string-trim (match-string-no-properties 1))))
            ((looking-at "Content-Type:[ \t]*\\([^\r\n]+\\)")
             (setq content-type (match-string-no-properties 1))))
           (forward-line 1))
-        (list :content-type content-type :status status)))))
+        (list :content-type content-type :status status :location location)))))
 
 (declare-function gptel-agent-web-youtube-run "gptel-agent-web-youtube")
 

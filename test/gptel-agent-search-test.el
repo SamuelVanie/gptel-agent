@@ -34,6 +34,32 @@
     (should (= (length results) 1))
     (car results)))
 
+(ert-deftest gptel-agent-repo-policy-batches-admitted-directories ()
+  (gptel-edit-test--with-files
+      (cl-loop for i below 48 collect (cons (format "d%02d/nested/match" i) "needle\n"))
+    (let ((launch (symbol-function 'gptel-agent--repo-launch))
+          (gptel-agent-policy--active-check
+           (lambda (args &optional _field)
+             (not (equal "d17" (file-name-nondirectory (plist-get args :path)))))))
+      (dolist (walker '(python emacs))
+        (when (or (eq walker 'emacs) (executable-find "python3"))
+          (let ((backend (gptel-agent-repo-test--backend 'emacs walker))
+                (walks 0))
+            (cl-letf (((symbol-function 'gptel-agent--repo-launch)
+                       (lambda (job command)
+                         (when (eq (gptel-agent--repo-stage job) 'walk) (cl-incf walks))
+                         (funcall launch job command))))
+              (let ((result (gptel-agent-repo-test--call "Grep" backend "needle" ".")))
+                (should (string-match-p "paths excluded by tool policy" result))
+                (should (string-match-p "results=47" result))
+                (should-not (string-match-p "d17/" result))
+                ;; Root, 47 permitted children, then their nested directories.
+                (should (= walks 3)))
+              (let ((limited (gptel-agent-repo-test--call "Grep" backend "needle" "."
+                                                          nil nil nil nil 100)))
+                (should (string-match-p "incomplete: traversal entry limit" limited))
+                (should (string-match-p "examined=100" limited))))))))))
+
 (ert-deftest gptel-agent-repo-glob-preserves-semantics-across-walkers ()
   (gptel-edit-test--with-files '(("a.EL" . "a") (".hidden" . "h")
                                  ("node_modules/pkg/file.el" . "dependency")

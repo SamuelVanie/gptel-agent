@@ -24,6 +24,72 @@
           pending)
       (setf (plist-get (gptel-fsm-info fsm) :callback) callback))))
 
+(ert-deftest gptel-agent-access-policy-outside-reads-and-recursive-grep ()
+  (gptel-agent-access-test--with-project
+    (let* ((gptel-agent-policy--definitions (make-hash-table :test #'eq))
+           (shared (expand-file-name "specs/" back))
+           (hidden (expand-file-name "private" shared))
+           (sibling (expand-file-name "specs-private/secret" back)))
+      (gptel-agent-instructions-test--write (concat shared "public") "fixture: authorized")
+      (gptel-agent-instructions-test--write (expand-file-name "nested/ok" shared) "fixture: nested")
+      (gptel-agent-instructions-test--write (expand-file-name "sensitive-name" hidden) "fixture: hidden")
+      (gptel-agent-instructions-test--write sibling "fixture: private")
+      (make-symbolic-link sibling (concat shared "link"))
+      (make-directory (expand-file-name "nested/" front))
+      (make-symbolic-link sibling (expand-file-name "nested/AGENTS.md" front))
+      (gptel-agent-define-tool-policy
+       'read-specs :allow `((:tool "Read" :args (:file_path (under workspace ,shared)))
+                            (:tool "Grep" :args (:path (under workspace ,shared)))
+                            (:tool "Glob" :args (:root_directory (under workspace ,shared))))
+       :deny `((:tool "Grep" :args (:path ,hidden))
+               (:tool "Glob" :args (:root_directory ,hidden))))
+      (with-current-buffer parent (setq-local gptel-agent-tool-policy 'read-specs))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (should-not (gptel-agent-access-test--ask fsm "Read" (list :file_path (concat shared "public"))))
+      (should (string-match-p "fixture: authorized" (gptel-agent-instructions-test--payload fsm)))
+      ;; Even an existing conversation grant cannot lift the policy ceiling.
+      (with-current-buffer parent
+        (setq-local gptel-agent-access--grant (cons default-directory (file-truename default-directory))))
+      (dolist (path (list sibling (concat shared "link") "nested/AGENTS.md"))
+        (should-not (gptel-agent-access-test--ask fsm "Read" (list :file_path path)))
+        (should-not (string-match-p "fixture: private" (gptel-agent-instructions-test--payload fsm))))
+      (dolist (call `(("Grep" (:regex "fixture" :path ,shared))
+                      ("Glob" (:pattern "*" :root_directory ,shared))))
+        (should-not (gptel-agent-access-test--ask fsm (car call) (cadr call)))
+        (let ((deadline (+ (float-time) 10)))
+          (while (and (eq (gptel-fsm-state fsm) 'TOOL) (< (float-time) deadline))
+            (accept-process-output nil 0.02)))
+        (let ((payload (gptel-agent-instructions-test--payload fsm)))
+          (should (eq (gptel-fsm-state fsm) 'WAIT))
+          (should (string-match-p "fixture: nested" payload))
+          (should (string-match-p "paths excluded by tool policy" payload))
+          (should-not (string-match-p "fixture: private\\|fixture: hidden\\|sensitive-name" payload)))))))
+
+(ert-deftest gptel-agent-access-policy-outside-literal-link-needs-approval ()
+  (gptel-agent-access-test--with-project
+    (let ((gptel-agent-policy--definitions (make-hash-table :test #'eq))
+          (alias (expand-file-name "link" front)))
+      (make-symbolic-link (expand-file-name "data.txt" back) alias)
+      (gptel-agent-define-tool-policy 'one-link :allow '((:tool "Read" :args (:file_path "link"))))
+      (with-current-buffer parent (setq-local gptel-agent-tool-policy 'one-link))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (let ((pending (gptel-agent-access-test--ask fsm "Read" '(:file_path "link"))))
+        (should pending)
+        (should-not (string-match-p "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload fsm)))
+        (gptel--accept-tool-calls pending)
+        (should (string-match-p "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload fsm)))))))
+
+(ert-deftest gptel-agent-access-policy-broad-read-keeps-outside-approval ()
+  (gptel-agent-access-test--with-project
+    (let ((gptel-agent-policy--definitions (make-hash-table :test #'eq)))
+      (gptel-agent-define-tool-policy 'reads :allow '((:tool "Read")))
+      (with-current-buffer parent (setq-local gptel-agent-tool-policy 'reads))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (let ((calls (gptel-agent-access-test--ask fsm "Read" (list :file_path (concat back "data.txt")))))
+        (should calls)
+        (gptel--accept-tool-calls calls)
+        (should (string-match-p "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload fsm)))))))
+
 (ert-deftest gptel-agent-access-read-one-call-all-providers ()
   (dolist (backend (list (gptel-make-openai "access-openai" :key "unused" :models '(test))
                          (gptel-make-openai-responses "access-responses" :key "unused" :models '(test))
@@ -67,6 +133,32 @@
          (setf (gptel-tool-confirm grant) nil
                (plist-get (gptel-fsm-info fsm) :tools) (list grant)))
        (should (gptel-agent-access-test--ask fsm "Read" (list :file_path (concat back "data.txt"))))))))
+
+(ert-deftest gptel-agent-access-supervised-reads-use-live-request ()
+  (gptel-agent-access-test--with-project
+   (let ((scope (gptel-agent-supervise parent))
+         (args '(:file_path "../backend/data.txt"))
+         observed)
+     (with-current-buffer parent
+       (setq-local gptel-pre-tool-call-functions
+                   (list (lambda (call) (push (plist-get call :name) observed) nil)))
+       (setq fsm (gptel-request "Read outside" :buffer parent :stream nil :callback #'ignore
+                   :transforms (list #'gptel-agent-instructions--transform
+                                     (lambda (request)
+                                       (gptel-agent-supervision-allow-outside-reads scope request)))
+                   :fsm (gptel-make-fsm :table gptel-send--transitions
+                                        :handlers gptel-send--handlers))))
+     (should-not (gptel-agent-access-test--ask fsm "Read" args))
+     (should (equal observed '("Read")))
+     (should (string-match-p "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload fsm)))
+     (should (string-match-p "BACK-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+     (with-current-buffer parent
+       (should-not gptel-agent-access--grant)
+       (should (gptel-agent-access--outside-p "Read" args))
+       (should (gptel-agent-access--outside-p "Write" args fsm))
+       (should-error (gptel-agent-access--outside-p "Read" '(:file_path "/ssh:host:/data") fsm)))
+     (gptel-agent-supervision-stop scope)
+     (with-current-buffer parent (should (gptel-agent-access--outside-p "Read" args fsm))))))
 
 (ert-deftest gptel-agent-access-remember-across-calls-and-turns ()
   (dolist (instructions '(nil t))
