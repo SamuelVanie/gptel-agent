@@ -394,6 +394,53 @@
                     (gptel-tool-function (gptel-get-tool "Discussion"))))
         (should-not gptel-agent-access--grant)))))
 
+(ert-deftest gptel-agent-session-restores-preset-without-reapplying-it ()
+  (gptel-agent-session-test--with-store
+    (let ((buffer (gptel-agent-session-test--buffer " *preset-chat*" "Transcript"))
+          (gptel--known-presets (copy-tree gptel--known-presets))
+          (activations 0)
+          id)
+      (gptel-make-preset 'session-test-preset
+        :system "Preset prompt" :temperature 0.2 :tools '("Read")
+        :post (lambda () (cl-incf activations)))
+      (with-current-buffer buffer
+        (gptel--apply-preset
+         'session-test-preset (lambda (symbol value) (set (make-local-variable symbol) value)))
+        ;; Changes made after activation must survive alongside the preset name.
+        (setq-local gptel-system-prompt "Customized prompt"
+                    gptel-temperature 0.7
+                    gptel-tools (list (gptel-get-tool "Discussion"))))
+      (gptel-agent-session-mode 1)
+      (gptel-agent-session-save)
+      (setq id (buffer-local-value 'gptel-agent-session--id buffer))
+      (gptel-agent-session-test--forget buffer)
+      (setq buffer (gptel-agent-session-restore id))
+      (with-current-buffer buffer
+        (should (local-variable-p 'gptel--preset))
+        (should (eq gptel--preset 'session-test-preset))
+        (should (equal gptel-system-prompt "Customized prompt"))
+        (should (= gptel-temperature 0.7))
+        (should (equal '("Discussion") (mapcar #'gptel-tool-name gptel-tools))))
+      (should (= activations 1)))))
+
+(ert-deftest gptel-agent-session-preset-only-changes-are-persisted ()
+  (gptel-agent-session-test--with-store
+    (let ((buffer (gptel-agent-session-test--buffer " *preset-change-chat*" "Transcript"))
+          id)
+      (gptel-agent-session-mode 1)
+      (gptel-agent-session-save)
+      (setq id (buffer-local-value 'gptel-agent-session--id buffer))
+      ;; A name need not be registered to be retained.  Clearing it is saved too.
+      (dolist (preset '(session-first-preset session-second-preset nil))
+        (with-current-buffer buffer (setq-local gptel--preset preset))
+        (should (gethash buffer gptel-agent-session--dirty))
+        (gptel-agent-session-save)
+        (gptel-agent-session-test--forget buffer)
+        (setq buffer (gptel-agent-session-restore id))
+        (with-current-buffer buffer
+          (should (local-variable-p 'gptel--preset))
+          (should (eq gptel--preset preset)))))))
+
 (ert-deftest gptel-agent-session-unchanged-chats-do-not-rewrite ()
   (gptel-agent-session-test--with-store
     (let ((buffer (gptel-agent-session-test--buffer " *quiet-chat*" "Saved once"))

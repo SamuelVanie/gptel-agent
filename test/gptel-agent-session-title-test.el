@@ -152,6 +152,42 @@
       (gptel-agent-session-title-test--reply (car requests) "Current title")
       (should (equal "Current title" gptel-agent-session--title)))))
 
+(ert-deftest gptel-agent-session-title-restores-chat-preset-independently ()
+  (gptel-agent-session-title-test--with-request
+    (let ((gptel--known-presets (copy-tree gptel--known-presets))
+          (chat-activations 0)
+          (title-activations 0))
+      (gptel-make-preset 'session-chat-preset
+        :system "Chat instructions" :temperature 0.2
+        :post (lambda () (cl-incf chat-activations)))
+      (gptel-make-preset 'session-title-preset
+        :system "Different title instructions" :temperature 0.1
+        :post (lambda () (cl-incf title-activations)))
+      (gptel--apply-preset
+       'session-chat-preset (lambda (symbol value) (set (make-local-variable symbol) value)))
+      (setq-local gptel-agent-session-title-preset 'session-title-preset
+                  gptel-system-prompt "Customized chat instructions"
+                  gptel-temperature 0.7)
+      (gptel-agent-session-save)
+      (should (eq 'session-title-preset
+                  (buffer-local-value 'gptel--preset (plist-get (car requests) :buffer))))
+      (gptel-agent-session-title-test--reply (car requests) "Preset and title coexist")
+      (gptel-agent-session-save)
+      (let ((id gptel-agent-session--id))
+        (gptel-agent-session-test--forget buffer)
+        (with-current-buffer (gptel-agent-session-restore id)
+          (should (eq 'session-chat-preset gptel--preset))
+          (should (equal "Customized chat instructions" gptel-system-prompt))
+          (should (= 0.7 gptel-temperature))
+          (should (equal "Preset and title coexist" gptel-agent-session--title))
+          (should (equal "*gptel:Preset and title coexist*" (buffer-name)))
+          (goto-char (point-max))
+          (insert "A later message")
+          (gptel-agent-session-save)))
+      (should (= 1 chat-activations))
+      (should (= 1 title-activations))
+      (should (= 1 (length requests))))))
+
 (ert-deftest gptel-agent-session-title-failure-keeps-name-and-allows-retry ()
   (gptel-agent-session-title-test--with-request
     (setq gptel-agent-session--title "Existing title")
