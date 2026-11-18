@@ -768,6 +768,39 @@
        (gptel-agent-update)
        ,@body)))
 
+(ert-deftest gptel-agent-main-presets-match-after-activation ()
+  (require 'gptel-transient)
+  (gptel-agent-test--with-main-presets
+    (dolist (preset '(gptel-agent ask gptel-plan))
+      (with-temp-buffer
+        (gptel--apply-preset
+         preset (lambda (symbol value) (set (make-local-variable symbol) value)))
+        (let ((spec (copy-tree (gptel-get-preset preset))))
+          ;; Comparing the name must neither refresh runtime definitions nor
+          ;; mutate the registered preset, including when called repeatedly.
+          (cl-letf (((symbol-function 'gptel-agent--refresh-registry)
+                     (lambda () (ert-fail "Display refreshed the registry"))))
+            (dotimes (_ 2)
+              (should-not (gptel--preset-mismatch-p preset))
+              (should-not (gptel--preset-mismatch-p (symbol-name preset)))))
+          (should (equal spec (gptel-get-preset preset))))
+        ;; Actual user changes must still mark the preset as modified.
+        (dolist (symbol '(gptel-system-prompt gptel-tools gptel-agent--current-agent))
+          (let ((saved (symbol-value symbol)))
+            (set symbol (if (eq symbol 'gptel-tools) nil "Changed"))
+            (should (gptel--preset-mismatch-p preset))
+            (set symbol saved)))))))
+
+(ert-deftest gptel-agent-preset-mismatch-preserves-other-presets ()
+  (require 'gptel-transient)
+  (let ((gptel--known-presets '((ordinary :model test :temperature 0.2))))
+    (with-temp-buffer
+      (gptel--apply-preset
+       'ordinary (lambda (symbol value) (set (make-local-variable symbol) value)))
+      (should-not (gptel--preset-mismatch-p 'ordinary))
+      (setq gptel-model 'different)
+      (should (gptel--preset-mismatch-p 'ordinary)))))
+
 (ert-deftest gptel-agent-main-preset-activation-restricts-selector ()
   (gptel-agent-test--with-main-presets
     ;; Exercise the same named-preset path as gptel's menu, including

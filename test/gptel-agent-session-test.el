@@ -423,6 +423,65 @@
         (should (equal '("Discussion") (mapcar #'gptel-tool-name gptel-tools))))
       (should (= activations 1)))))
 
+(ert-deftest gptel-agent-session-restored-agent-continues-tools ()
+  (require 'gptel-transient)
+  (gptel-agent-session-test--with-store
+    (gptel-agent-test--with-main-presets
+      (dolist (mode '(text-mode org-mode))
+        (let ((buffer (gptel-agent-session-test--buffer " *restored-agent*" ""))
+              (gptel-agent-use-project-instructions nil)
+              requests id)
+          (with-current-buffer buffer
+            (funcall mode)
+            (setq default-directory (file-name-as-directory gptel-agent-session-directory))
+            (setq-local gptel-backend
+                        (gptel-make-openai-responses
+                         "restored-agent" :key "unused" :stream t :models '(test))
+                        gptel-model 'test gptel-stream t gptel-use-curl t
+                        gptel-confirm-tool-calls nil)
+            (gptel-mode 1)
+            (gptel--apply-preset
+             'gptel-agent (lambda (symbol value) (set (make-local-variable symbol) value)))
+            (insert "Inspect the working directory.")
+            ;; Include real response/tool history in the saved session, not
+            ;; just a draft with a preset label.
+            (cl-letf (((symbol-function 'gptel-curl-get-response)
+                       (lambda (request) (push request requests))))
+              (gptel-send)
+              (let ((fsm (car requests)))
+                (gptel-agent-workers-test--tool
+                 fsm "PathInfo" (list :path gptel-agent-session-directory))
+                (gptel-agent-workers-test--answer fsm "First inspection complete." t)
+                (should (eq (gptel-fsm-state fsm) 'DONE))))
+            (goto-char (point-max))
+            (insert "Inspect it again."))
+          (gptel-agent-session-mode 1)
+          (gptel-agent-session-save)
+          (setq id (buffer-local-value 'gptel-agent-session--id buffer))
+          (gptel-agent-session-test--forget buffer)
+          (setq buffer (gptel-agent-session-restore id))
+          (setq requests nil)
+          (with-current-buffer buffer
+            (should (eq gptel--preset 'gptel-agent))
+            (should-not (gptel--preset-mismatch-p gptel--preset))
+            (should (eq gptel-model 'test))
+            (should (gptel-openai-responses-p gptel-backend))
+            (should (alist-get 'tool (gptel--get-buffer-bounds)))
+            (cl-letf (((symbol-function 'gptel-curl-get-response)
+                       (lambda (request) (push request requests)))
+                      ((symbol-function 'gptel--url-get-response)
+                       (lambda (&rest _) (ert-fail "Lost streaming transport"))))
+              (gptel-send)
+              (let ((fsm (car requests)))
+                (should fsm)
+                (dotimes (round 2)
+                  (gptel-agent-workers-test--tool
+                   fsm "PathInfo" (list :path gptel-agent-session-directory))
+                  (should (eq (gptel-fsm-state fsm) 'WAIT))
+                  (should (= (length requests) (+ 2 round))))
+                (gptel-agent-workers-test--answer fsm "Directory inspected." t)
+                (should (eq (gptel-fsm-state fsm) 'DONE))))))))))
+
 (ert-deftest gptel-agent-session-preset-only-changes-are-persisted ()
   (gptel-agent-session-test--with-store
     (let ((buffer (gptel-agent-session-test--buffer " *preset-change-chat*" "Transcript"))

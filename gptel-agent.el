@@ -577,6 +577,26 @@ AGENTS is an alist of agent names and associated plist as value
   (gptel-agent--update-agents)
   (gptel-agent--full-agent-definitions))
 
+(defun gptel-agent--preset-mismatch (original name)
+  "Call ORIGINAL on preset NAME without comparing its runtime registry.
+The registry snapshot is computed at activation, not a user setting.
+gptel's fast preset comparison compares the literal :eval spec with its
+result, incorrectly marking even a freshly applied agent preset modified."
+  (let* ((entry (or (assoc name gptel--known-presets)
+                    (and (stringp name)
+                         (assq (intern-soft name) gptel--known-presets))))
+         (gptel--known-presets
+          (if (plist-member (cdr entry) :agent--registry-snapshot)
+              (cons (cons (car entry)
+                          (gptel-agent--plist-without-keys
+                           (cdr entry) '(:agent--registry-snapshot)))
+                    (remq entry gptel--known-presets))
+            gptel--known-presets)))
+    (funcall original name)))
+
+(with-eval-after-load 'gptel-transient
+  (advice-add 'gptel--preset-mismatch-p :around #'gptel-agent--preset-mismatch))
+
 ;;;###autoload
 (defun gptel-agent-update ()
   "Update agent definitions and presets in the current buffer."
