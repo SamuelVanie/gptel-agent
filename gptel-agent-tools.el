@@ -753,11 +753,29 @@ request owner, which may differ from the buffer displaying the approval."
 (cl-defstruct (gptel-agent--bash (:constructor gptel-agent--make-bash))
   process buffer source callback query limit preview-chars preview-lines
   (chars 0) (newlines 0) file file-identity fsm post-hook
-  timeout timeout-timer timed-out done file-limit)
+  timeout timeout-timer timed-out done file-limit finishing cancelled)
 
 (defvar-local gptel-agent--bash-jobs nil
   "Foreground Bash calls owned by this buffer.")
 (put 'gptel-agent--bash-jobs 'permanent-local t)
+
+(defun gptel-agent--bash-stop-process (process)
+  "Detach and stop the foreground PROCESS, including its process group."
+  (set-process-filter process #'ignore)
+  (set-process-sentinel process #'ignore)
+  (process-put process 'gptel-agent-bash nil)
+  (unwind-protect
+      (when (process-live-p process) (kill-process process))
+    (delete-process process)))
+
+(defun gptel-agent--bash-attach-process (job process)
+  "Acquire PROCESS for JOB, or stop it if JOB was already cancelled.
+A file handler can run filters and sentinels before `make-process' returns."
+  (when (processp process)
+    (setf (gptel-agent--bash-process job) process)
+    (if (gptel-agent--bash-done job)
+        (gptel-agent--bash-stop-process process)
+      (process-put process 'gptel-agent-bash job))))
 
 (defun gptel-agent--bash-dispose (job &optional keep-file)
   "Release JOB and stop its process group, retaining its log only if KEEP-FILE."
@@ -775,13 +793,14 @@ request owner, which may differ from the buffer displaying the approval."
             (remq (gptel-agent--bash-post-hook job)
                   (plist-get (gptel-fsm-info fsm) :post))))
     (unwind-protect
-        (when-let* ((process (gptel-agent--bash-process job)))
-          (set-process-filter process #'ignore)
-          (set-process-sentinel process #'ignore)
-          (process-put process 'gptel-agent-bash nil)
-          (unwind-protect
-              (when (process-live-p process) (kill-process process))
-            (delete-process process)))
+        (when-let* ((process
+                     (or (gptel-agent--bash-process job)
+                         ;; A handler may create the process, then signal
+                         ;; without returning or delivering any events.
+                         (and (buffer-live-p (gptel-agent--bash-buffer job))
+                              (get-buffer-process (gptel-agent--bash-buffer job))))))
+          (setf (gptel-agent--bash-process job) process)
+          (gptel-agent--bash-stop-process process))
       (when (buffer-live-p (gptel-agent--bash-buffer job))
         (kill-buffer (gptel-agent--bash-buffer job)))
       (when-let* ((file (gptel-agent--bash-file job))
@@ -798,9 +817,14 @@ request owner, which may differ from the buffer displaying the approval."
   "Cancel foreground Bash calls belonging to the current buffer."
   (dolist (job (copy-sequence gptel-agent--bash-jobs))
     (condition-case err
-        (gptel-agent--bash-dispose job)
+        (gptel-agent--bash-cancel job)
       (error (message "Could not clean up Bash: %s" (error-message-string err))))))
 (put 'gptel-agent--bash-cleanup 'permanent-local-hook t)
+
+(defun gptel-agent--bash-cancel (job)
+  "Invalidate JOB's request and dispose its resources."
+  (setf (gptel-agent--bash-cancelled job) t)
+  (gptel-agent--bash-dispose job))
 
 (defun gptel-agent--bash-spill (job)
   "Create JOB's log and write its retained output before appending new chunks."
@@ -817,6 +841,7 @@ request owner, which may differ from the buffer displaying the approval."
 
 (defun gptel-agent--bash-filter (job process output)
   "Spool OUTPUT for JOB, keeping only a bounded prefix in PROCESS's buffer."
+  (gptel-agent--bash-attach-process job process)
   (unless (gptel-agent--bash-done job)
     (condition-case err
         (with-current-buffer (gptel-agent--bash-buffer job)
@@ -895,7 +920,9 @@ OUTPUT is the incoming chunk that could not be persisted."
 
 (defun gptel-agent--bash-finish (job process &optional failure)
   "Finish JOB after PROCESS exits or times out, or with capture FAILURE."
-  (unless (gptel-agent--bash-done job)
+  (gptel-agent--bash-attach-process job process)
+  (unless (or (gptel-agent--bash-done job) (gptel-agent--bash-finishing job))
+    (setf (gptel-agent--bash-finishing job) t)
     (let ((source (gptel-agent--bash-source job))
           (callback (gptel-agent--bash-callback job))
           (fsm (gptel-agent--bash-fsm job)) result keep-file)
@@ -907,10 +934,19 @@ OUTPUT is the incoming chunk that could not be persisted."
                       (condition-case err
                           (prog1 (gptel-agent--bash-result job process)
                             (setq keep-file (gptel-agent--bash-file job)))
-                        (error (gptel-agent--bash-capture-error job "finish" err))))))
-        (gptel-agent--bash-dispose job keep-file))
+                        (error (gptel-agent--bash-capture-error job "finish" err)))))
+            ;; Formatting can enter a file handler.  Cancellation during that
+            ;; work must invalidate the callback captured before it started.
+            (unless (and (not (gptel-agent--bash-done job))
+                         (buffer-live-p source)
+                         (or (null fsm) (eq (gptel-fsm-state fsm) 'TOOL)))
+              (setq result nil keep-file nil)))
+        (unwind-protect (gptel-agent--bash-dispose job keep-file)
+          (setf (gptel-agent--bash-finishing job) nil)))
       ;; Release buffers and request hooks before a callback can start more work.
-      (when result
+      (when (and result (buffer-live-p source)
+                 (not (gptel-agent--bash-cancelled job))
+                 (or (null fsm) (eq (gptel-fsm-state fsm) 'TOOL)))
         (with-current-buffer source (funcall callback result))))))
 
 (defun gptel-agent--bash-expire (job)
@@ -939,43 +975,54 @@ Bound execution with `gptel-agent-bash-timeout', captured at launch."
                :preview-chars gptel-agent-tool-result-preview-chars
                :preview-lines gptel-agent-tool-result-preview-lines
                :buffer (generate-new-buffer " *gptel-agent-bash*")))
-         (cleanup (lambda (&rest _) (gptel-agent--bash-dispose job))))
+         (cleanup (lambda (&rest _) (gptel-agent--bash-cancel job)))
+         launched)
     (with-current-buffer (gptel-agent--bash-buffer job)
       (buffer-disable-undo)
       ;; Logs are local even when the command runs through a remote file handler.
       (setq-local default-directory temporary-file-directory))
     (setf (gptel-agent--bash-post-hook job) cleanup)
-    (condition-case err
-        (let ((process
-               (make-process
-                :name "gptel-agent-bash" :buffer (gptel-agent--bash-buffer job)
-                ;; Foreground calls have no input API.  Use /dev/null rather
-                ;; than an open (or closed) pipe: commands like rg inspect
-                ;; stdin's type to choose between input and directory search.
-                ;; Command-local pipes, redirections and heredocs still work.
-                :command (list "bash" "-c" (concat "exec </dev/null\n" command))
-                :connection-type 'pipe :file-handler t :noquery t
-                :filter (apply-partially #'gptel-agent--bash-filter job)
-                :sentinel (lambda (process _event)
-                            (when (memq (process-status process) '(exit signal))
-                              (gptel-agent--bash-finish job process))))))
-          (unless (processp process)
-            (error "This directory does not support asynchronous processes"))
-          (setf (gptel-agent--bash-process job) process)
-          (process-put process 'gptel-agent-bash job)
-          (push job gptel-agent--bash-jobs)
-          (add-hook 'kill-buffer-hook #'gptel-agent--bash-cleanup nil t)
-          (when fsm
-            (setf (plist-get (gptel-fsm-info fsm) :post)
-                  (cons cleanup (plist-get (gptel-fsm-info fsm) :post))))
-          (unless (gptel-agent--bash-done job)
-            (setf (gptel-agent--bash-timeout-timer job)
-                  (run-at-time (gptel-agent--bash-timeout job) nil
-                               #'gptel-agent--bash-expire job)))
-          process)
-      (error
-       (gptel-agent--bash-dispose job)
-       (signal (car err) (cdr err))))))
+    (unwind-protect
+        (condition-case err
+            (progn
+              ;; Cancellation must own the launch even before its first event.
+              (push job gptel-agent--bash-jobs)
+              (add-hook 'kill-buffer-hook #'gptel-agent--bash-cleanup nil t)
+              (when fsm
+                (setf (plist-get (gptel-fsm-info fsm) :post)
+                      (cons cleanup (plist-get (gptel-fsm-info fsm) :post))))
+              (let ((process
+                     (make-process
+                      :name "gptel-agent-bash" :buffer (gptel-agent--bash-buffer job)
+                      ;; Foreground calls have no input API.  Use /dev/null rather
+                      ;; than an open (or closed) pipe: commands like rg inspect
+                      ;; stdin's type to choose between input and directory search.
+                      ;; Command-local pipes, redirections and heredocs still work.
+                      :command (list "bash" "-c" (concat "exec </dev/null\n" command))
+                      :connection-type 'pipe :file-handler t :noquery t
+                      :filter (apply-partially #'gptel-agent--bash-filter job)
+                      :sentinel (lambda (process _event)
+                                  (when (memq (process-status process) '(exit signal))
+                                    (gptel-agent--bash-finish job process))))))
+                (unless (processp process)
+                  (error "This directory does not support asynchronous processes"))
+                ;; Early completion may already have disposed JOB; never register
+                ;; it again.  An early cancellation may only now acquire its handle.
+                (gptel-agent--bash-attach-process job process)
+                (unless (gptel-agent--bash-done job)
+                  (setf (gptel-agent--bash-timeout-timer job)
+                        (run-at-time (gptel-agent--bash-timeout job) nil
+                                     #'gptel-agent--bash-expire job)))
+                (setq launched t)
+                process))
+          (error
+           ;; Cancellation can kill the output buffer before a handler creates
+           ;; its process.  Such a launch error must not revive the request.
+           ;; Errors after a delivered callback still belong to the caller.
+           (unless (gptel-agent--bash-cancelled job)
+             (signal (car err) (cdr err)))))
+      ;; Also cover quit and other nonlocal exits from a process file handler.
+      (unless launched (gptel-agent--bash-dispose job)))))
 
 (defun gptel-agent--execute-bash (callback command query &optional background fsm)
   "Execute COMMAND asynchronously in bash and call CALLBACK with output.
