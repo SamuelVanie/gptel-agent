@@ -133,8 +133,10 @@
         (should-not (string-match-p "child\\|\\[directory" files))
         (should-not (string-match-p "\\[file\\]" dirs))
         (should (string-match-p "File.java" (gptel-path-test--glob "*.JAVA" "." 1)))))
-    (should-error (gptel-path-test--glob "*" "File.java"))
-    (should-error (gptel-path-test--glob "*" "." 0))))
+    (should (string-match-p "\\`Error:.*expected: directory; actual: file"
+                            (gptel-path-test--glob "*" "File.java")))
+    (should (string-match-p "\\`Error:.*depth"
+                            (gptel-path-test--glob "*" "." 0)))))
 
 (ert-deftest gptel-path-new-schemas-expose-complete-targets ()
   (dolist (entry '(("Write" "file_path" "content") ("Mkdir" "directory_path")
