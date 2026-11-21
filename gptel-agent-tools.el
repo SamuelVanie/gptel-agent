@@ -116,6 +116,19 @@ Glob and Grep stop at this output limit and report incomplete coverage."
   :type 'natnum
   :group 'gptel-agent)
 
+(defcustom gptel-agent-bash-timeout 120
+  "Maximum execution time in seconds for foreground Bash commands.
+Must be a positive finite number.  The value is captured when each command
+starts.  On expiry, stop the process group and return a timeout result with
+captured output, preserving oversized output in its usual saved log.
+Request cancellation instead discards unfinished output without calling back.
+
+Explicit background jobs have no execution deadline; use Bash with
+background=true and the Process tool for intentional long-running commands.
+Timers run when Emacs services events, so a busy Emacs can delay expiry."
+  :type 'number
+  :group 'gptel-agent)
+
 (defcustom gptel-agent-preset nil
   "gptel preset to apply when calling sub-agents.
 
@@ -716,7 +729,8 @@ request owner, which may differ from the buffer displaying the approval."
 
 (cl-defstruct (gptel-agent--bash (:constructor gptel-agent--make-bash))
   process buffer source callback query limit preview-chars preview-lines
-  (chars 0) (newlines 0) file file-identity fsm post-hook done)
+  (chars 0) (newlines 0) file file-identity fsm post-hook
+  timeout timeout-timer timed-out done)
 
 (defvar-local gptel-agent--bash-jobs nil
   "Foreground Bash calls owned by this buffer.")
@@ -727,6 +741,9 @@ request owner, which may differ from the buffer displaying the approval."
   (unless (gptel-agent--bash-done job)
     ;; Invalidate callbacks before signalling a process or killing a buffer.
     (setf (gptel-agent--bash-done job) t)
+    (when-let* ((timer (gptel-agent--bash-timeout-timer job)))
+      (cancel-timer timer)
+      (setf (gptel-agent--bash-timeout-timer job) nil))
     (when (buffer-live-p (gptel-agent--bash-source job))
       (with-current-buffer (gptel-agent--bash-source job)
         (setq gptel-agent--bash-jobs (delq job gptel-agent--bash-jobs))))
@@ -799,9 +816,17 @@ request owner, which may differ from the buffer displaying the approval."
 (defun gptel-agent--bash-result (job process)
   "Format JOB's result without reading its full log back into memory."
   (let* ((exit-code (process-exit-status process))
-         (prefix (unless (and (eq (process-status process) 'exit) (zerop exit-code))
-                   (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n"
-                           exit-code)))
+         (prefix
+          (cond
+           ((gptel-agent--bash-timed-out job)
+            (format
+             (concat "Command timed out after %s seconds; its process group was stopped.\n"
+                     "Captured output is partial. Check for partial effects before retrying.\n"
+                     "For longer jobs, use background=true and Process to monitor completion.\n"
+                     "STDOUT+STDERR:\n")
+             (gptel-agent--bash-timeout job)))
+           ((not (and (eq (process-status process) 'exit) (zerop exit-code)))
+            (format "Command failed with exit code %d:\nSTDOUT+STDERR:\n" exit-code))))
          (chars (gptel-agent--bash-chars job)))
     (with-current-buffer (gptel-agent--bash-buffer job)
       (if (<= (+ chars (length prefix)) (gptel-agent--bash-limit job))
@@ -828,7 +853,7 @@ request owner, which may differ from the buffer displaying the approval."
           result)))))
 
 (defun gptel-agent--bash-finish (job process &optional failure)
-  "Finish JOB after PROCESS exits, or stop it with capture FAILURE."
+  "Finish JOB after PROCESS exits or times out, or with capture FAILURE."
   (unless (gptel-agent--bash-done job)
     (let ((source (gptel-agent--bash-source job))
           (callback (gptel-agent--bash-callback job))
@@ -848,10 +873,27 @@ request owner, which may differ from the buffer displaying the approval."
       (when result
         (with-current-buffer source (funcall callback result))))))
 
+(defun gptel-agent--bash-expire (job)
+  "Stop JOB at its deadline and deliver captured output once.
+If the process already exited, let its sentinel drain output and finish."
+  (unless (gptel-agent--bash-done job)
+    (let ((process (gptel-agent--bash-process job)))
+      ;; Exit status can become visible before pending output is filtered.
+      ;; Finishing here would discard it; the normal sentinel runs after drain.
+      (when (process-live-p process)
+        (setf (gptel-agent--bash-timed-out job) t)
+        (gptel-agent--bash-finish job process)))))
+
 (defun gptel-agent--start-foreground-bash (callback command query fsm)
-  "Run COMMAND for CALLBACK and QUERY, owned by this buffer and optional FSM."
+  "Run COMMAND for CALLBACK and QUERY, owned by this buffer and optional FSM.
+Bound execution with `gptel-agent-bash-timeout', captured at launch."
+  (unless (and (numberp gptel-agent-bash-timeout)
+               (> gptel-agent-bash-timeout 0)
+               (< gptel-agent-bash-timeout 1.0e+INF))
+    (error "gptel-agent-bash-timeout must be a positive finite number of seconds"))
   (let* ((job (gptel-agent--make-bash
                :source (current-buffer) :callback callback :query query :fsm fsm
+               :timeout gptel-agent-bash-timeout
                :limit gptel-agent-tool-result-max-chars
                :preview-chars gptel-agent-tool-result-preview-chars
                :preview-lines gptel-agent-tool-result-preview-lines
@@ -885,6 +927,10 @@ request owner, which may differ from the buffer displaying the approval."
           (when fsm
             (setf (plist-get (gptel-fsm-info fsm) :post)
                   (cons cleanup (plist-get (gptel-fsm-info fsm) :post))))
+          (unless (gptel-agent--bash-done job)
+            (setf (gptel-agent--bash-timeout-timer job)
+                  (run-at-time (gptel-agent--bash-timeout job) nil
+                               #'gptel-agent--bash-expire job)))
           process)
       (error
        (gptel-agent--bash-dispose job)
@@ -898,8 +944,10 @@ COMMAND is the bash command string to execute.  QUERY states what should be
 extracted from the result if it is too large to return directly.
 When BACKGROUND is t, return a session-owned job ID immediately.
 Otherwise run with stdin from /dev/null and spill oversized output
-incrementally to disk.  Optional FSM owns foreground execution so cancelling
-the request also stops its commands.  Validation and launch errors are
+incrementally to disk.  `gptel-agent-bash-timeout' bounds foreground execution;
+expiry stops the process group and returns captured output as a partial result.
+Optional FSM owns foreground execution so cancelling the request also stops
+its commands.  Validation and launch errors are
 delivered through CALLBACK so the agent can correct the call."
   (let (process result callback-called)
     (condition-case err
@@ -4297,7 +4345,11 @@ outside access for this chat. These approvals do not change the conversation's \
 directory. Agent and Discussion accept directory for a child's workspace.
 - For parallel commands, make multiple `Bash` calls in one message
 - Prefer foreground Bash (background=false, the default) for tests, builds and \
-commands whose result you need before proceeding. It waits for completion.
+commands whose result you need before proceeding. It waits for completion up to \
+the configured deadline (gptel-agent-bash-timeout, 120 seconds by default). \
+Timeout stops the process group and returns partial output, with the usual log \
+handoff for oversized output. Check partial effects before retrying; use \
+background=true and Process for intentional longer runs.
 - Foreground stdin is /dev/null, so implicit reads receive EOF. \
 Use pipes, file redirection or heredocs to supply input within the command. \
 For interactive jobs, use background=true and Process send.
@@ -4338,7 +4390,7 @@ Example: 'ls -la | head -20' or 'grep -i error app.log | tail -50'")
          ( :name "background"
            :type boolean
            :optional t
-           :description "Start a managed background job and return immediately. Defaults to false (wait for completion). Background output retains a bounded tail; use Process to read and manage the job."))
+           :description "Start a managed background job and return immediately, without a foreground execution deadline. Defaults to false (wait for completion or timeout). Background output retains a bounded tail; use Process to read and manage the job."))
  :category "gptel-agent"
  :confirm t
  :include t

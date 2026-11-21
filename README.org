@@ -697,6 +697,16 @@ hiding or killing only the review list does not discard proposals.
 
 =Bash= normally waits for a command to finish. Prefer this foreground mode
 for tests, builds and commands whose result is needed before proceeding.
+Foreground execution has a 120-second deadline by default. Customize
+=gptel-agent-bash-timeout= to a positive finite number of seconds (fractions
+are allowed); each command captures the setting when it starts. On timeout,
+the process group is stopped and the tool returns a timeout result with partial
+stdout/stderr. Oversized output keeps its saved log and result-explorer handoff.
+The agent can continue working after this result. Check for partial effects
+before retrying, and use =background=true= with =Process= for intentional longer
+runs. Explicit background jobs are unaffected by this setting. The deadline
+uses an Emacs timer, so expiry can be delayed while Emacs is busy.
+
 Foreground commands receive stdin from =/dev/null=, so an implicit input read
 cannot leave the agent waiting indefinitely. Pipes, file redirection and
 heredocs inside the command still work. Use a background job and =Process=

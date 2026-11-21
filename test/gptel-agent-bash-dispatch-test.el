@@ -93,6 +93,45 @@
             (cl-set-difference (buffer-list) buffers))))
         (gptel-agent-bash-dispatch-test--assert-recovery fsm)))))
 
+(ert-deftest gptel-agent-bash-invalid-timeout-remains-recoverable ()
+  (dolist (localized '(nil t))
+    (dolist (invalid '(nil 0 -1 "120" t 1.0e+INF -1.0e+INF 0.0e+NaN))
+      (gptel-agent-bash-dispatch-test--with-fsm (fsm localized)
+        (let ((gptel-agent-bash-timeout invalid)
+              (buffers (buffer-list)))
+          (cl-letf (((symbol-function 'make-process)
+                     (lambda (&rest _) (ert-fail "Invalid timeout launched a process"))))
+            (gptel-agent-bash-dispatch-test--assert-error
+             fsm '(:command "true" :query "Read output")
+             "gptel-agent-bash-timeout must be a positive finite number of seconds"))
+          (should (equal buffers (buffer-list))))
+        (gptel-agent-bash-dispatch-test--assert-recovery fsm)))))
+
+(ert-deftest gptel-agent-bash-timeout-delivers-result-and-allows-next-call ()
+  ;; Exercise the installed gptel dispatcher's optional argument handling as
+  ;; well as request-local wrappers; the timer must finish TOOL, not abort it.
+  (dolist (localized '(nil t))
+    (dolist (background '(omitted nil :json-false))
+      (gptel-agent-bash-dispatch-test--with-fsm (fsm localized)
+        (setq-local gptel-agent-bash-timeout 0.05)
+        (let ((call (list :name "Bash" :args
+                          (append '(:command "sleep 60" :query "Read output")
+                                  (unless (eq background 'omitted)
+                                    (list :background background))))))
+          (setf (plist-get (gptel-fsm-info fsm) :tool-use) (list call))
+          (gptel--fsm-transition fsm 'TOOL)
+          (should (eq (gptel-fsm-state fsm) 'TOOL))
+          (gptel-agent-bash-dispatch-test--wait (lambda () (plist-get call :result)))
+          (should (eq (gptel-fsm-state fsm) 'TRET))
+          (should (string-prefix-p "Command timed out after 0.05 seconds;"
+                                   (plist-get call :result)))
+          (should-not (plist-get (gptel-fsm-info fsm) :error))
+          (should (= (length (plist-get (gptel-fsm-info fsm) :tool-result)) 1))
+          (should-not gptel-agent--bash-jobs)
+          (should-not gptel-agent--processes))
+        (setq-local gptel-agent-bash-timeout 120)
+        (gptel-agent-bash-dispatch-test--assert-recovery fsm)))))
+
 (ert-deftest gptel-agent-bash-immediate-callback-errors-are-not-retried ()
   ;; In particular, a successful background launch calls back immediately.
   ;; Its callback must be outside the startup error handler too.
