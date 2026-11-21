@@ -501,7 +501,11 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
               :text (buffer-substring-no-properties (point-min) (point-max))
               :bounds (gptel-agent-session--data (gptel--get-buffer-bounds))
               :backend (and gptel-backend (gptel-backend-name gptel-backend))
-              :tools (mapcar #'gptel-tool-name gptel-tools) :settings settings
+              :tools (mapcar (lambda (tool)
+                               (list (or (gptel-tool-category tool) "misc")
+                                     (gptel-tool-name tool)))
+                             gptel-tools)
+              :settings settings
               :discussion (and chat
                                (list :id (gptel-agent-discussion--chat-id chat)
                                      :title (gptel-agent-discussion--chat-title chat)
@@ -930,10 +934,16 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
                 (set (make-local-variable (car entry)) (cdr entry)))))
           (setq-local gptel-backend (cdr (assoc (plist-get record :backend) gptel--known-backends))
                       gptel-tools
-                      (delq nil (mapcar (lambda (name)
-                                         (condition-case nil (gptel-get-tool name)
+                      (delq nil (mapcar (lambda (reference)
+                                         ;; Legacy records use names; new records
+                                         ;; retain the selected registry category.
+                                         (condition-case nil
+                                             (let ((tool (gptel-get-tool reference)))
+                                               (unless (gptel-tool-p tool)
+                                                 (error "Saved reference is not a tool"))
+                                               tool)
                                            (error (display-warning 'gptel-agent-session
-                                                                   (format "Missing saved tool %s" name))
+                                                                   (format "Missing saved tool %S" reference))
                                                   nil)))
                                        (plist-get record :tools))))
           (unless gptel-backend
@@ -1041,7 +1051,11 @@ survive restoration.  Saving works independently of `gptel-agent-session-mode'."
                          (list (plist-get record :draft) (plist-get record :sent-end)))
                (string-or-null-p (plist-get record :backend))
                (proper-list-p (plist-get record :tools))
-               (cl-every #'stringp (plist-get record :tools))
+               (cl-every (lambda (reference)
+                           (or (stringp reference)
+                               (and (eq (proper-list-p reference) 2)
+                                    (cl-every #'stringp reference))))
+                         (plist-get record :tools))
                (proper-list-p settings)
                (cl-every (lambda (entry)
                            (and (consp entry) (memq (car entry) gptel-agent-session--settings)))
