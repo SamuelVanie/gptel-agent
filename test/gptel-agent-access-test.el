@@ -554,5 +554,24 @@
             (gptel--accept-tool-calls calls)
             (should-not (file-exists-p path)))))))))
 
+(ert-deftest gptel-agent-access-clone-requires-its-own-outside-approval ()
+  (gptel-agent-access-test--with-project
+   (setq fsm (gptel-agent-instructions-test--request parent))
+   (let ((args '(:file_path "../backend/data.txt")) clone)
+     (unwind-protect
+         (progn
+           (gptel-agent-allow-outside-access
+            (gptel-agent-access-test--ask fsm "Read" args))
+           (with-current-buffer parent
+             (should-not (gptel-agent-access--outside-p "Read" args))
+             (setq clone (clone-buffer " *access-independent-clone*")))
+           (with-current-buffer clone
+             (should (gptel-agent-access--outside-p "Read" args))
+             (should-not gptel-agent-access--grant))
+           (with-current-buffer parent
+             (should (gptel-agent-access--granted-p))
+             (should-not (gptel-agent-access--outside-p "Read" args))))
+       (when (buffer-live-p clone) (kill-buffer clone))))))
+
 (provide 'gptel-agent-access-test)
 ;;; gptel-agent-access-test.el ends here

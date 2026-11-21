@@ -1076,9 +1076,9 @@ delivered through CALLBACK so the agent can correct the call."
 ;;; Code tools
 ;;;; Diagnostics from flymake
 (declare-function flymake--project-diagnostics "flymake")
-(declare-function flymake--diag-beg "flymake")
-(declare-function flymake--diag-type "flymake")
-(declare-function flymake--diag-text "flymake")
+(declare-function flymake-diagnostic-beg "flymake")
+(declare-function flymake-diagnostic-type "flymake")
+(declare-function flymake-diagnostic-text "flymake")
 (declare-function flymake-diagnostic-buffer "flymake")
 
 (defun gptel-agent--flymake-diagnostics (&optional all)
@@ -1092,20 +1092,21 @@ diagnostics."
     (require 'flymake)
     (let ((results '()))
       (dolist (diag (flymake--project-diagnostics project))
-        (let ((severity (flymake--diag-type diag)))
+        (let ((severity (flymake-diagnostic-type diag)))
           (when (memq severity `(:error :warning ,@(and all '(:note))))
             (with-current-buffer (flymake-diagnostic-buffer diag)
-              (let* ((beg (flymake--diag-beg diag))
-                     (line-num (line-number-at-pos beg))
-                     (line-text (buffer-substring-no-properties
-                                 (line-beginning-position) (line-end-position))))
-                (push (format "File: %s:%d\nSeverity: %s\nMessage: %s\n---\n%s"
-                              (buffer-file-name)
-                              line-num
-                              severity
-                              (flymake--diag-text diag)
-                              line-text)
-                      results))))))
+              (save-excursion
+                (save-restriction
+                  (widen)
+                  (goto-char (flymake-diagnostic-beg diag))
+                  (push (format "File: %s:%d\nSeverity: %s\nMessage: %s\n---\n%s"
+                                (buffer-file-name)
+                                (line-number-at-pos)
+                                severity
+                                (flymake-diagnostic-text diag)
+                                (buffer-substring-no-properties
+                                 (line-beginning-position) (line-end-position)))
+                        results)))))))
       (string-join (nreverse results) "\n\n"))))
 
 ;;; Filesystem tools

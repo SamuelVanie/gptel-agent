@@ -123,7 +123,8 @@ attachments, hooks, runtime agent snapshots and approval scopes are excluded.")
   "Whether BUFFER is an ordinary chat, including a closed discussion."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
-         (and gptel-mode (not gptel-agent-session-managed-externally)
+         (and gptel-mode (not (buffer-base-buffer))
+              (not gptel-agent-session-managed-externally)
               (not gptel-agent-session--excluded)
               (not gptel-agent--supervised-run)
               (not (bound-and-true-p gptel-agent-review-aside-mode))
@@ -420,6 +421,24 @@ Uses `gptel-agent-session-title-context-function' and
   (when (gptel-agent-session--eligible-p (current-buffer))
     (gptel-agent-session--clone)
     (gptel-agent-session--track)))
+
+(defun gptel-agent-session--detach-indirect ()
+  "Release copied session metadata in a view without touching its base chat."
+  (gptel-agent-session--clone)
+  (setq gptel-agent-session--sent-end nil)
+  (remove-hook 'after-change-functions #'gptel-agent-session--mark-dirty t)
+  (add-hook 'after-change-functions #'gptel-agent-session--indirect-changed nil t))
+
+(defun gptel-agent-session--indirect-changed (&rest _)
+  "Save shared transcript edits through the base chat's session owner."
+  (when-let* ((base (buffer-base-buffer))
+              ((gptel-agent-session--eligible-p base)))
+    (with-current-buffer base (gptel-agent-session--changed))))
+(put 'gptel-agent-session--indirect-changed 'permanent-local-hook t)
+
+;; Clear copied identities even while the global mode is disabled.  Enabling
+;; it later must not let the view's kill hook unregister its base chat.
+(add-hook 'clone-indirect-buffer-hook #'gptel-agent-session--detach-indirect -70)
 
 (defun gptel-agent-session--track-all ()
   "Discover ordinary chats and ownership once, in linear time."
