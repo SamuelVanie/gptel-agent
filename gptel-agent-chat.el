@@ -39,6 +39,7 @@ Keep this value when reloading the module, just like the counter.")
 
 (defun gptel-agent-chat--clone ()
   "Clear copied peer identity and request state in a cloned buffer."
+  (gptel-agent--todo-header-detach)
   (when (local-variable-p 'kill-buffer-hook)
     (setq kill-buffer-hook (copy-sequence kill-buffer-hook)))
   ;; Pending Process actions install closures as kill hooks.  Removing a

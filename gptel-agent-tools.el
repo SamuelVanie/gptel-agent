@@ -1467,6 +1467,60 @@ START-COLUMN is a one-based UTF-8 byte column on START-LINE."
 ;;; Todo-write tool (task tracking)
 (defvar-local gptel-agent--todos nil)
 
+(defvar-local gptel-agent--todo-header-cleanup nil
+  "Cleanup function for this buffer's current task header decoration.")
+
+(defun gptel-agent--todo-header-detach ()
+  "Detach copied native header ownership after cloning a chat buffer."
+  ;; The copied closure belongs to the source request: never invoke it here.
+  (setq gptel-agent--todo-header-cleanup nil)
+  (when-let* (((proper-list-p header-line-format))
+              (segment (nth 2 header-line-format))
+              ((or (eq segment gptel--header-line-info)
+                   (and (stringp segment) (> (length segment) 0)
+                        (get-text-property 0 'gptel-agent--todo-header segment)))))
+    ;; Even an undecorated native header shares its mutable spine with source.
+    (setq-local header-line-format (copy-sequence header-line-format))
+    (setf (nth 2 header-line-format) gptel--header-line-info)))
+
+(defun gptel-agent--todo-header-update (info in-progress)
+  "Show IN-PROGRESS in the native info segment until request INFO finishes.
+Leave compact and custom headers intact; the overlay still shows their tasks."
+  (when gptel-agent--todo-header-cleanup
+    (funcall gptel-agent--todo-header-cleanup))
+  (when (and in-progress gptel-mode gptel-use-header-line
+             (consp header-line-format)
+             (consp (cdr header-line-format))
+             (consp (cddr header-line-format))
+             (eq (nth 2 header-line-format) gptel--header-line-info))
+    (let* ((buffer (current-buffer))
+           (cell (nthcdr 2 header-line-format))
+           (original (car cell))
+           (decoration
+            (propertize
+             (concat (propertize
+                      " " 'display
+                      `(space :align-to (- right ,(+ 5 (length in-progress)))))
+                     (propertize (concat "Task: " in-progress)
+                                 'face 'font-lock-escape-face))
+             'gptel-agent--todo-header t))
+           cleanup)
+      (setq cleanup
+            (lambda (&rest _)
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  ;; Restore only our cell, even if a UI has saved this header.
+                  ;; Never reinstall a header or overwrite a newer decoration.
+                  (when (eq (car cell) decoration)
+                    (setcar cell original))
+                  (when (eq gptel-agent--todo-header-cleanup cleanup)
+                    (setq gptel-agent--todo-header-cleanup nil))))
+              (plist-put info :post (delq cleanup (plist-get info :post)))))
+      (setcar cell decoration)
+      (setq gptel-agent--todo-header-cleanup cleanup)
+      ;; Register per request/update, independently of overlay creation.
+      (plist-put info :post (cons cleanup (plist-get info :post))))))
+
 (defun gptel-agent-toggle-todos ()
   "Toggle the display of the gptel agent todo list."
   (interactive)
@@ -1503,6 +1557,10 @@ displayed in their own diagnostic buffer, independently of the parent chat."
          (where-from
           (if run (point-min)
             (previous-single-property-change where-to 'gptel nil (point-min)))))
+    (gptel-agent--todo-header-update
+     info (cl-loop for todo across todos
+                   when (equal (plist-get todo :status) "in_progress")
+                   return (plist-get todo :activeForm)))
     (unless (= where-from where-to)
       (pcase-let ((`(,_ . ,todo-ov)
                    (get-char-property-and-overlay where-from 'gptel-agent--todos)))
@@ -1515,13 +1573,7 @@ displayed in their own diagnostic buffer, independently of the parent chat."
           (overlay-put todo-ov 'priority -40)
           (overlay-put todo-ov 'keymap (define-keymap
                                          "<tab>" #'gptel-agent-toggle-todos
-                                         "TAB"   #'gptel-agent-toggle-todos))
-          (plist-put
-           info :post              ; Don't use push, see note in gptel-anthropic
-           (cons (lambda (&rest _)      ; Clean up header line after tasks are done
-                   (when (and gptel-mode gptel-use-header-line header-line-format)
-                     (setf (nth 2 header-line-format) gptel--header-line-info)))
-                 (plist-get info :post))))
+                                         "TAB"   #'gptel-agent-toggle-todos)))
         (let* ((formatted-todos         ; Format the todo list
                 (mapconcat
                  (lambda (todo)
@@ -1534,10 +1586,6 @@ displayed in their own diagnostic buffer, independently of the parent chat."
                                                'face '(:inherit bold :inherit warning))))
                      (_ (concat "○ " (plist-get todo :content)))))
                  todos "\n"))
-               (in-progress
-                (cl-loop for todo across todos
-                         when (equal (plist-get todo :status) "in_progress")
-                         return (plist-get todo :activeForm)))
                (todo-display
                 (concat
                  (unless (= (char-before (overlay-end todo-ov)) 10) "\n")
@@ -1551,16 +1599,7 @@ displayed in their own diagnostic buffer, independently of the parent chat."
                  (propertize " to toggle display ]\n" 'face 'font-lock-comment-face)
                  formatted-todos "\n"
                  gptel-agent--hrule)))
-          (overlay-put todo-ov 'after-string todo-display)
-          (when (and gptel-mode gptel-use-header-line header-line-format)
-            (setf (nth 2 header-line-format)
-                  (if in-progress
-                      (concat (propertize
-                               " " 'display
-                               `(space :align-to (- right ,(+ 5 (length in-progress)))))
-                              (propertize (concat "Task: " in-progress)
-                                          'face 'font-lock-escape-face))
-                    gptel--header-line-info)))))))
+          (overlay-put todo-ov 'after-string todo-display)))))
   t)
 
 ;;; Skill tool
