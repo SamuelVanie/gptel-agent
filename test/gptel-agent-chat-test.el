@@ -288,5 +288,78 @@
     (should-not (gptel-agent-skills-test--tool fsm "MainChat"))
     (should-not (member "MainChat" (gptel-agent-skills-test--wire-names fsm)))))
 
+(ert-deftest gptel-agent-chat-clone-routes-separately-without-session-mode ()
+  (let ((gptel-agent-session-mode nil)
+        (sender (generate-new-buffer " *clone-sender*"))
+        (original (generate-new-buffer " *clone-original*"))
+        (token (make-symbol "original-request"))
+        clone)
+    (unwind-protect
+        (progn
+          (dolist (buffer (list sender original))
+            (with-current-buffer buffer (setq-local gptel-mode t)))
+          (with-current-buffer original (setq gptel-agent-chat--request-token token))
+          (let ((original-id (gptel-agent-chat--id original)))
+            (gptel-agent-chat--send sender original-id "Queued before cloning")
+            (let ((inbox (buffer-local-value 'gptel-agent-chat--inbox original)))
+              (setq clone (with-current-buffer original (clone-buffer " *clone-recipient*")))
+              (should-not (buffer-local-value 'gptel-agent-chat--inbox clone))
+              (should-not (buffer-local-value 'gptel-agent-chat--request-token clone))
+              (should (eq inbox (buffer-local-value 'gptel-agent-chat--inbox original)))
+              (should (eq token (buffer-local-value 'gptel-agent-chat--request-token original))))
+            (let ((clone-id (gptel-agent-chat--id clone)))
+              (should-not (equal original-id clone-id))
+              ;; Ensure routing cannot accidentally pass due to buffer-list order.
+              (bury-buffer original)
+              (gptel-agent-chat--send sender original-id "For original")
+              (bury-buffer clone)
+              (gptel-agent-chat--send sender clone-id "For clone")
+              (should (equal (mapcar (lambda (event) (plist-get event :text))
+                                     (buffer-local-value 'gptel-agent-chat--inbox original))
+                             '("Queued before cloning" "For original")))
+              (should (equal (mapcar (lambda (event) (plist-get event :text))
+                                     (buffer-local-value 'gptel-agent-chat--inbox clone))
+                             '("For clone"))))))
+      (dolist (buffer (list sender original clone))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
+(ert-deftest gptel-agent-chat-clone-does-not-retain-live-sender-dispatcher ()
+  (gptel-agent-chat-test--with-chats
+    (let ((gptel-agent-session-mode nil) clone)
+      (unwind-protect
+          (with-current-buffer sender
+            ;; A host may keep a request-local tool in the conversation buffer.
+            (gptel-agent-chat--localize sender-fsm)
+            (let* ((source-tool (gptel-agent--find-builtin-tool "MainChat" gptel-tools))
+                   (source-function (gptel-tool-function source-tool))
+                   (token gptel-agent-chat--request-token)
+                   (target (gptel-agent-chat--id recipient)))
+              (setq clone (clone-buffer " *clone-live-sender*"))
+              (with-current-buffer clone
+                (let ((tool (gptel-agent--find-builtin-tool "MainChat" gptel-tools)))
+                  (should (string-prefix-p
+                           "Error:" (funcall (gptel-tool-function tool) "send" target "Wrong sender")))
+                  (should (equal (gptel-tool-confirm tool) (gptel-tool-confirm source-tool)))))
+              (should-not (buffer-local-value 'gptel-agent-chat--inbox recipient))
+              (should (eq token gptel-agent-chat--request-token))
+              (should (eq source-function (gptel-tool-function source-tool)))
+              (should (string-prefix-p "Message queued"
+                                       (funcall source-function "send" target "Original still active")))))
+        (when (buffer-live-p clone)
+          ;; Cloned lifecycle hooks must not tear down the original test request.
+          (with-current-buffer clone (let (kill-buffer-hook) (kill-buffer clone))))))))
+
+(ert-deftest gptel-agent-chat-mode-change-retains-peer-state ()
+  (with-temp-buffer
+    (setq-local gptel-mode t)
+    (let ((id (gptel-agent-chat--id (current-buffer)))
+          (inbox (list (list :text "Queued")))
+          (token (make-symbol "request")))
+      (setq gptel-agent-chat--inbox inbox gptel-agent-chat--request-token token)
+      (text-mode)
+      (should (equal id (gptel-agent-chat--id (current-buffer))))
+      (should (eq inbox gptel-agent-chat--inbox))
+      (should (eq token gptel-agent-chat--request-token)))))
+
 (provide 'gptel-agent-chat-test)
 ;;; gptel-agent-chat-test.el ends here
