@@ -19,6 +19,36 @@
                   "text/html" "https://example.test" 10000)
                  "Version 2.0")))
 
+(ert-deftest gptel-agent-web-worker-hidden-main-does-not-hide-visible-content ()
+  (dolist (hidden '("<main hidden='hidden'>Old route</main>"
+                    "<main style='display: none'>Old route</main>"
+                    "<main aria-hidden='true'>Old route</main>"
+                    "<div hidden='hidden'><main>Old route</main></div>"))
+    (should (equal
+             (gptel-agent-web-worker-fetch
+              (concat "<html><body>Surrounding text" hidden
+                      "<main>Visible current article content.</main></body></html>")
+              "text/html" "https://example.test" 10000)
+             "Visible current article content."))))
+
+(ert-deftest gptel-agent-web-worker-hidden-article-does-not-count-as-visible-article ()
+  (should (equal
+           (gptel-agent-web-worker-fetch
+            "<html><body>Surrounding text<article hidden='hidden'>Old article</article><article>Current article.</article></body></html>"
+            "text/html" "https://example.test" 10000)
+           "Current article.")))
+
+(ert-deftest gptel-agent-web-worker-search-skips-hidden-titles-and-snippets ()
+  (dolist (hidden '("<a class='result__a' hidden='hidden' href='https://old.test'>Old title</a>"
+                    "<div class='result__snippet' hidden='hidden'>Old snippet</div>"))
+    (let* ((body (concat "<html><body>" hidden
+                         "<a class='result__a' href='https://current.test'>Current title</a><div class='result__snippet'>Current snippet</div></body></html>"))
+           (result (read (gptel-agent-web-worker-search body "query" 1 "https://engine.test/search")))
+           (entry (car (plist-get result :results))))
+      (should (= (plist-get result :returned-count) 1))
+      (should (equal (plist-get entry :url) "https://current.test"))
+      (should (equal (plist-get entry :excerpt) "Current title\nCurrent snippet")))))
+
 (ert-deftest gptel-agent-web-worker-text-and-json-preserved ()
   (dolist (pair '(("application/json" . "{\"items\":[],\"loading\":true}")
                   ("text/plain" . "Enable JavaScript\n  This is documentation.")
