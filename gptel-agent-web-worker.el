@@ -92,15 +92,16 @@ is non-nil.  Return a cons of text and whether the limit stopped traversal."
 
 (defun gptel-agent-web-worker--find (root predicate &optional limit)
   "Find nodes under ROOT satisfying PREDICATE, returning at most LIMIT.
+Skip hidden nodes and their descendants without counting them toward LIMIT.
 Use iterative traversal so deeply nested HTML cannot exhaust Lisp recursion."
   (let ((pending (list root)) found (count 0))
     (while (and pending (or (null limit) (< count limit)))
       (let ((node (pop pending)))
         (when (consp node)
-          (when (funcall predicate node)
-            (push node found)
-            (cl-incf count))
           (unless (gptel-agent-web-worker--hidden-p node)
+            (when (funcall predicate node)
+              (push node found)
+              (cl-incf count))
             (dolist (child (reverse (dom-children node)))
               (when (consp child) (push child pending)))))))
     (nreverse found)))
