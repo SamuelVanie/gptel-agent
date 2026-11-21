@@ -4,6 +4,29 @@
 
 ** Compatibility fixes
 
+- File edits reject characters that cannot be saved in the file's fixed
+  encoding before writing any part of a batch or recording its history.
+  Automatic encoding selection for new and undecided files is preserved.
+
+- Single-file patches now follow symlinks consistently with batch edits and
+  review. Deletion preserves the link and removes its target, which history
+  can restore.
+
+- Skill discovery and interactive selections are local to each conversation.
+  Requests refresh discovery when their directory or configuration changes,
+  while in-flight requests retain their snapshots. Workers and discussions
+  inherit discovery configuration and discover skills in their own directory.
+
+- Saved sessions retain tool categories so same-named tools cannot be swapped
+  on restore. Legacy snapshots with name-only references remain readable.
+
+- Cloned chats receive independent MainChat identities, inboxes and request
+  dispatchers even when session persistence is disabled. Closing a clone no
+  longer stops the original chat's workers, discussions, shell jobs or timers.
+
+- WebFetch treats brackets and braces in URLs literally, and hidden HTML
+  elements no longer displace visible main content, articles or search results.
+
 - Non-ASCII paths in rewritten tool calls no longer fail with
   ~wrong-type-argument json-value-p~ when an agent continues after approval.
   Embedded OpenAI tool arguments are decoded from UTF-8 before sending.

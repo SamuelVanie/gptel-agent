@@ -601,6 +601,10 @@ files first. Restores require files to match that snapshot's after-state;
 restore newer changes first to step back through history. Each restore is
 itself saved, so it can be undone. Originals, proposed versions, encoding and
 file permissions are recorded, including creation and deletion of empty files.
+Edits that cannot be represented in a file's existing fixed encoding are
+rejected before any file in the batch is written. Use compatible text or
+explicitly change the file's encoding before retrying. New files and files
+whose encoding is still undecided can select an encoding for Unicode text.
 
 Cancelled changes and the entries that cancelled them are hidden by default.
 Press =c= to show or hide them. The Status column marks =[-] Cancelled=,
@@ -640,6 +644,8 @@ needs: =old_str=/=new_str= for replacement, =new_str= for a patch,
 =line_number=/=new_str= for insertion, or =content= for writing. Operations
 run in order, with one original/final comparison per affected file in the
 review. Unified diffs can also create/delete files using =/dev/null=.
+File edits follow symlinks, including deletion: deleting through a symlink
+removes its target and preserves the link. History restores the target.
 Renames, binary files and mode changes remain unsupported. Shell/Elisp side
 effects are not intercepted; use the structured tools for reviewable changes.
 
@@ -1060,6 +1066,12 @@ the tool returns a short reminder instead of another copy. Changed instructions
 or results no longer in context are loaded normally. Discovery and
 =gptel-agent-toggle-skill= continue to update the advertised list independently
 of this check.
+
+Discovery and interactive skill selection belong to each conversation.
+Changing its working directory or skill-directory configuration refreshes
+discovery for its next request. Requests already running keep their discovery
+snapshots. Workers and discussions inherit the configuration and selection,
+then discover skills in their own working directory.
 
 =allowed-tools= follows the experimental [[https://agentskills.io/specification#allowed-tools-field][Agent Skills specification]]: a
 space-separated string of pre-approved tool names. gptel-agent supports exact,
