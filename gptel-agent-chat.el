@@ -57,6 +57,7 @@ Keep this value when reloading the module, just like the counter.")
         (remove-hook 'kill-buffer-hook cleanup t))))
   (setq gptel-agent-chat--id nil gptel-agent-chat--inbox nil
         gptel-agent-chat--request-token nil
+        gptel-agent-access--grant nil
         ;; Kill hooks must not close the original chat's requests or jobs.
         gptel--fsm-last nil gptel-agent--supervised-run nil
         gptel-agent--worker-requests nil gptel-agent--sessions nil
