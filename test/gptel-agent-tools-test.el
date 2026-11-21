@@ -445,12 +445,12 @@
           (delete-file result-file))))))
 
 (ert-deftest gptel-agent-result-explorer-tools-are-locked-and-cite-the-file ()
-  (let ((query "Find the error") result-file)
+  (let ((query "Find the error") (owner (current-buffer)) result-file)
     (unwind-protect
         (progn
           (with-temp-buffer
             (insert "startup ok\nERROR database unavailable\nshutdown\n")
-            (setq result-file (gptel-agent--save-tool-result "bash" query)))
+            (setq result-file (gptel-agent--save-tool-result "bash" query owner)))
           (let ((gptel-agent--current-agent "result-explorer")
                 (gptel-agent--result-file-scope result-file))
             (should (string-match-p
@@ -475,12 +475,12 @@
           (delete-file result-file))))))
 
 (ert-deftest gptel-agent-result-explorer-rejects-a-changed-scope-query ()
-  (let ((query "Find failures") result-file)
+  (let ((query "Find failures") (owner (current-buffer)) result-file)
     (unwind-protect
         (progn
           (with-temp-buffer
             (insert "failure evidence")
-            (setq result-file (gptel-agent--save-tool-result "bash" query)))
+            (setq result-file (gptel-agent--save-tool-result "bash" query owner)))
           (should-not (gptel-agent--result-explorer-contract-error
                        result-file query))
           (should (string-match-p
@@ -499,7 +499,7 @@
         (progn
           (with-temp-buffer
             (insert "failure evidence")
-            (setq result-file (gptel-agent--save-tool-result "bash" query)))
+            (setq result-file (gptel-agent--save-tool-result "bash" query parent)))
           (let ((fsm (gptel-make-fsm :info (list :buffer parent))))
             (gptel-agent--task
              (lambda (value) (setq response value))

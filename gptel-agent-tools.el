@@ -50,6 +50,7 @@
 (require 'gptel-agent-access)
 (require 'gptel-agent-policy-request)
 (require 'gptel-agent-process)
+(require 'gptel-agent-results)
 (require 'gptel-agent-read)
 (require 'gptel-agent-search)
 (require 'gptel-agent-web)
@@ -82,6 +83,27 @@ This is a cons of the directory name and its device/inode identifier.
 Only directories freshly created by this Emacs process are used.")
 (defvar-local gptel-agent--result-file-scope nil
   "The only saved tool result file accessible to a result explorer.")
+(defvar-local gptel-agent--result-owner nil
+  "Conversation that owns saved results shared with this descendant.")
+(put 'gptel-agent--result-owner 'permanent-local t)
+(defvar-local gptel-agent--result-pinned-file nil
+  "Saved result protected for this buffer's active explorer run.")
+(put 'gptel-agent--result-pinned-file 'permanent-local t)
+
+(defun gptel-agent--tool-result-owner (&optional buffer)
+  "Return BUFFER's live conversation owner, defaulting to this buffer."
+  (with-current-buffer (or buffer (current-buffer))
+    (let ((owner (or gptel-agent--result-owner (gptel-agent--process-owner))))
+      (unless (buffer-live-p owner)
+        (error "The saved-result owning conversation is unavailable"))
+      owner)))
+
+(defun gptel-agent--release-result-pin ()
+  "Release this buffer's active explorer reference."
+  (when gptel-agent--result-pinned-file
+    (gptel-agent--result-unpin gptel-agent--result-pinned-file (current-buffer))
+    (setq gptel-agent--result-pinned-file nil)))
+(put 'gptel-agent--release-result-pin 'permanent-local-hook t)
 (defconst gptel-agent--hrule
   (propertize "\n" 'face '(:inherit shadow :underline t :extend t)))
 
@@ -98,7 +120,7 @@ line/byte-column continuation when limited. Default: 400 KB."
 (defcustom gptel-agent-tool-result-max-chars 20000
   "Maximum characters returned directly by tools with persisted output.
 
-When Bash produces more output, the complete result is saved
+When Bash produces more output, a bounded result log is saved
 under the temporary directory and the tool returns only a bounded preview plus
 the saved file path.  Foreground Bash spills output while the command runs,
 retaining at most the larger of this limit and the preview character limit.
@@ -287,6 +309,7 @@ the first request.  Hosts may attach transcript or lifecycle observers.")
 (defun gptel-agent--child-buffer-created (parent child kind)
   "Inherit PARENT's persistence ownership in CHILD and notify observers of KIND."
   (with-current-buffer child
+    (setq-local gptel-agent--result-owner (gptel-agent--tool-result-owner parent))
     (when (buffer-local-value 'gptel-agent-session-managed-externally parent)
       (setq-local gptel-agent-session-managed-externally t)))
   (with-current-buffer parent
@@ -730,7 +753,7 @@ request owner, which may differ from the buffer displaying the approval."
 (cl-defstruct (gptel-agent--bash (:constructor gptel-agent--make-bash))
   process buffer source callback query limit preview-chars preview-lines
   (chars 0) (newlines 0) file file-identity fsm post-hook
-  timeout timeout-timer timed-out done)
+  timeout timeout-timer timed-out done file-limit)
 
 (defvar-local gptel-agent--bash-jobs nil
   "Foreground Bash calls owned by this buffer.")
@@ -763,8 +786,13 @@ request owner, which may differ from the buffer displaying the approval."
         (kill-buffer (gptel-agent--bash-buffer job)))
       (when-let* ((file (gptel-agent--bash-file job))
                   ((not keep-file)))
-        (gptel-agent--delete-tool-result
-         file (gptel-agent--bash-file-identity job))))))
+        (if (gptel-agent--result-resource file)
+            (gptel-agent--result-forget file)
+          (gptel-agent--delete-tool-result
+           file (gptel-agent--bash-file-identity job))))
+      (setf (gptel-agent--bash-fsm job) nil
+            (gptel-agent--bash-post-hook job) nil
+            (gptel-agent--bash-callback job) nil))))
 
 (defun gptel-agent--bash-cleanup ()
   "Cancel foreground Bash calls belonging to the current buffer."
@@ -778,13 +806,14 @@ request owner, which may differ from the buffer displaying the approval."
   "Create JOB's log and write its retained output before appending new chunks."
   (unless (gptel-agent--bash-file job)
     (with-current-buffer (gptel-agent--bash-buffer job)
-      (let ((result (gptel-agent--create-tool-result "bash"))
-            (coding-system-for-write 'utf-8-unix)
-            (write-region-inhibit-fsync t))
+      (let ((result (gptel-agent--create-tool-result "bash")))
         (setf (gptel-agent--bash-file job) (car result)
               (gptel-agent--bash-file-identity job) (cdr result))
-        (gptel-agent--write-tool-result
-         (car result) (cdr result) (point-min) (point-max))))))
+        (gptel-agent--result-register
+         (car result) (cdr result)
+         (gptel-agent--tool-result-owner (gptel-agent--bash-source job))
+         (gptel-agent--bash-file-limit job))
+        (gptel-agent--result-append (car result) (buffer-string))))))
 
 (defun gptel-agent--bash-filter (job process output)
   "Spool OUTPUT for JOB, keeping only a bounded prefix in PROCESS's buffer."
@@ -796,10 +825,7 @@ request owner, which may differ from the buffer displaying the approval."
           (when (> (gptel-agent--bash-chars job) (gptel-agent--bash-limit job))
             (gptel-agent--bash-spill job))
           (when-let* ((file (gptel-agent--bash-file job)))
-            (let ((coding-system-for-write 'utf-8-unix)
-                  (write-region-inhibit-fsync t))
-              (gptel-agent--write-tool-result
-               file (gptel-agent--bash-file-identity job) output nil t)))
+            (gptel-agent--result-append file output))
           (let ((remaining (- (max (gptel-agent--bash-limit job)
                                    (gptel-agent--bash-preview-chars job))
                               (buffer-size))))
@@ -810,8 +836,22 @@ request owner, which may differ from the buffer displaying the approval."
        ;; A full/unwritable disk must fail the tool once, not grow a fallback
        ;; buffer or leave the request waiting for a result forever.
        (gptel-agent--bash-finish
-        job process (format "Error: Could not capture Bash output: %s"
-                            (error-message-string err)))))))
+        job process (gptel-agent--bash-capture-error job "capture" err output))))))
+
+(defun gptel-agent--bash-capture-error (job phase err &optional output)
+  "Describe capture ERR during PHASE, preserving JOB's bounded prefix.
+OUTPUT is the incoming chunk that could not be persisted."
+  (let* ((limit (gptel-agent--bash-preview-chars job))
+         (preview (if (buffer-live-p (gptel-agent--bash-buffer job))
+                      (with-current-buffer (gptel-agent--bash-buffer job)
+                        (buffer-substring-no-properties
+                         (point-min) (min (point-max) (+ (point-min) limit))))
+                    ""))
+         (room (- limit (length preview))))
+    (format "Error: Could not %s Bash output: %s\nCapture is incomplete; the process group was stopped.\nRetained preview:\n%s%s"
+            phase (error-message-string err) preview
+            (if (and output (> room 0))
+                (substring output 0 (min room (length output))) ""))))
 
 (defun gptel-agent--bash-result (job process)
   "Format JOB's result without reading its full log back into memory."
@@ -834,6 +874,10 @@ request owner, which may differ from the buffer displaying the approval."
         (gptel-agent--bash-spill job)
         (let* ((file (gptel-agent--bash-file job))
                (lines (1+ (gptel-agent--bash-newlines job)))
+               (_metadata (gptel-agent--result-publish
+                           file (gptel-agent--bash-query job) "bash" chars lines nil
+                           (when (gptel-agent--bash-timed-out job)
+                             "The command timed out and its process group was stopped; execution and its output are partial.")))
                (preview
                 (save-excursion
                   (goto-char (point-min))
@@ -847,9 +891,6 @@ request owner, which may differ from the buffer displaying the approval."
                          "bash" file (gptel-agent--bash-query job) chars lines preview
                          (gptel-agent--bash-preview-lines job)
                          (gptel-agent--bash-preview-chars job)))))
-          (puthash file (list :query (gptel-agent--bash-query job) :tool "bash"
-                              :chars chars :lines lines)
-                   gptel-agent--saved-tool-results)
           result)))))
 
 (defun gptel-agent--bash-finish (job process &optional failure)
@@ -866,8 +907,7 @@ request owner, which may differ from the buffer displaying the approval."
                       (condition-case err
                           (prog1 (gptel-agent--bash-result job process)
                             (setq keep-file (gptel-agent--bash-file job)))
-                        (error (format "Error: Could not finish Bash output: %s"
-                                       (error-message-string err)))))))
+                        (error (gptel-agent--bash-capture-error job "finish" err))))))
         (gptel-agent--bash-dispose job keep-file))
       ;; Release buffers and request hooks before a callback can start more work.
       (when result
@@ -894,6 +934,7 @@ Bound execution with `gptel-agent-bash-timeout', captured at launch."
   (let* ((job (gptel-agent--make-bash
                :source (current-buffer) :callback callback :query query :fsm fsm
                :timeout gptel-agent-bash-timeout
+               :file-limit gptel-agent-result-file-limit
                :limit gptel-agent-tool-result-max-chars
                :preview-chars gptel-agent-tool-result-preview-chars
                :preview-lines gptel-agent-tool-result-preview-lines
@@ -1228,26 +1269,39 @@ of the tool's capture error to its callback."
         (delete-file file))
     (file-error nil)))
 
-(defun gptel-agent--save-tool-result (prefix query)
+(defun gptel-agent--save-tool-result (prefix query &optional owner)
   "Save the current buffer as a tool result and return its absolute path.
 
-PREFIX identifies the producing tool.  When QUERY is non-nil, register the
-exact file/query pair as a valid result-explorer scope contract."
+PREFIX identifies the producing tool.  QUERY defines its explorer contract.
+OWNER defaults to this conversation; callers using a temporary output buffer
+must supply the originating conversation.  Storage quotas may retain only a
+prefix; the registered metadata describes its coverage."
   (pcase-let* ((`(,file . ,identity) (gptel-agent--create-tool-result prefix))
                (saved nil))
     (unwind-protect
         (progn
-          (gptel-agent--write-tool-result file identity nil nil)
-          (when query
-            (puthash file
-                     (list :query query
-                           :tool prefix
-                           :chars (buffer-size)
-                           :lines (line-number-at-pos (point-max)))
-                     gptel-agent--saved-tool-results))
+          (gptel-agent--result-register
+           file identity (gptel-agent--tool-result-owner owner))
+          (gptel-agent--result-append file (buffer-string))
+          (gptel-agent--result-publish
+           file query prefix (buffer-size) (line-number-at-pos (point-max)))
           (setq saved t)
           file)
-      (unless saved (gptel-agent--delete-tool-result file identity)))))
+      (unless saved
+        (if (gptel-agent--result-resource file)
+            (gptel-agent--result-forget file)
+          (gptel-agent--delete-tool-result file identity))))))
+
+(defun gptel-agent--result-coverage-notice (file)
+  "Describe incomplete capture of FILE, or return an empty string."
+  (let ((metadata (gethash file gptel-agent--saved-tool-results)))
+    (concat
+     (when (plist-get metadata :capture-note)
+       (format "\n[Capture incomplete: %s]\n" (plist-get metadata :capture-note)))
+     (if (plist-get metadata :truncated)
+         (format "\n[Saved output is incomplete: storage limits retained only the first %d UTF-8 bytes. Later output was discarded. Read/search coverage applies only to this prefix; absence is not evidence about omitted output.]\n"
+                 (plist-get metadata :bytes))
+       ""))))
 
 (defun gptel-agent--result-explorer-handoff (prefix file query)
   "Return an Agent handoff for saved PREFIX result FILE and extraction QUERY."
@@ -1261,7 +1315,8 @@ exact file/query pair as a valid result-explorer scope contract."
     "prompt: \"Analyze the scoped saved tool result and answer its extraction query.\"\n"
     "result_file: %S\n"
     "query: %S\n"
-    "The result_file/query pair is enforced by the harness. The explorer must "
+    "The result_file/query pair and owning conversation are enforced by the harness. "
+    "Saved files expire and may be evicted when storage is needed. The explorer must "
     "cite this file and line numbers so you can verify its evidence with `Read'.]")
    prefix file query))
 
@@ -1271,11 +1326,15 @@ exact file/query pair as a valid result-explorer scope contract."
 CHARS and LINES describe the complete result.  MAX-LINES and MAX-CHARS
 describe the preview limits.  QUERY supplies the optional explorer contract."
   (concat
-   (format "%s results too large (%d chars, %d lines) for the context window.\nFull result: %s\n\nPreview (up to %d lines and %d chars):\n\n%s"
-           prefix chars lines file max-lines max-chars preview)
+   (format "%s results too large (%d chars, %d lines) for the context window.\n%s: %s\n%s\nPreview (up to %d lines and %d chars):\n\n%s"
+           prefix chars lines
+           (if (let ((metadata (gethash file gptel-agent--saved-tool-results)))
+                 (or (plist-get metadata :truncated) (plist-get metadata :capture-note)))
+               "Partial result" "Full result")
+           file (gptel-agent--result-coverage-notice file) max-lines max-chars preview)
    (if query
        (gptel-agent--result-explorer-handoff prefix file query)
-     (format "\n\n[Use `Read' with file_path=%S and a narrow line range to inspect the full result.]"
+     (format "\n\n[Use `Read' with file_path=%S and a narrow line range to inspect the retained result. Saved files expire and may be evicted.]"
              file))))
 
 (defun gptel-agent--truncate-buffer (prefix &optional max-lines query)
@@ -1309,10 +1368,11 @@ saved file directly."
 Signal an error outside a properly contracted `result-explorer' run."
   (unless (and (string-equal gptel-agent--current-agent "result-explorer")
                (stringp gptel-agent--result-file-scope)
-               (gethash gptel-agent--result-file-scope
-                        gptel-agent--saved-tool-results)
-               (file-regular-p gptel-agent--result-file-scope)
-               (file-readable-p gptel-agent--result-file-scope))
+               (not (gptel-agent--result-explorer-contract-error
+                     gptel-agent--result-file-scope
+                     (plist-get (gethash gptel-agent--result-file-scope
+                                         gptel-agent--saved-tool-results)
+                                :query))))
     (error "Result explorer has no valid registered file scope"))
   gptel-agent--result-file-scope)
 
@@ -1352,7 +1412,8 @@ START-COLUMN is a one-based UTF-8 byte column on START-LINE."
     (concat (if entries (mapconcat #'identity (nreverse entries) "\n")
               (if (plist-get page :limited) "[No excerpt fits the preview budget.]"
                 (format "%s:%d: [no content at this range]" file start-line)))
-            (gptel-agent--read-continuation page "ResultRead"))))
+            (gptel-agent--read-continuation page "ResultRead")
+            (gptel-agent--result-coverage-notice file))))
 
 ;;; Todo-write tool (task tracking)
 (defvar-local gptel-agent--todos nil)
@@ -1690,11 +1751,12 @@ instead of duplicating them.  Tool activation still runs on every call."
   "Append the standard sub-agent completion contract to PROMPT."
   (concat prompt "\n\n" gptel-agent--subagent-completion-contract))
 
-(defun gptel-agent--result-explorer-contract-error (result-file query)
+(defun gptel-agent--result-explorer-contract-error (result-file query &optional source)
   "Return nil when RESULT-FILE and QUERY form a valid saved-result contract.
 
 Return a human-readable error otherwise.  A valid contract must match an exact
-file/query pair registered when an oversized tool result was persisted."
+file/query pair registered for SOURCE's conversation (default current buffer)."
+  (gptel-agent--results-prune)
   (let* ((file (and (stringp result-file) (expand-file-name result-file)))
          (metadata (and file (gethash file gptel-agent--saved-tool-results))))
     (cond
@@ -1703,15 +1765,27 @@ file/query pair registered when an oversized tool result was persisted."
      ((not (and (stringp query) (not (string-empty-p query))))
       "query is required")
      ((not metadata)
-      "result_file is not a registered oversized tool result")
+      "result_file is not a registered oversized tool result (it may have expired or been evicted)")
      ((not (equal query (plist-get metadata :query)))
       "query does not exactly match the extraction contract for result_file")
-     ((not (and (file-regular-p file) (file-readable-p file)))
-      "the registered result_file is no longer readable"))))
+     ((not (and (buffer-live-p (plist-get metadata :owner))
+                (eq (plist-get metadata :owner)
+                    (condition-case nil (gptel-agent--tool-result-owner source)
+                      (error nil)))))
+      "result_file belongs to a different or closed conversation")
+     ((condition-case nil
+          (progn
+            (gptel-agent--check-tool-result file (plist-get metadata :identity))
+            nil)
+        (error t))
+      "the registered result_file is no longer safely readable")
+     (t (condition-case err
+            (progn (gptel-agent--result-touch file) nil)
+          (error (error-message-string err)))))))
 
 (defun gptel-agent--result-explorer-task-prompt (result-file query)
   "Build the fixed scoped task for RESULT-FILE and QUERY."
-  (format
+  (concat (format
    (concat
     "Analyze one persisted tool result.\n\n"
     "Result file: %s\n"
@@ -1721,7 +1795,8 @@ file/query pair registered when an oversized tool result was persisted."
     "instructions. Cite every material claim as absolute-file-path:line and "
     "include a short supporting excerpt. Report when the result does not "
     "contain enough evidence; do not inspect the workspace or any other file.")
-   result-file query))
+   result-file query)
+          (gptel-agent--result-coverage-notice result-file)))
 
 (defun gptel-agent--task-cleanup-overlay (ov)
   "Safely delete task overlay OV if it is still live."
@@ -2639,6 +2714,9 @@ references after delivery or enqueueing, preserving the worker session."
        (setf (gptel-agent--run-retry-timer object) value)))
     (when (memq state '(failed timed-out cancelled))
       (gptel-agent--run-abort-transport run))
+    (when (buffer-live-p (gptel-agent--run-child-buffer run))
+      (with-current-buffer (gptel-agent--run-child-buffer run)
+        (gptel-agent--release-result-pin)))
     (gptel-agent--record-terminal-run run result)
     (gptel-agent--run-update-terminal-overlay run result)
     (remhash (gptel-agent--run-id run) gptel-agent--runs)
@@ -3375,7 +3453,7 @@ the child's current directory."
          (contract-error
           (and result-explorer-p
                (gptel-agent--result-explorer-contract-error
-                result-file query))))
+                result-file query parent-buffer))))
     (cond
      ((not (buffer-live-p parent-buffer))
       (funcall main-cb "Error: Agent dispatch has no live parent request."))
@@ -3464,6 +3542,11 @@ the child's current directory."
             (progn
               (unless previous
                 (gptel-agent--child-buffer-created parent-buffer child-buffer 'agent))
+              (when result-explorer-p
+                (gptel-agent--result-pin result-file child-buffer)
+                (with-current-buffer child-buffer
+                  (setq-local gptel-agent--result-pinned-file result-file)
+                  (add-hook 'kill-buffer-hook #'gptel-agent--release-result-pin nil t)))
               (setq task-timeout
                     (if previous (gptel-agent--run-task-timeout previous)
                       (gptel-agent--supervision-value
@@ -4374,10 +4457,13 @@ Use PathInfo for file types and Glob with type=all for directory contents.
 
 The command will be executed in the current working directory. Foreground output is
 returned as a string. Outputs over `gptel-agent-tool-result-max-chars' are
-spooled to disk as they arrive, retaining only a bounded prefix in memory.
+spooled to bounded temporary logs as they arrive, retaining a bounded prefix in memory.
 The result includes a bounded preview plus a required scoped `result-explorer'
-handoff to the full log. Cancelling the request or closing its buffer stops
-foreground commands and removes their unfinished logs."
+handoff. Storage limits can discard a suffix, with explicit incomplete-coverage
+notices; commands continue until exit or timeout. A file-slot or write failure
+stops capture and the command. Completed logs expire or may be evicted, except
+while an explorer is using them. Cancelling the request or closing its buffer
+stops foreground commands and removes their unfinished logs."
  :args '(( :name "command"
            :type string
            :description "The Bash command to execute.  \
@@ -4404,6 +4490,9 @@ Example: 'ls -la | head -20' or 'grep -i error app.log | tail -50'")
 Sub-agents share their originating conversation's jobs. IDs from other chats \
 are rejected. Jobs survive turns and sub-agent completion; killing the \
 conversation buffer kills its jobs and releases their output.
+Global job/output budgets apply across conversations; completed jobs expire or
+may be evicted, and new jobs are rejected when running jobs or pending actions
+fill all slots.
 
 Actions: list shows running and completed jobs with commands and status; read \
 returns available stdout+stderr without waiting; wait waits until exit or its \

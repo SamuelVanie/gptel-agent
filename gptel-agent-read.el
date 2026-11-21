@@ -17,6 +17,9 @@
 (defvar gptel-agent-read-file-size-threshold)
 (defvar gptel-agent-tool-result-preview-chars)
 (declare-function gptel-agent--scoped-result-file "gptel-agent-tools")
+(declare-function gptel-agent--result-pin "gptel-agent-results" (file buffer))
+(declare-function gptel-agent--result-unpin "gptel-agent-results" (file buffer))
+(declare-function gptel-agent--result-resource "gptel-agent-results" (file))
 
 (defconst gptel-agent--read-chunk-size 65536
   "Maximum bytes in one file read, independent of line length.")
@@ -232,7 +235,7 @@ The dispatcher used by an existing tool batch is never reinterpreted."
   (pending "") (stderr "") (candidates nil) (entries nil) (used 0) (count 0)
   (offset 0) (carry "") (line 1) (line-start 0) (next-byte 0)
   skipping (skipped-lines 0) first-skipped-byte first-skipped-line
-  evidence-offset cached-line cached-start status done)
+  evidence-offset cached-line cached-start status done pin-buffer)
 
 (defvar-local gptel-agent--searches nil
   "Saved-result searches owned by this conversation.")
@@ -255,7 +258,14 @@ The dispatcher used by an existing tool batch is never reinterpreted."
             (remq (gptel-agent--search-cleanup job) (plist-get (gptel-fsm-info fsm) :post))))
     (when (buffer-live-p (gptel-agent--search-source job))
       (with-current-buffer (gptel-agent--search-source job)
-        (setq gptel-agent--searches (delq job gptel-agent--searches))))))
+        (setq gptel-agent--searches (delq job gptel-agent--searches))))
+    (when-let* ((pin (gptel-agent--search-pin-buffer job)))
+      ;; A search owns a separate pin from the explorer run: disposing one
+      ;; concurrent search must not release another search's or run's lease.
+      (setf (gptel-agent--search-pin-buffer job) nil)
+      (unwind-protect
+          (gptel-agent--result-unpin (gptel-agent--search-file job) pin)
+        (when (buffer-live-p pin) (kill-buffer pin))))))
 
 (defun gptel-agent--searches-cleanup ()
   "Silently cancel saved-result searches owned by the current buffer."
@@ -274,6 +284,9 @@ The dispatcher used by an existing tool batch is never reinterpreted."
   (unless (gptel-agent--search-done job)
     (let* ((live (gptel-agent--search-live-p job))
            (file (gptel-agent--search-file job))
+           (resource (and live (gptel-agent--result-resource file)))
+           (truncated (plist-get resource :truncated))
+           (capture-note (plist-get resource :capture-note))
            (attrs (and live (file-attributes file)))
            (changed (and live (not (equal (list (file-attribute-size attrs)
                                                 (file-attribute-modification-time attrs))
@@ -286,6 +299,10 @@ The dispatcher used by an existing tool batch is never reinterpreted."
                              (gptel-agent--search-first-skipped-line job)
                              (gptel-agent--search-first-skipped-byte job)
                              (if (equal status "complete") "remaining lines scanned" status)))
+                    ((and truncated (equal status "complete"))
+                     "incomplete: saved output truncated; retained prefix scanned")
+                    ((and capture-note (equal status "complete"))
+                     "incomplete: partial command execution; captured output scanned")
                     (t status)))
            (result
             (when live
@@ -298,7 +315,14 @@ The dispatcher used by an existing tool batch is never reinterpreted."
                        status (gptel-agent--search-backend job)
                        (if-let* ((skipped (gptel-agent--search-first-skipped-byte job)))
                            (min skipped (gptel-agent--search-next-byte job))
-                         (gptel-agent--search-next-byte job)))))))
+                         (gptel-agent--search-next-byte job)))
+               (when truncated
+                 (format (concat "\n[Saved output incomplete: only first %d UTF-8 bytes retained; "
+                                 "later command output was discarded. Search coverage applies "
+                                 "only to the retained prefix.]")
+                         (plist-get resource :bytes)))
+               (when capture-note
+                 (format "\n[Capture incomplete: %s]" capture-note))))))
       (gptel-agent--search-dispose job)
       (when result
         (with-current-buffer (gptel-agent--search-source job)
@@ -501,54 +525,58 @@ it is never replaced with another dialect while executing a query."
       (setf (gptel-agent--search-timeout job)
             (run-at-time 30 nil (lambda () (gptel-agent--search-finish job "incomplete: timeout"))))
       (condition-case err
-          (if (eq name 'emacs)
-              (progn
-                ;; Validate even for an empty file, before claiming no matches.
-                (string-match regex "")
-                (gptel-agent--search-schedule job #'gptel-agent--search-fallback))
-            (unless (and program (file-executable-p program))
-              (error "advertised %s backend is unavailable; contract refreshes at the next request boundary" name))
-            (let* ((default-directory temporary-file-directory)
-                   (process-environment (copy-sequence process-environment))
-                   (args (append
-                          (if (eq name 'rg) '("--no-config" "--no-heading" "--no-filename" "--color=never"
-                                              "--no-mmap" "--encoding=none" "-a" "-n" "-b" "-o")
-                            '("-a" "-n" "-b" "-o" "-E" "-h"))
-                          (unless (eq case-sensitive t) '("-i"))
-                          (list "-e" regex "--" file))))
-              (setenv "LC_ALL" "C")
-              (setenv "RIPGREP_CONFIG_PATH" nil)
-              (setenv "GREP_OPTIONS" nil)
-              (setf (gptel-agent--search-stderr-process job)
-                    (make-pipe-process
-                     :name "gptel-result-search-stderr" :buffer nil :noquery t :coding 'no-conversion
-                     :filter (lambda (_process output)
-                               (unless (gptel-agent--search-done job)
-                                 (let ((room (- 2048 (length (gptel-agent--search-stderr job)))))
-                                   (when (> room 0)
-                                     (setf (gptel-agent--search-stderr job)
-                                           (concat (gptel-agent--search-stderr job)
-                                                   (substring output 0 (min room (length output))))))))))
-                    (gptel-agent--search-process job)
-                    (make-process
-                     :name "gptel-result-search" :buffer nil :noquery t :connection-type 'pipe
-                     :coding '(no-conversion . utf-8-unix) :command (cons program args)
-                     :stderr (gptel-agent--search-stderr-process job)
-                     :filter (apply-partially #'gptel-agent--search-filter job)
-                     :sentinel
-                     (lambda (process _event)
-                       (when (memq (process-status process) '(exit signal))
-                         (gptel-agent--search-collected
-                          job
-                          (if (and (eq (process-status process) 'exit)
-                                   (memq (process-exit-status process) '(0 1))
-                                   (string-empty-p (gptel-agent--search-pending job)))
-                              "complete"
-                            (format "incomplete: search failed (exit %d): %s"
-                                    (process-exit-status process)
-                                    (decode-coding-string (gptel-agent--search-stderr job) 'utf-8-unix))))))))
-              (unless (processp (gptel-agent--search-process job))
-                (error "Could not start the advertised search backend"))))
+          (progn
+            (setf (gptel-agent--search-pin-buffer job)
+                  (generate-new-buffer " *gptel-result-search-pin*"))
+            (gptel-agent--result-pin file (gptel-agent--search-pin-buffer job))
+            (if (eq name 'emacs)
+                (progn
+                  ;; Validate even for an empty file, before claiming no matches.
+                  (string-match regex "")
+                  (gptel-agent--search-schedule job #'gptel-agent--search-fallback))
+              (unless (and program (file-executable-p program))
+                (error "advertised %s backend is unavailable; contract refreshes at the next request boundary" name))
+              (let* ((default-directory temporary-file-directory)
+                     (process-environment (copy-sequence process-environment))
+                     (args (append
+                            (if (eq name 'rg) '("--no-config" "--no-heading" "--no-filename" "--color=never"
+                                                "--no-mmap" "--encoding=none" "-a" "-n" "-b" "-o")
+                              '("-a" "-n" "-b" "-o" "-E" "-h"))
+                            (unless (eq case-sensitive t) '("-i"))
+                            (list "-e" regex "--" file))))
+                (setenv "LC_ALL" "C")
+                (setenv "RIPGREP_CONFIG_PATH" nil)
+                (setenv "GREP_OPTIONS" nil)
+                (setf (gptel-agent--search-stderr-process job)
+                      (make-pipe-process
+                       :name "gptel-result-search-stderr" :buffer nil :noquery t :coding 'no-conversion
+                       :filter (lambda (_process output)
+                                 (unless (gptel-agent--search-done job)
+                                   (let ((room (- 2048 (length (gptel-agent--search-stderr job)))))
+                                     (when (> room 0)
+                                       (setf (gptel-agent--search-stderr job)
+                                             (concat (gptel-agent--search-stderr job)
+                                                     (substring output 0 (min room (length output))))))))))
+                      (gptel-agent--search-process job)
+                      (make-process
+                       :name "gptel-result-search" :buffer nil :noquery t :connection-type 'pipe
+                       :coding '(no-conversion . utf-8-unix) :command (cons program args)
+                       :stderr (gptel-agent--search-stderr-process job)
+                       :filter (apply-partially #'gptel-agent--search-filter job)
+                       :sentinel
+                       (lambda (process _event)
+                         (when (memq (process-status process) '(exit signal))
+                           (gptel-agent--search-collected
+                            job
+                            (if (and (eq (process-status process) 'exit)
+                                     (memq (process-exit-status process) '(0 1))
+                                     (string-empty-p (gptel-agent--search-pending job)))
+                                "complete"
+                              (format "incomplete: search failed (exit %d): %s"
+                                      (process-exit-status process)
+                                      (decode-coding-string (gptel-agent--search-stderr job) 'utf-8-unix))))))))
+                (unless (processp (gptel-agent--search-process job))
+                  (error "Could not start the advertised search backend")))))
         (error (gptel-agent--search-finish job (concat "incomplete: " (error-message-string err)))))))
   nil)
 

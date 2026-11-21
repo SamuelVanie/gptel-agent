@@ -14,12 +14,15 @@ other tests.  All hostile paths and their targets stay inside SCRATCH."
           (temporary-file-directory (file-name-as-directory ,root))
           (default-directory (file-name-as-directory ,scratch))
           (gptel-agent--tool-results-storage nil)
-          (gptel-agent--saved-tool-results (make-hash-table :test #'equal)))
+          (gptel-agent--saved-tool-results (make-hash-table :test #'equal))
+         (gptel-agent--result-resources (make-hash-table :test #'equal))
+         (gptel-agent--results-timer nil))
      (unwind-protect
          (progn
            (make-directory ,root)
            (set-file-modes ,root #o1777)
            ,@body)
+       (gptel-agent--results-exit-cleanup)
        (delete-directory ,scratch t))))
 
 (cl-defmacro gptel-agent-result-storage-test--with-job ((job results) &body body)
@@ -49,9 +52,10 @@ other tests.  All hostile paths and their targets stay inside SCRATCH."
 
 (defun gptel-agent-result-storage-test--save (&optional prefix)
   "Save sample evidence using PREFIX and the real generic result writer."
-  (with-temp-buffer
-    (insert "saved evidence\n")
-    (gptel-agent--save-tool-result (or prefix "test") "Find evidence")))
+  (let ((owner (current-buffer)))
+    (with-temp-buffer
+      (insert "saved evidence\n")
+      (gptel-agent--save-tool-result (or prefix "test") "Find evidence" owner))))
 
 (ert-deftest gptel-agent-result-storage-ignores-untrusted-legacy-paths ()
   (dolist (symlink '(nil t))

@@ -29,6 +29,36 @@ Only one send may be pending per job; additional sends are rejected."
   :type 'natnum
   :group 'gptel-agent)
 
+(defcustom gptel-agent-process-job-limit 64
+  "Maximum background jobs across all conversations, including completed jobs.
+Starting a job first evicts the oldest completed jobs, then fails if all
+remaining slots are occupied by running jobs or pending managed actions."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-process-completed-limit 32
+  "Maximum completed background jobs retained across all conversations.
+The oldest completed jobs are removed first.  Pending managed actions
+protect a job until those actions have finished."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-process-total-output-limit 2000000
+  "Maximum decoded characters retained across all background jobs.
+Output is bounded before insertion.  Older output is discarded first,
+preferring completed jobs; reads report discarded absolute character ranges.
+This bounds character storage, not subprocess memory or OS pipe buffers."
+  :type 'natnum
+  :group 'gptel-agent)
+
+(defcustom gptel-agent-process-retention-seconds 3600
+  "Maximum age in seconds of retained completed background jobs.
+Running jobs and jobs with pending managed actions are never expired.
+Cleanup runs about once a minute while jobs exist and on new launches.
+A busy Emacs can delay timers."
+  :type 'number
+  :group 'gptel-agent)
+
 (defvar gptel-agent--process-writing nil
   "Non-nil while a managed pipe write is on the Lisp stack.
 Prevent nested pumps: one write's timeout must not unwind another write.")
@@ -39,9 +69,15 @@ Prevent nested pumps: one write's timeout must not unwind another write.")
   "Background shell jobs owned by this conversation buffer.")
 (put 'gptel-agent--processes 'permanent-local t)
 
+(defvar gptel-agent--process-registry nil
+  "All managed background jobs, for instance-wide resource limits.")
+(defvar gptel-agent--process-retention-timer nil
+  "Timer that expires retained completed background jobs.")
+
 (cl-defstruct (gptel-agent--job (:constructor gptel-agent--make-job))
   id process buffer command directory started-at limit (base 0) (cursor 0)
-  waiters send input-disabled last-send eof input-closed last-eof)
+  waiters send input-disabled last-send eof input-closed last-eof
+  owner completed-at (output-at 0) disposing cleanup-pending)
 
 (cl-defstruct (gptel-agent--process-send
                (:constructor gptel-agent--make-process-send))
@@ -70,17 +106,103 @@ Prevent nested pumps: one write's timeout must not unwind another write.")
       (setq owner parent))
     owner))
 
-(defun gptel-agent--process-filter (job _process output)
-  "Append OUTPUT to JOB, retaining only its configured tail."
+(defun gptel-agent--process-output-size (job)
+  "Return JOB's retained character count."
+  (if (buffer-live-p (gptel-agent--job-buffer job))
+      (buffer-size (gptel-agent--job-buffer job)) 0))
+
+(defun gptel-agent--process-trim (job count)
+  "Discard up to COUNT oldest retained characters from JOB."
   (when (buffer-live-p (gptel-agent--job-buffer job))
     (with-current-buffer (gptel-agent--job-buffer job)
-      (let ((inhibit-read-only t))
-        (goto-char (point-max))
-        (insert output)
-        (let ((excess (- (buffer-size) (gptel-agent--job-limit job))))
-          (when (> excess 0)
-            (delete-region (point-min) (+ (point-min) excess))
-            (cl-incf (gptel-agent--job-base job) excess)))))))
+      (let ((inhibit-read-only t)
+            (drop (min count (buffer-size))))
+        (delete-region (point-min) (+ (point-min) drop))
+        (cl-incf (gptel-agent--job-base job) drop)))))
+
+(defun gptel-agent--process-output-room (job incoming)
+  "Make aggregate room for INCOMING characters in JOB.
+Discard completed jobs' output first, then the least recently updated tails."
+  (let* ((others (delq job (copy-sequence gptel-agent--process-registry)))
+         (excess (- (+ incoming (gptel-agent--process-output-size job)
+                       (cl-loop for other in others
+                                sum (gptel-agent--process-output-size other)))
+                    gptel-agent-process-total-output-limit)))
+    (dolist (other
+             (sort others
+                   (lambda (a b)
+                     (if (eq (not (null (gptel-agent--job-completed-at a)))
+                             (not (null (gptel-agent--job-completed-at b))))
+                         (< (gptel-agent--job-output-at a)
+                            (gptel-agent--job-output-at b))
+                       (gptel-agent--job-completed-at a)))))
+      (when (> excess 0)
+        (let ((drop (min excess (gptel-agent--process-output-size other))))
+          (gptel-agent--process-trim other drop)
+          (cl-decf excess drop))))
+    (when (> excess 0) (gptel-agent--process-trim job excess))))
+
+(defun gptel-agent--process-filter (job _process output)
+  "Append OUTPUT to JOB, enforcing per-job and aggregate tail limits."
+  (when (buffer-live-p (gptel-agent--job-buffer job))
+    (let* ((limit (min (gptel-agent--job-limit job)
+                       gptel-agent-process-total-output-limit))
+           (length (length output))
+           (keep (min length limit)))
+      ;; Never insert an arbitrarily large filter chunk before trimming it.
+      (gptel-agent--process-trim
+       job (max 0 (- (+ (gptel-agent--process-output-size job) keep) limit)))
+      (cl-incf (gptel-agent--job-base job) (- length keep))
+      (gptel-agent--process-output-room job keep)
+      (with-current-buffer (gptel-agent--job-buffer job)
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (insert (if (= keep length) output (substring output (- length keep))))))
+      (setf (gptel-agent--job-output-at job) (float-time)))))
+
+(defun gptel-agent--process-evictable-p (job)
+  "Whether JOB is completed and has no pending managed action."
+  (and (gptel-agent--job-completed-at job)
+       (not (gptel-agent--job-disposing job))
+       (not (gptel-agent--job-cleanup-pending job))
+       (not (process-live-p (gptel-agent--job-process job)))
+       (not (gptel-agent--job-waiters job))
+       (not (gptel-agent--job-send job))
+       (not (gptel-agent--job-eof job))))
+
+(defun gptel-agent--process-prune (&optional reserve)
+  "Expire completed jobs and make room for RESERVE new jobs, if possible."
+  ;; A failed termination must retain its resource reservation and bounded
+  ;; filter.  Retry it even if the owner was killed before cleanup succeeded.
+  (dolist (job (copy-sequence gptel-agent--process-registry))
+    (when (and (not (gptel-agent--job-disposing job))
+               (or (gptel-agent--job-cleanup-pending job)
+                   (not (buffer-live-p (gptel-agent--job-owner job)))))
+      (condition-case err
+          (gptel-agent--process-dispose job)
+        (error (message "Could not clean up %s; retaining its quota: %s"
+                        (gptel-agent--job-id job) (error-message-string err))))))
+  (let* ((now (float-time))
+         (completed (sort (cl-remove-if-not #'gptel-agent--process-evictable-p
+                                           gptel-agent--process-registry)
+                          (lambda (a b) (< (gptel-agent--job-completed-at a)
+                                           (gptel-agent--job-completed-at b)))))
+         (count (cl-count-if #'gptel-agent--job-completed-at
+                             gptel-agent--process-registry)))
+    (dolist (job completed)
+      (when (or (>= (- now (gptel-agent--job-completed-at job))
+                   gptel-agent-process-retention-seconds)
+                (> count gptel-agent-process-completed-limit)
+                (> (+ (length gptel-agent--process-registry) (or reserve 0))
+                   gptel-agent-process-job-limit))
+        (condition-case err
+            (progn (gptel-agent--process-dispose job) (cl-decf count))
+          (error (message "Could not clean up %s; retaining its quota: %s"
+                          (gptel-agent--job-id job) (error-message-string err)))))))
+  (when (and (null gptel-agent--process-registry)
+             gptel-agent--process-retention-timer)
+    (cancel-timer gptel-agent--process-retention-timer)
+    (setq gptel-agent--process-retention-timer nil)))
 
 (defun gptel-agent--process-summary (job)
   "Return JOB's identity, status and execution context."
@@ -109,56 +231,91 @@ Prevent nested pumps: one write's timeout must not unwind another write.")
                       (not (gptel-agent--job-eof job))
                       (not (gptel-agent--job-send job))) "yes" "no"))
      (gptel-agent--job-last-send job)
-     (gptel-agent--job-last-eof job))))
+     (gptel-agent--job-last-eof job)
+     "retention: completed jobs may expire or be evicted by global job retention limits; output tails may be truncated by aggregate output limits.\n")))
 
 (defun gptel-agent--process-dispose (job &optional notify)
   "Kill JOB's live process group and release its output buffer.
-Cancel pending waits, or resolve them before removal when NOTIFY is non-nil."
-  (dolist (waiter (copy-sequence (gptel-agent--job-waiters job)))
-    (gptel-agent--process-finish-wait waiter (and notify "removed")))
-  (when-let* ((send (gptel-agent--job-send job)))
-    (gptel-agent--process-stop-send send "removed" (not notify)))
-  (when-let* ((eof (gptel-agent--job-eof job)))
-    (if notify
-        ;; The pump defers callbacks until any other job's write unwinds.
-        (setf (gptel-agent--process-eof-reason eof) "removed")
-      (gptel-agent--process-finish-eof eof "cancelled" t)))
-  (let ((process (gptel-agent--job-process job)))
-    (when (processp process)
-      ;; Unlike signalling a raw PID, this targets the subprocess group,
-      ;; including ordinary server children of npm/shell wrappers.
-      (when (process-live-p process)
-        (kill-process process))
-      (delete-process process))
-    (when (buffer-live-p (gptel-agent--job-buffer job))
-      (kill-buffer (gptel-agent--job-buffer job)))))
+Cancel pending waits, or resolve them before removal when NOTIFY is non-nil.
+Failed cleanup retains its quota and bounded output filter for later retry."
+  (unless (gptel-agent--job-disposing job)
+    ;; Callbacks and process deletion may reenter.  Keep the reservation until
+    ;; every resource is released, but do not recursively dispose this job.
+    (setf (gptel-agent--job-disposing job) t
+          (gptel-agent--job-cleanup-pending job) t)
+    (unwind-protect
+        (progn
+          (dolist (waiter (copy-sequence (gptel-agent--job-waiters job)))
+            (gptel-agent--process-finish-wait waiter (and notify "removed")))
+          (when-let* ((send (gptel-agent--job-send job)))
+            (gptel-agent--process-stop-send send "removed" (not notify)))
+          (when-let* ((eof (gptel-agent--job-eof job)))
+            (if notify
+                ;; The pump defers callbacks until any other write unwinds.
+                (setf (gptel-agent--process-eof-reason eof) "removed")
+              (gptel-agent--process-finish-eof eof "cancelled" t)))
+          (let ((process (gptel-agent--job-process job)))
+            (when (processp process)
+              ;; Unlike signalling a raw PID, this targets the subprocess
+              ;; group, including ordinary children of shell wrappers.
+              (when (process-live-p process) (kill-process process))
+              (delete-process process)
+              ;; Do not disable the bounded filter until termination succeeds.
+              (set-process-filter process #'ignore)
+              (set-process-sentinel process #'ignore)))
+          (when (buffer-live-p (gptel-agent--job-buffer job))
+            (unless (kill-buffer (gptel-agent--job-buffer job))
+              (error "The managed output buffer could not be released")))
+          (setq gptel-agent--process-registry
+                (delq job gptel-agent--process-registry))
+          (when (buffer-live-p (gptel-agent--job-owner job))
+            (with-current-buffer (gptel-agent--job-owner job)
+              (setq gptel-agent--processes (delq job gptel-agent--processes))))
+          (setf (gptel-agent--job-cleanup-pending job) nil)
+          (when (and (null gptel-agent--process-registry)
+                     gptel-agent--process-retention-timer)
+            (cancel-timer gptel-agent--process-retention-timer)
+            (setq gptel-agent--process-retention-timer nil)))
+      (setf (gptel-agent--job-disposing job) nil))))
 
 (defun gptel-agent--process-cleanup ()
   "Dispose of all jobs owned by the current conversation."
-  (dolist (job gptel-agent--processes)
+  (dolist (job (copy-sequence gptel-agent--processes))
     (condition-case err
         (gptel-agent--process-dispose job)
       (error (message "Could not clean up %s: %s"
-                      (gptel-agent--job-id job) (error-message-string err)))))
-  (setq gptel-agent--processes nil))
+                      (gptel-agent--job-id job) (error-message-string err))))))
 (put 'gptel-agent--process-cleanup 'permanent-local-hook t)
 
 (defun gptel-agent--start-background-process (command)
   "Start COMMAND as a managed job and return its process object.
 Use `gptel-agent--manage-process' to read output or control the job."
-  (unless (and (integerp gptel-agent-process-output-limit)
-               (> gptel-agent-process-output-limit 0))
-    (error "gptel-agent-process-output-limit must be a positive integer"))
+  (dolist (setting '(gptel-agent-process-output-limit
+                     gptel-agent-process-job-limit
+                     gptel-agent-process-completed-limit
+                     gptel-agent-process-total-output-limit))
+    (unless (and (integerp (symbol-value setting)) (> (symbol-value setting) 0))
+      (error "%s must be a positive integer" setting)))
+  (unless (and (numberp gptel-agent-process-retention-seconds)
+               (< 0 gptel-agent-process-retention-seconds most-positive-fixnum))
+    (error "gptel-agent-process-retention-seconds must be finite and positive"))
+  (gptel-agent--process-prune 1)
+  (when (>= (length gptel-agent--process-registry) gptel-agent-process-job-limit)
+    (error "Background job quota reached (%d); running jobs and pending actions are protected. Kill/remove a job before starting another"
+           gptel-agent-process-job-limit))
   (let* ((owner (gptel-agent--process-owner))
          (job (gptel-agent--make-job
                :id (format "bash-%d" (cl-incf gptel-agent--process-counter))
                :command command :directory default-directory
+               :owner owner
                :started-at (format-time-string "%FT%T%z")
                :limit gptel-agent-process-output-limit
                :buffer (generate-new-buffer " *gptel-agent-process*")))
          process)
     (with-current-buffer (gptel-agent--job-buffer job)
       (buffer-disable-undo))
+    ;; Reserve the slot before launch; failure releases it through disposal.
+    (push job gptel-agent--process-registry)
     (condition-case err
         (progn
           (setq process
@@ -182,6 +339,10 @@ Use `gptel-agent--manage-process' to read output or control the job."
           (with-current-buffer owner
             (push job gptel-agent--processes)
             (add-hook 'kill-buffer-hook #'gptel-agent--process-cleanup nil t))
+          (unless gptel-agent--process-retention-timer
+            (let ((interval (min 60 gptel-agent-process-retention-seconds)))
+              (setq gptel-agent--process-retention-timer
+                    (run-at-time interval interval #'gptel-agent--process-prune))))
           process)
       (error
        (gptel-agent--process-dispose job)
@@ -283,7 +444,10 @@ Offsets count decoded characters."
     (when-let* ((send (gptel-agent--job-send job)))
       (gptel-agent--process-stop-send send "exit"))
     (dolist (waiter (copy-sequence (gptel-agent--job-waiters job)))
-      (gptel-agent--process-finish-wait waiter "exit"))))
+      (gptel-agent--process-finish-wait waiter "exit"))
+    (unless (gptel-agent--job-completed-at job)
+      (setf (gptel-agent--job-completed-at job) (float-time)))
+    (gptel-agent--process-prune)))
 
 (defun gptel-agent--process-finish-send (send reason)
   "Resolve SEND once with REASON, after its active write has unwound."
@@ -623,7 +787,7 @@ Report operation errors through CALLBACK so the model can correct its call."
                               (cl-find process-id gptel-agent--processes
                                        :key #'gptel-agent--job-id :test #'equal))))
                    (unless job
-                     (error "Unknown process_id in this session: %s" process-id))
+                     (error "Unknown process_id in this session: %s (completed jobs may expire or be evicted by retention limits)" process-id))
                    (pcase action
                      ("send"
                       (gptel-agent--process-send-input callback job input timeout-ms fsm))
@@ -650,7 +814,7 @@ Use `gptel-agent--process-tool' for wait/send/eof completion callbacks."
       (let ((job (with-current-buffer (gptel-agent--process-owner)
                    (cl-find process-id gptel-agent--processes
                             :key #'gptel-agent--job-id :test #'equal))))
-        (unless job (error "Unknown process_id in this session: %s" process-id))
+        (unless job (error "Unknown process_id in this session: %s (completed jobs may expire or be evicted by retention limits)" process-id))
         (if (equal action "send")
             (gptel-agent--process-send-input #'ignore job input nil nil)
           (when (or input offset max-chars view)
@@ -670,7 +834,7 @@ Use `gptel-agent--process-tool' for wait/send/eof completion callbacks."
                              :key #'gptel-agent--job-id :test #'equal))
                (process (and job (gptel-agent--job-process job))))
           (unless job
-            (error "Unknown process_id in this session: %s" process-id))
+            (error "Unknown process_id in this session: %s (completed jobs may expire or be evicted by retention limits)" process-id))
           (pcase action
             ("read" (gptel-agent--process-read job offset max-chars view))
             ("remove"

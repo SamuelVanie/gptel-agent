@@ -17,7 +17,9 @@
   (declare (indent 1))
   `(let ((,source (generate-new-buffer " *bash-test*"))
          (,directory (make-temp-file "gptel-bash-test-" t))
-         (gptel-agent--saved-tool-results (make-hash-table :test #'equal)))
+         (gptel-agent--saved-tool-results (make-hash-table :test #'equal))
+         (gptel-agent--result-resources (make-hash-table :test #'equal))
+         (gptel-agent--results-timer nil))
      (unwind-protect
          (cl-letf (((symbol-function 'gptel-agent--tool-results-directory)
                     (lambda () ,directory)))
@@ -74,15 +76,20 @@
         (should (equal (gptel-agent-bash-test--read file)
                        (concat (make-string (1- 1048576) ?\s) "x"
                                (make-string (1- 1048576) ?\s) "y\nfinished\n")))
-        (should (equal (gethash file gptel-agent--saved-tool-results)
-                       (list :query "Find the completion marker" :tool "bash"
-                             :chars (+ (* 2 1024 1024) 10) :lines 3)))
+        (let ((metadata (gethash file gptel-agent--saved-tool-results)))
+          (should (equal (plist-get metadata :query) "Find the completion marker"))
+          (should (equal (plist-get metadata :tool) "bash"))
+          (should (= (plist-get metadata :chars) (+ (* 2 1024 1024) 10)))
+          (should (= (plist-get metadata :lines) 3))
+          (should (eq (plist-get metadata :owner) source))
+          (should-not (plist-get metadata :truncated)))
         (should-not (buffer-live-p output))
         (should-not gptel-agent--bash-jobs)
         (gptel-agent--bash-finish job process)
         (should (= (length results) 1))
         (kill-buffer source)
-        (should (file-exists-p file))))))
+        (should-not (file-exists-p file))
+        (should-not (gethash file gptel-agent--saved-tool-results))))))
 
 (ert-deftest gptel-agent-bash-small-output-preserves-success-and-failure ()
   (dolist (case '(("true" "")
@@ -264,20 +271,20 @@
       (should-not results))))
 
 (ert-deftest gptel-agent-bash-disk-errors-finish-once-and-clean-up ()
-  (dolist (fail-on-append '(nil t))
+  (dolist (fail-on-write '(1 2))
     (gptel-agent-bash-test--with-session (source directory)
       (let* ((gptel-agent-tool-result-max-chars 5)
-             (write (symbol-function 'write-region)) results
+             (write (symbol-function 'write-region)) (writes 0) results
              (process (gptel-agent--execute-bash
                        (lambda (result) (push result results))
-                       (concat "printf 'long output'; "
+                       (concat "printf 'long output'; sleep 0.1; printf 'second chunk'; "
                                (gptel-agent-bash-test--gate directory "continue"))
                        "Read output"))
              (output (process-buffer process)))
         (cl-letf (((symbol-function 'write-region)
                    (lambda (start end filename &optional append &rest args)
                      (if (and (string-prefix-p directory filename)
-                              (eq (not (null append)) fail-on-append))
+                              (= (cl-incf writes) fail-on-write))
                          (signal 'file-error '("Simulated full disk"))
                        (apply write start end filename append args)))))
           (gptel-agent-bash-test--wait (lambda () results)))
@@ -301,5 +308,130 @@
       (should-not gptel-agent--bash-jobs)
       (should (equal buffers (buffer-list)))
       (should-not (directory-files directory nil directory-files-no-dot-files-regexp)))))
+
+(ert-deftest gptel-agent-bash-retention-bounds-live-utf8-log-and-reports-coverage ()
+  (gptel-agent-bash-test--with-session (source directory)
+    (let* ((gptel-agent-tool-result-max-chars 3)
+           (gptel-agent-tool-result-preview-chars 2000)
+           (gptel-agent-result-file-limit 7)
+           results
+           (process (gptel-agent--execute-bash
+                     (lambda (result) (push result results))
+                     (concat "printf 'é猫ABCD'; "
+                             (gptel-agent-bash-test--gate directory "next")
+                             "; printf 'later evidence'")
+                     "Find evidence"))
+           (job (process-get process 'gptel-agent-bash)))
+      (gptel-agent-bash-test--wait (lambda () (gptel-agent--bash-file job)))
+      (let ((file (gptel-agent--bash-file job)))
+        (should (process-live-p process))
+        (should (= (file-attribute-size (file-attributes file)) 7))
+        (should (equal (gptel-agent-bash-test--read file) "é猫AB"))
+        (gptel-agent-bash-test--release directory "next")
+        (gptel-agent-bash-test--wait (lambda () results))
+        (should (= (length results) 1))
+        (should (string-match-p "Partial result:" (car results)))
+        (should-not (string-match-p "Full result:" (car results)))
+        (should (string-match-p "storage limits" (car results)))
+        (should (equal (gptel-agent-bash-test--read file) "é猫AB"))
+        (should (string-match-p "incomplete" (gptel-agent--result-explorer-task-prompt file "Find evidence")))
+        (let ((gptel-agent--current-agent "result-explorer")
+              (gptel-agent--result-file-scope file))
+          (should (string-match-p "incomplete" (gptel-agent--read-scoped-result 1 1))))))))
+
+(ert-deftest gptel-agent-bash-retention-full-slots-fail-once-with-preview ()
+  (gptel-agent-bash-test--with-session (source directory)
+    (let* ((gptel-agent-tool-result-max-chars 10)
+           (gptel-agent-result-count-limit 0)
+           results
+           (process (gptel-agent--execute-bash
+                     (lambda (result) (push result results))
+                     (concat "printf kept; "
+                             (gptel-agent-bash-test--gate directory "next")
+                             "; printf 'enough output to require a log'; sleep 10")
+                     "Find evidence"))
+           (job (process-get process 'gptel-agent-bash)))
+      (gptel-agent-bash-test--wait (lambda () (= (gptel-agent--bash-chars job) 4)))
+      (gptel-agent-bash-test--release directory "next")
+      (gptel-agent-bash-test--wait (lambda () results))
+      (should (= (length results) 1))
+      (should (string-match-p "quota is full" (car results)))
+      (should (string-match-p "Retained preview:\nkept" (car results)))
+      (should-not (process-live-p process))
+      (should-not (gptel-agent--bash-fsm job))
+      (should-not (gptel-agent--bash-callback job))
+      (should (zerop (hash-table-count gptel-agent--result-resources))))))
+
+(ert-deftest gptel-agent-result-contract-inherits-family-owner-and-expires ()
+  (gptel-agent-bash-test--with-session (source directory)
+    (let ((child (generate-new-buffer " *result-descendant*"))
+          (other (generate-new-buffer " *result-unrelated*")) file)
+      (unwind-protect
+          (progn
+            (gptel-agent--child-buffer-created source child 'discussion)
+            (with-current-buffer child
+              (text-mode)
+              (with-temp-buffer
+                (insert "family evidence")
+                (setq file (gptel-agent--save-tool-result "test" "Find evidence" child))))
+            (should-not (gptel-agent--result-explorer-contract-error file "Find evidence" source))
+            (should-not (gptel-agent--result-explorer-contract-error file "Find evidence" child))
+            (should (string-match-p "different" (gptel-agent--result-explorer-contract-error file "Find evidence" other)))
+            (kill-buffer child)
+            (should (file-exists-p file))
+            (setf (plist-get (gptel-agent--result-resource file) :access) 0)
+            (should (string-match-p "expired" (gptel-agent--result-explorer-contract-error file "Find evidence" source)))
+            (should-not (file-exists-p file))
+            (should-not (gethash file gptel-agent--saved-tool-results)))
+        (when (buffer-live-p child) (kill-buffer child))
+        (kill-buffer other)))))
+
+
+(ert-deftest gptel-agent-bash-retention-first-chunk-and-finish-errors-keep-preview ()
+  (gptel-agent-bash-test--with-session (source directory)
+    (let ((gptel-agent-result-count-limit 0)
+          (gptel-agent-tool-result-max-chars 10))
+      (dolist (command '("printf important-evidence" "printf short; exit 1"))
+        (let (results)
+          (gptel-agent--execute-bash (lambda (value) (push value results)) command "Find evidence")
+          (gptel-agent-bash-test--wait (lambda () results))
+          (should (= (length results) 1))
+          (should (string-match-p "quota is full" (car results)))
+          (should (string-match-p (if (string-match-p "short" command)
+                                     "Retained preview:\nshort"
+                                   "Retained preview:\nimportant-evidence")
+                                 (car results))))))))
+
+(ert-deftest gptel-agent-bash-retention-missing-output-buffer-still-finishes-once ()
+  (gptel-agent-bash-test--with-session (source directory)
+    (let* ((output (generate-new-buffer " *lost-output*")) results
+           (job (gptel-agent--make-bash :source source :buffer output
+                                       :callback (lambda (value) (push value results))
+                                       :limit 10 :preview-chars 20 :preview-lines 2)))
+      (kill-buffer output)
+      (gptel-agent--bash-filter job nil "last evidence")
+      (gptel-agent--bash-filter job nil "late delivery")
+      (should (= (length results) 1))
+      (should (gptel-agent--bash-done job))
+      (should (string-match-p "Could not capture Bash output" (car results)))
+      (should (string-match-p "last evidence" (car results))))))
+
+(ert-deftest gptel-agent-result-contract-rejects-nil-owners-of-pinned-files ()
+  (gptel-agent-bash-test--with-session (source directory)
+    (let ((child (generate-new-buffer " *orphan-result-descendant*")) file)
+      (unwind-protect
+          (progn
+            (gptel-agent--child-buffer-created source child 'discussion)
+            (with-temp-buffer
+              (insert "evidence")
+              (setq file (gptel-agent--save-tool-result "test" "Find evidence" source)))
+            (gptel-agent--result-pin file child)
+            (kill-buffer source)
+            (should (file-exists-p file))
+            (should-not (plist-get (gethash file gptel-agent--saved-tool-results) :owner))
+            (should (string-match-p "closed conversation"
+                                    (gptel-agent--result-explorer-contract-error file "Find evidence" child))))
+        (kill-buffer child))
+      (should-not (file-exists-p file)))))
 
 ;;; gptel-agent-bash-test.el ends here

@@ -17,19 +17,26 @@
 
 (cl-defmacro gptel-agent-read-test--with-file ((file source text) &body body)
   (declare (indent 1))
-  `(let ((,file (make-temp-file "gptel-read-"))
-         (,source (generate-new-buffer " *gptel-read-test*"))
-         (gptel-agent--saved-tool-results (make-hash-table :test #'equal)))
+  `(let* ((directory (make-temp-file "gptel-read-results-" t))
+          (temporary-file-directory (file-name-as-directory directory))
+          (gptel-agent--tool-results-storage nil)
+          (gptel-agent--saved-tool-results (make-hash-table :test #'equal))
+          (gptel-agent--result-resources (make-hash-table :test #'equal))
+          (gptel-agent--results-timer nil)
+          (,source (generate-new-buffer " *gptel-read-test*"))
+          ,file)
      (unwind-protect
          (progn
-           (let ((coding-system-for-write 'utf-8-unix)) (write-region ,text nil ,file nil 'silent))
-           (puthash ,file '(:query "Find evidence") gptel-agent--saved-tool-results)
+           (with-temp-buffer
+             (insert ,text)
+             (setq ,file (gptel-agent--save-tool-result "read" "Find evidence" ,source)))
            (with-current-buffer ,source
              (setq-local gptel-agent--current-agent "result-explorer"
                          gptel-agent--result-file-scope ,file)
              ,@body))
        (when (buffer-live-p ,source) (kill-buffer ,source))
-       (delete-file ,file))))
+       (gptel-agent--results-exit-cleanup)
+       (delete-directory directory t))))
 
 (defun gptel-agent-read-test--search (backend regex &optional sensitive max-results offset)
   "Run one search, forcing BACKEND, and verify retained state while it runs."

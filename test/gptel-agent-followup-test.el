@@ -209,16 +209,17 @@
 
 (ert-deftest gptel-agent-followup-keeps-result-explorer-scope ()
   (gptel-agent-followup-test--with-chat
-    (let ((first-file (make-temp-file "agent-scope-" nil nil "First evidence"))
-          (second-file (make-temp-file "agent-scope-" nil nil "Other evidence"))
-          (gptel-agent--saved-tool-results (make-hash-table :test #'equal))
+    (let ((first-file (with-temp-buffer
+                        (insert "First evidence")
+                        (gptel-agent--save-tool-result "scope" "Find evidence" parent)))
+          (second-file (with-temp-buffer
+                         (insert "Other evidence")
+                         (gptel-agent--save-tool-result "scope" "Find evidence" parent)))
           (query "Find evidence"))
       (unwind-protect
           (progn
             (setq snapshot '(("result-explorer" :system "Extract evidence"
                               :tools ("ResultRead" "ResultGrep"))))
-            (dolist (file (list first-file second-file))
-              (puthash file (list :query query) gptel-agent--saved-tool-results))
             (gptel-agent--task deliver "result-explorer" "Extract" "Ignored"
                                parent-fsm snapshot first-file query)
             (let* ((fsm (car requests))
@@ -235,8 +236,8 @@
               (should (equal (buffer-local-value 'gptel-agent--result-file-scope
                                                  (gptel-agent--run-child-buffer run))
                              first-file))))
-        (delete-file first-file)
-        (delete-file second-file)))))
+        (gptel-agent--result-forget first-file)
+        (gptel-agent--result-forget second-file)))))
 
 (ert-deftest gptel-agent-parent-close-removes-completed-failed-and-nested-chats ()
   (gptel-agent-followup-test--with-chat
@@ -292,5 +293,35 @@
           (should (string-match-p "Final answer" (prin1-to-string (elt messages 1))))
           (should-not (string-match-p "Earlier commentary" (prin1-to-string messages))))))))
 
+(ert-deftest gptel-agent-result-run-pins-release-on-completion-and-cancellation ()
+  (let ((gptel-agent--saved-tool-results (make-hash-table :test #'equal))
+        (gptel-agent--result-resources (make-hash-table :test #'equal))
+        (gptel-agent--results-timer nil))
+    (gptel-agent-followup-test--with-chat
+      (let ((file (with-temp-buffer
+                    (insert "evidence")
+                    (gptel-agent--save-tool-result "test" "Find evidence" parent))))
+        (setq snapshot '(("result-explorer" :system "Extract evidence"
+                          :tools ("ResultRead" "ResultGrep"))))
+        (dolist (state '(completed cancelled))
+          (gptel-agent--task deliver "result-explorer" "Extract" "Ignored"
+                             parent-fsm snapshot file "Find evidence")
+          (let* ((fsm (car requests))
+                 (run (plist-get (gptel-fsm-info fsm) :context))
+                 (child (gptel-agent--run-child-buffer run))
+                 (entry (gptel-agent--result-resource file)))
+            (should (memq child (plist-get entry :pins)))
+            (setf (plist-get entry :access) 0)
+            (gptel-agent--results-prune)
+            (should (file-exists-p file))
+            (if (eq state 'completed)
+                (gptel-agent-followup-test--finish fsm "Found evidence")
+              (gptel-agent--run-finish run 'cancelled "Cancelled"))
+            (should-not (plist-get entry :pins))
+            ;; Retained transcripts and request metadata do not pin storage.
+            (should (buffer-live-p child))))
+        (setf (plist-get (gptel-agent--result-resource file) :access) 0)
+        (gptel-agent--results-prune)
+        (should-not (file-exists-p file))))))
 (provide 'gptel-agent-followup-test)
 ;;; gptel-agent-followup-test.el ends here
