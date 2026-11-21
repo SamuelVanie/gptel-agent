@@ -4,6 +4,10 @@
 
 ** Compatibility fixes
 
+- Non-ASCII paths in rewritten tool calls no longer fail with
+  ~wrong-type-argument json-value-p~ when an agent continues after approval.
+  Embedded OpenAI tool arguments are decoded from UTF-8 before sending.
+
 - Concurrent sub-agent tool approvals now have independent insertion markers
   and preview regions. Approving a worker no longer merges prompts with the
   main agent or disturbs its response text and prefixes. Task cards remain at

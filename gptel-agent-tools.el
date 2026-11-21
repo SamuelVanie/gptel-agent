@@ -2346,6 +2346,25 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
     (gptel-agent--run-finish
      run 'cancelled "Error: Owning request stopped." 'parent-stopped t)))
 
+(defun gptel-agent--workers-decode-tool-arguments (data)
+  "Keep embedded tool argument JSON in DATA as text before sending it.
+Some gptel tool-call rewrites store `json-serialize' output directly in
+OpenAI argument fields.  That output is unibyte UTF-8, which the enclosing
+request's serializer rejects when it contains non-ASCII bytes.  Decode only
+those fields; tool inputs for other backends and signed reasoning are left
+alone."
+  (let (calls)
+    (seq-doseq (message (plist-get data :messages))
+      (seq-doseq (call (plist-get message :tool_calls))
+        (push (plist-get call :function) calls)))
+    (seq-doseq (item (plist-get data :input))
+      (when (equal (plist-get item :type) "function_call")
+        (push item calls)))
+    (dolist (call calls)
+      (let ((args (plist-get call :arguments)))
+        (when (and (stringp args) (not (multibyte-string-p args)))
+          (plist-put call :arguments (decode-coding-string args 'utf-8 t)))))))
+
 (defun gptel-agent--workers-dispatch (gate state)
   "Run request-local handlers for STATE, enforcing GATE's lifecycle."
   (unless (gptel-agent--workers-closed gate)
@@ -2365,6 +2384,7 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
                  (gptel-agent--workers-wrap-callback gate)
                  (gptel-agent--workers-inject gate)
                  (let ((data (plist-get info :data)))
+                   (gptel-agent--workers-decode-tool-arguments data)
                    (plist-put info :agent-tool-prompt-count
                               (length (or (plist-get data :messages)
                                           (plist-get data :contents)
