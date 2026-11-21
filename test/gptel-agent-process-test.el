@@ -546,7 +546,7 @@
       (should-not completed)
       (apply (gptel-tool-function tool) (lambda (result) (push result results))
              (gptel--map-tool-args tool (list :action "send" :process_id id :input "go\n")))
-      (should (= (length results) 3))
+      (gptel-agent-process-test--wait (lambda () (= (length results) 3)))
       (gptel-agent-process-test--wait (lambda () completed))
       (should (string-suffix-p "done" completed))
       (should (string-match-p "wait_reason: exit" completed)))))

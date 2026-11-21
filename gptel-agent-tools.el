@@ -4406,7 +4406,7 @@ conversation buffer kills its jobs and releases their output.
 
 Actions: list shows running and completed jobs with commands and status; read \
 returns available stdout+stderr without waiting; wait waits until exit or its \
-deadline and returns status plus output; send writes input verbatim \
+deadline and returns status plus output; send asynchronously writes UTF-8 input \
 (include a newline when needed); interrupt sends SIGINT to the process group; \
 kill sends SIGKILL to the process group; remove forgets a completed job and \
 its retained output. Use interrupt for a graceful stop, then kill if needed.
@@ -4426,6 +4426,19 @@ timeout leaves the job running. Wait defaults \
 to view=tail (or unread if offset is supplied). Use timeout_ms=0 for an immediate \
 snapshot. Servers and watchers may never exit; use read to inspect their output. \
 A running process with no output is not finished.
+
+send preserves input and order, including newlines; it does not append anything. \
+Only one send per job may be pending (default limit 1 MiB). timeout_ms bounds \
+writing (default 5000, maximum 60000), including time waiting for another \
+job's active write; that write can delay this send's callback past its deadline. \
+send_reason=sent means the pipe accepted all bytes, not that the program consumed \
+or executed them. \
+written_bytes_min/max describe the accepted prefix; unequal values mean an \
+interrupted chunk has uncertain delivery. Such interruption disables further \
+input: Emacs may retain an unsent suffix, which is not flushed automatically. \
+Start a new job for more input; do not blindly repeat partial commands. \
+Cancellation drops unattempted input but cannot retract bytes already accepted. \
+Send requires a local POSIX job; read/control remain available otherwise.
 These are pipes, not an interactive terminal. Do not daemonize jobs or use \
 shell job control: detached children cannot be managed as part of the group."
  :args '((:name "action" :type string
@@ -4434,7 +4447,7 @@ shell job control: detached children cannot be managed as part of the group."
          (:name "process_id" :type string :optional t
           :description "ID returned by Bash or Process list. Required except for list; never an OS PID.")
          (:name "input" :type string :optional t
-          :description "For send: exact input to write, including any required newline.")
+          :description "For send: exact text to encode as UTF-8, including any required newline (default maximum 1 MiB).")
          (:name "offset" :type integer :optional t :minimum 0
           :description "For read/wait: absolute character offset for replay without moving the cursor. Omit this argument entirely for view=tail; even offset=0 cannot be combined with tail.")
          (:name "max_chars" :type integer :optional t :minimum 1 :maximum 20000
@@ -4444,7 +4457,7 @@ shell job control: detached children cannot be managed as part of the group."
          (:name "until" :type string :optional t :enum ["exit"]
           :description "For wait: wait for process termination (default exit), not merely new output.")
          (:name "timeout_ms" :type integer :optional t :minimum 0 :maximum 60000
-          :description "For wait: maximum milliseconds to wait (default 30000). Zero returns immediately. Timeout does not stop the job."))
+          :description "For wait/send: deadline in milliseconds (wait default 30000, send default 5000). With zero, wait returns a snapshot and send writes nothing. Timeout does not stop the job."))
  :category "gptel-agent"
  :confirm (lambda (action &rest _) (equal action "send"))
  :include t

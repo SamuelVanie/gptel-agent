@@ -767,6 +767,37 @@ stopping jobs owned by a surviving conversation.
 Invalid arguments return a tool error so the agent can correct the call
 without aborting the request or stopping the job.
 
+=send= queues UTF-8 input without adding or changing newlines. It returns
+asynchronously, so other tools can run while input is pending. Each job allows
+one pending send, capped by =gptel-agent-process-input-limit= (default 1048576
+bytes); overlapping or oversized sends are rejected before writing. The
+=timeout_ms= total deadline defaults to 5000 (maximum 60000); zero writes
+nothing. A blocked write services timers and subprocess output until that
+deadline or cancellation. Pipe writes are serialized across jobs to prevent
+one write's cancellation from unwinding another; time waiting for that turn
+counts toward the total deadline. A queued send's callback can arrive after
+its deadline if another write is still active, but it will not write after
+its deadline. Other tools can still progress. Sends require local
+POSIX pipes; remote and Windows jobs still support the other actions.
+
+Results report =send_reason= (=sent=, =timeout=, =exit= or
+=error=), =input_bytes=, =written_bytes_min= and =written_bytes_max=.
+Successful sends have equal counts: all bytes were accepted by the pipe,
+which does not prove the program consumed or executed them. If a write is
+interrupted, the counts bound its possibly delivered prefix. The unattempted
+remainder is discarded, but Emacs can retain an opaque suffix of that one
+chunk. It does not flush that suffix automatically. Further sends are
+permanently disabled for that job to prevent accidental delivery of retained
+bytes. Start a new job for further input; inspect effects before repeating a
+partially delivered command. Read, interrupt and kill remain available.
+
+Request cancellation or destruction of the calling buffer drops pending
+input and suppresses its obsolete callback. It cannot retract accepted bytes;
+an active write is unwound by its watchdog, with the same uncertainty and
+input-disable rule. The job survives if its owning conversation survives.
+Its latest send outcome (including cancellation) is available through
+=Process list/read=. Cancelling a send before any write leaves input usable.
+
 Each job retains the most recent =gptel-agent-process-output-limit= characters
 (default 200000). Older output is discarded and a read reports any missing
 range. Redirect output to a file in the command if you need a complete durable

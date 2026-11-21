@@ -208,8 +208,8 @@ When EDITED-ARGS is supplied, edit the actual inspection buffer before Confirm."
                            (list :action "send" :process_id (gptel-agent--job-id job)
                                  :input "confirmed\n"))))
             (gptel-agent-approval-test--confirm request parent inspect)
-            (should (string-prefix-p "Action send sent."
-                                     (gptel-agent-approval-test--result request)))
+            (should (string-match-p "send_reason: sent\n"
+                                    (gptel-agent-approval-test--result request)))
             (gptel-agent-approval-test--wait (lambda () (not (process-live-p process))))
             (should (equal (with-current-buffer (process-buffer process) (buffer-string))
                            "confirmed"))))))))
