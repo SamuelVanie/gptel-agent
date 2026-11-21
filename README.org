@@ -702,6 +702,13 @@ cannot leave the agent waiting indefinitely. Pipes, file redirection and
 heredocs inside the command still work. Use a background job and =Process=
 =send= for commands that need interactive input. Invalid Bash arguments and
 process launch failures return tool errors so the agent can correct its call.
+
+Approving =Bash= or =Process= from another buffer, including Inspect, uses the
+requesting conversation's execution context. The Bash approval preview shows
+that conversation's directory. If the directory or its symlink target changes
+after the preview, execution returns a tool error; submit a fresh Bash call
+to use the new directory.
+
 Set =background= to =true= for servers, watchers or jobs the agent can work
 alongside. It immediately returns a =process_id=,
 leaving the agent free to run other commands and inspect output later:

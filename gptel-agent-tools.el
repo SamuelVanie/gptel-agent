@@ -647,17 +647,61 @@ ARG-VALUES is the list of arguments for the tool call."
      inner-from (1- (point)) 'font-lock-face (gptel-agent--block-bg))
     (gptel-agent--confirm-overlay from (point) t)))
 
-(defun gptel-agent--execute-bash-preview-setup (arg-values _info)
+(defun gptel-agent--bash-preview-calls (info arg-values)
+  "Return unfinished Bash calls in INFO with ARG-VALUES.
+Use the call objects themselves so preview context survives inspection edits
+and shallow copies of the request's display info."
+  (cl-remove-if-not
+   (lambda (call)
+     (and (equal (plist-get call :name) "Bash")
+          (not (plist-get call :result))
+          (let ((args (plist-get call :args)))
+            (equal arg-values (list (plist-get args :command)
+                                    (plist-get args :query)
+                                    (plist-get args :background))))))
+   (plist-get info :tool-use)))
+
+(defun gptel-agent--bash-directory-unchanged-p (directory)
+  "Whether DIRECTORY's displayed path and canonical target are still current."
+  (and (equal (car directory) default-directory)
+       (condition-case nil
+           (equal (cdr directory) (file-truename default-directory))
+         (file-error nil))))
+
+(defun gptel-agent--execute-bash-preview-setup (arg-values info)
   "Setup preview overlay for Bash command execution tool call.
 
-ARG-VALUES is the list of arguments for the tool call."
-  (let ((command (car arg-values))
-        (from (point)) (inner-from))
+ARG-VALUES is the list of arguments for the tool call.  INFO identifies the
+request owner, which may differ from the buffer displaying the approval."
+  (let* ((command (car arg-values))
+         (owner (plist-get info :buffer))
+         (calls (gptel-agent--bash-preview-calls info arg-values))
+         (directory
+          (or (plist-get (car calls) :agent-bash-directory)
+              (when (buffer-live-p owner)
+                (with-current-buffer owner
+                  (cons default-directory
+                        (condition-case nil (file-truename default-directory)
+                          (file-error nil)))))))
+         (unchanged (and (buffer-live-p owner)
+                         (with-current-buffer owner
+                           (gptel-agent--bash-directory-unchanged-p directory))))
+         (from (point)) (inner-from))
+    ;; Keep the first displayed context until this call finishes, including
+    ;; when Inspect edits its arguments.  New calls get their own snapshot.
+    (dolist (call calls)
+      (unless (plist-member call :agent-bash-directory)
+        (plist-put call :agent-bash-directory directory)))
     (insert
      "(" (propertize "Bash" 'font-lock-face 'font-lock-keyword-face)
-     " in " (propertize (abbreviate-file-name default-directory)
+     " in " (propertize (if directory (abbreviate-file-name (car directory))
+                          "unavailable request buffer")
                         'font-lock-face 'font-lock-string-face)
      (if (eq (nth 2 arg-values) t) " background)\n" ")\n"))
+    (unless unchanged
+      (insert (if (buffer-live-p owner)
+                  "Working directory changed or is unavailable; submit a fresh Bash call.\n"
+                "Request buffer is no longer live; this call cannot execute.\n")))
     (setq inner-from (point))
     (insert command)
     (gptel-agent--fontify-block 'sh-mode inner-from (point))
@@ -4737,17 +4781,32 @@ IGNORE-SELECTION ignores the conversation's interactive selection."
    "\n</available_agents>"))
 
 (defun gptel-agent--localize-agent-tool (fsm)
-  "Replace Agent in the current prompt buffer with an FSM-owned clone.
+  "Give agent tools in the current prompt buffer FSM-owned dispatchers.
 
-The clone captures FSM and a snapshot of the allowed agent registry.  Its
+The Agent clone captures FSM and the allowed agent registry.  Its
 schema and dispatcher therefore cannot change when another project updates
-the global registry while this request is in flight."
+the global registry while this request is in flight.  Bash and Process enter
+FSM's live request buffer even when confirmed from another buffer."
   (gptel-agent--localize-ask-tool fsm)
   (when-let* ((base-tool (gptel-agent--find-builtin-tool "Bash" gptel-tools)))
     (let ((tool (gptel--copy-tool base-tool)))
       (setf (gptel-tool-function tool)
             (lambda (callback command query &optional background)
-              (gptel-agent--execute-bash callback command query background fsm)))
+              (let* ((info (gptel-fsm-info fsm))
+                     (owner (plist-get info :buffer)))
+                (if (not (buffer-live-p owner))
+                    (funcall callback "Error: Bash request buffer is no longer live.")
+                  (with-current-buffer owner
+                    ;; Approval UI buffers are temporary.  Both launch context
+                    ;; and lifecycle hooks must belong to the actual requester.
+                    (if (cl-some
+                         (lambda (call)
+                           (when-let* ((directory (plist-get call :agent-bash-directory)))
+                             (not (gptel-agent--bash-directory-unchanged-p directory))))
+                         (gptel-agent--bash-preview-calls info (list command query background)))
+                        (funcall callback
+                                 "Error: Bash working directory changed since its approval preview. Submit a fresh Bash call for the current directory.")
+                      (gptel-agent--execute-bash callback command query background fsm)))))))
       (setq-local gptel-tools
                   (mapcar (lambda (candidate)
                             (if (eq candidate base-tool) tool candidate))
@@ -4760,8 +4819,12 @@ the global registry while this request is in flight."
       (setf (gptel-tool-function tool)
             (lambda (callback action &optional process-id input offset max-chars
                               view until timeout-ms)
-              (gptel-agent--process-tool
-               callback action process-id input offset max-chars view until timeout-ms fsm)))
+              (let ((owner (plist-get (gptel-fsm-info fsm) :buffer)))
+                (if (not (buffer-live-p owner))
+                    (funcall callback "Error: Process request buffer is no longer live.")
+                  (with-current-buffer owner
+                    (gptel-agent--process-tool
+                     callback action process-id input offset max-chars view until timeout-ms fsm))))))
       (setq-local gptel-tools
                   (mapcar (lambda (candidate)
                             (if (eq candidate base-tool) tool candidate))
