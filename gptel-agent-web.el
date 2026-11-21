@@ -251,8 +251,8 @@ Oversized responses fail explicitly instead of parsing a partial document."
       (error "WebFetch target denied by tool policy"))
     (gptel-agent--web-launch
      job
-     (append (list curl "--disable" "--silent" "--show-error")
-             (if check '("--globoff") '("--location" "--max-redirs" "5"))
+     (append (list curl "--disable" "--silent" "--show-error" "--globoff")
+             (unless check '("--location" "--max-redirs" "5"))
              (list "--proto" "=http,https" "--proto-redir" "=http,https"
                    "--compressed" "--max-time" (number-to-string (gptel-agent--web-job-timeout job))
                    "--max-filesize" (number-to-string (gptel-agent--web-job-max-bytes job))
