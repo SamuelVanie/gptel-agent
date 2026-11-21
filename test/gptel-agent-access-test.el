@@ -295,6 +295,34 @@
        (should-not (file-exists-p (concat root "new.txt")))
        (should-not (file-exists-p (concat back "other.txt")))))))
 
+(ert-deftest gptel-agent-access-symlink-deletion-requires-unchanged-approval ()
+  (dolist (retarget '(nil t))
+    (gptel-agent-access-test--with-project
+      (with-current-buffer parent (setq gptel-agent-use-project-instructions nil))
+      (let ((target (concat back "target")) (other (concat back "other"))
+            (alias (concat front "alias")))
+        (gptel-agent-instructions-test--write target "original\n")
+        (gptel-agent-instructions-test--write other "original\n")
+        (make-symbolic-link target alias)
+        (setq fsm (gptel-agent-instructions-test--request parent))
+        (let ((pending (gptel-agent-access-test--ask
+                        fsm "Edit" '(:mode "patch" :file_path "alias"
+                                     :new_str "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-original\n"))))
+          (should pending)
+          (should (file-exists-p target))
+          (when retarget
+            (delete-file alias)
+            (make-symbolic-link other alias))
+          (gptel--accept-tool-calls pending)
+          (if retarget
+              (progn
+                (should (file-exists-p target))
+                (should (string-match-p "target changed"
+                                        (gptel-agent-instructions-test--payload fsm))))
+            (should-not (file-exists-p target)))
+          (should (file-exists-p other))
+          (should (equal (file-symlink-p alias) (if retarget other target))))))))
+
 (ert-deftest gptel-agent-access-async-searches-ask-and-complete ()
   (dolist (name '("Glob" "Grep"))
     (gptel-agent-access-test--with-project

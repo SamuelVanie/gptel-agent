@@ -473,6 +473,30 @@ diff --git a/sub/two b/sub/two
       (should (file-symlink-p "alias"))
       (should (equal (gptel-edit-test--read "one") "final\n")))))
 
+(ert-deftest gptel-edit-directory-patch-coalesces-symlink-aliases ()
+  (gptel-edit-test--with-files '(("one" . "old\n"))
+    (make-symbolic-link "one" "alias")
+    (let ((changes (gptel-agent-edit-prepare
+                    "Edit" '(:mode "patch" :root_directory "."
+                             :new_str "--- a/alias\n+++ b/alias\n@@ -1 +1 @@\n-old\n+next\n--- a/one\n+++ b/one\n@@ -1 +1 @@\n-next\n+final\n"))))
+      (should (= (length changes) 1))
+      (gptel-agent-edit-apply changes)
+      (should (equal (file-symlink-p "alias") "one"))
+      (should (equal (gptel-edit-test--read "one") "final\n")))))
+
+(ert-deftest gptel-edit-prepared-symlink-deletion-keeps-original-target ()
+  (gptel-edit-test--with-files '(("target" . "original\n") ("other" . "original\n"))
+    (make-symbolic-link "target" "alias")
+    (let ((changes (gptel-agent-edit-prepare
+                    "Edit" '(:mode "patch" :file_path "alias"
+                             :new_str "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-original\n"))))
+      (delete-file "alias")
+      (make-symbolic-link "other" "alias")
+      (gptel-agent-edit-apply changes)
+      (should-not (file-exists-p "target"))
+      (should (equal (file-symlink-p "alias") "other"))
+      (should (equal (gptel-edit-test--read "other") "original\n")))))
+
 (defun gptel-edit-test--dispatch (name args confirm)
   "Dispatch NAME with ARGS through gptel's hooks and tool runner.
 Use CONFIRM in the current conversation and stop before any network request.

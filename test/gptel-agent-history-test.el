@@ -303,6 +303,45 @@
           (should (string-match-p "Finish the review" (plist-get call :result)))))
       (should (equal (gptel-edit-test--read "one") "new\n")))))
 
+(ert-deftest gptel-history-symlink-deletion-restores-the-target ()
+  (dolist (batch '(nil t))
+    (gptel-edit-test--with-files '(("target" . "original\n"))
+      (make-symbolic-link "target" "alias")
+      (let ((args (if batch
+                      '(:mode "batch" :root_directory "."
+                        :operations [(:operation "delete" :file_path "alias")])
+                    '(:mode "patch" :file_path "alias"
+                      :new_str "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-original\n"))))
+        (should-not (plist-get (gptel-edit-test--dispatch "Edit" args nil) :error)))
+      (should (equal (file-symlink-p "alias") "target"))
+      (should-not (file-exists-p "target"))
+      (let* ((snapshot (car (gptel-agent-history--entries)))
+             (file (car (plist-get (gptel-agent-history--manifest snapshot) :files))))
+        (should (equal (plist-get file :path) (file-truename "target")))
+        (gptel-agent-history-restore snapshot)
+        (should (equal (file-symlink-p "alias") "target"))
+        (should (equal (gptel-edit-test--read "alias") "original\n"))
+        (gptel-agent-history-restore (car (gptel-agent-history--entries)))
+        (should (equal (file-symlink-p "alias") "target"))
+        (should-not (file-exists-p "target"))))))
+
+(ert-deftest gptel-review-symlink-deletion-cancellation-preserves-the-link ()
+  (dolist (immediate '(nil t))
+    (gptel-review-test--with-files '(("target" . "original\n"))
+      (make-symbolic-link "target" "alias")
+      (let ((gptel-agent-review-apply-immediately immediate))
+        (should-not
+         (plist-get
+          (gptel-review-test--submit
+           "Edit" '(:mode "patch" :file_path "alias"
+                    :new_str "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-original\n"))
+          :error))
+        (should (equal (file-symlink-p "alias") "target"))
+        (should (eq (file-exists-p "target") (not immediate)))
+        (gptel-review-test--in-queue (gptel-agent-review-cancel-all))
+        (should (equal (file-symlink-p "alias") "target"))
+        (should (equal (gptel-edit-test--read "alias") "original\n"))))))
+
 (ert-deftest gptel-history-restores-batches-and-can-undo-a-restore ()
   (gptel-edit-test--with-files '(("one" . "original\n") ("empty" . ""))
     (set-file-modes "one" #o755)
