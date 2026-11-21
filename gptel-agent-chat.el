@@ -39,8 +39,39 @@ Keep this value when reloading the module, just like the counter.")
 
 (defun gptel-agent-chat--clone ()
   "Clear copied peer identity and request state in a cloned buffer."
+  (when (local-variable-p 'kill-buffer-hook)
+    (setq kill-buffer-hook (copy-sequence kill-buffer-hook)))
+  ;; Pending Process actions install closures as kill hooks.  Removing a
+  ;; copied ownership list cannot neutralize those captured source requests.
+  (dolist (job gptel-agent--process-registry)
+    (dolist (cleanup
+             (append
+              (mapcar #'gptel-agent--process-waiter-cleanup
+                      (gptel-agent--job-waiters job))
+              (when-let* ((send (gptel-agent--job-send job)))
+                (list (gptel-agent--process-send-cleanup send)))
+              (when-let* ((eof (gptel-agent--job-eof job)))
+                (list (gptel-agent--process-eof-cleanup eof)))))
+      (when (and cleanup (memq cleanup kill-buffer-hook))
+        (remove-hook 'kill-buffer-hook cleanup t))))
   (setq gptel-agent-chat--id nil gptel-agent-chat--inbox nil
-        gptel-agent-chat--request-token nil)
+        gptel-agent-chat--request-token nil
+        ;; Kill hooks must not close the original chat's requests or jobs.
+        gptel--fsm-last nil gptel-agent--supervised-run nil
+        gptel-agent--worker-requests nil gptel-agent--sessions nil
+        gptel-agent--processes nil gptel-agent--bash-jobs nil
+        gptel-agent--supervision nil gptel-agent--searches nil
+        gptel-agent--repository-searches nil gptel-agent--web-jobs nil)
+  ;; These modules can load after MainChat.  Clear only their copied locals,
+  ;; without cancelling source-owned timers, closing UI, or detaching children.
+  (dolist (variable '(gptel-agent-discussion--self gptel-agent-discussion--children
+                      gptel-agent-discussion--fsm gptel-agent-discussion--inbox
+                      gptel-agent-discussion--waiters gptel-agent-discussion--timer
+                      gptel-agent-discussion--draft-start gptel-agent-discussion--list-buffer
+                      gptel-agent-discussion--list-owner
+                      gptel-agent-review--queue gptel-agent-review--delivery
+                      gptel-agent-review--delivery-timer gptel-agent-review--tool-feedback))
+    (when (local-variable-p variable) (set variable nil)))
   ;; A host may retain a localized tool in the conversation buffer.  Do not
   ;; let its copied closure send as the original chat or mutate its tool.
   (when (gptel-agent--find-builtin-tool "MainChat" gptel-tools)

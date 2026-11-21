@@ -220,7 +220,15 @@
       (with-current-buffer worker
         (fundamental-mode)
         (setq-local gptel-mode t))
-      (should-not (gptel-agent-chat--main-p worker)))))
+      (should-not (gptel-agent-chat--main-p worker))
+      (let ((clone (with-current-buffer worker (clone-buffer " *cloned-worker*"))))
+        (unwind-protect
+            (progn
+              (should (buffer-local-value 'gptel-agent--child-chat-p clone))
+              (should-not (gptel-agent-chat--main-p clone))
+              (kill-buffer clone)
+              (should (gptel-agent--run-active-p run)))
+          (when (buffer-live-p clone) (kill-buffer clone)))))))
 
 (ert-deftest gptel-agent-chat-custom-discussion-transforms-cannot-inherit-tool ()
   (gptel-agent-chat-test--with-chats
@@ -345,9 +353,36 @@
               (should (eq source-function (gptel-tool-function source-tool)))
               (should (string-prefix-p "Message queued"
                                        (funcall source-function "send" target "Original still active")))))
-        (when (buffer-live-p clone)
-          ;; Cloned lifecycle hooks must not tear down the original test request.
-          (with-current-buffer clone (let (kill-buffer-hook) (kill-buffer clone))))))))
+        (when (buffer-live-p clone) (kill-buffer clone))))))
+
+(ert-deftest gptel-agent-chat-killing-clone-keeps-original-worker-running ()
+  (gptel-agent-chat-test--with-chats
+    (let* ((gptel-agent-session-mode nil)
+           (run (gptel-agent-workers-test--launch sender-fsm))
+           (gate (gptel-agent--workers-for sender-fsm))
+           (scope (gptel-agent-supervise sender))
+           (chat (gptel-agent-discussion-test--spawn sender-fsm sender))
+           (sessions (buffer-local-value 'gptel-agent--sessions sender))
+           (clone (with-current-buffer sender (clone-buffer " *clone-with-worker*"))))
+      (unwind-protect
+          (progn
+            (should (gptel-agent--run-active-p run))
+            (gptel-agent--supervision-register sender-fsm)
+            (kill-buffer clone)
+            (should-not (gptel-agent--workers-closed gate))
+            (should-not (gptel-agent--supervision-stopped scope))
+            (should (eq scope (buffer-local-value 'gptel-agent--supervision sender)))
+            (should (eq sessions (buffer-local-value 'gptel-agent--sessions sender)))
+            (should (memq gate (buffer-local-value 'gptel-agent--worker-requests sender)))
+            (should (gptel-agent--run-active-p run))
+            (should (eq sender (gptel-agent-discussion--chat-owner chat)))
+            (should (gptel-agent-discussion--active-p (gptel-agent-discussion--chat-fsm chat)))
+            (gptel-agent-workers-test--answer (gptel-agent--run-fsm run) "Child survived")
+            (gptel-agent-workers-test--answer (gptel-agent-discussion--chat-fsm chat)
+                                              "Discussion survived")
+            (should (eq (gptel-agent--run-state run) 'completed))
+            (should (gptel-agent-discussion--active-p sender-fsm)))
+        (when (buffer-live-p clone) (kill-buffer clone))))))
 
 (ert-deftest gptel-agent-chat-mode-change-retains-peer-state ()
   (with-temp-buffer
@@ -360,6 +395,81 @@
       (should (equal id (gptel-agent-chat--id (current-buffer))))
       (should (eq inbox gptel-agent-chat--inbox))
       (should (eq token gptel-agent-chat--request-token)))))
+
+(ert-deftest gptel-agent-chat-killing-clone-keeps-original-shell-jobs-running ()
+  (let ((source (generate-new-buffer " *clone-shell-owner*"))
+        (directory (make-temp-file "clone-shell-gate-" t))
+        (gptel-agent-session-mode nil)
+        clone foreground background result send-result eof-result wait-result cleanups)
+    (unwind-protect
+        (progn
+          (with-current-buffer source
+            (setq-local gptel-mode t)
+            (let ((command (format "while [ ! -f %s ]; do sleep 0.01; done; printf 'foreground survived'"
+                                   (shell-quote-argument (expand-file-name "release" directory)))))
+              (setq foreground (gptel-agent--execute-bash
+                                (lambda (value) (setq result value)) command "Read reply")
+                    background (gptel-agent--execute-bash #'ignore "cat" "Read reply" t)))
+            (let ((job (process-get background 'gptel-agent-job)))
+              (gptel-agent--process-send-input
+               (lambda (value) (setq send-result value)) job "background survived\n" 5000 nil)
+              (gptel-agent--process-close-input
+               (lambda (value) (setq eof-result value)) job 5000 nil)
+              (gptel-agent--process-wait
+               (lambda (value) (setq wait-result value)) job nil nil nil nil 5000 nil)
+              (setq cleanups (list (gptel-agent--process-send-cleanup (gptel-agent--job-send job))
+                                   (gptel-agent--process-eof-cleanup (gptel-agent--job-eof job))
+                                   (gptel-agent--process-waiter-cleanup
+                                    (car (gptel-agent--job-waiters job))))))
+            (setq clone (clone-buffer " *clone-shell-jobs*")))
+          (dolist (cleanup cleanups)
+            (should (memq cleanup (buffer-local-value 'kill-buffer-hook source)))
+            (should-not (memq cleanup (buffer-local-value 'kill-buffer-hook clone))))
+          (kill-buffer clone)
+          (should (process-live-p foreground))
+          (should (process-live-p background))
+          (should-not result)
+          (with-temp-file (expand-file-name "release" directory))
+          (let ((deadline (+ (float-time) 5)))
+            (while (and (< (float-time) deadline)
+                        (or (not result) (not wait-result)))
+              (accept-process-output nil 0.02)))
+          (should (string-match-p "foreground survived" result))
+          (should (string-match-p "send_reason: sent" send-result))
+          (should (string-match-p "eof_reason: closed" eof-result))
+          (should (string-match-p "background survived" wait-result))
+          (should (equal (with-current-buffer (process-buffer background) (buffer-string))
+                         "background survived\n")))
+      (when (buffer-live-p clone) (kill-buffer clone))
+      (when (buffer-live-p source) (kill-buffer source))
+      (dolist (process (list foreground background))
+        (when (process-live-p process) (delete-process process)))
+      (delete-directory directory t))))
+
+(ert-deftest gptel-agent-chat-killing-clone-keeps-original-delivery-timers ()
+  (let ((source (generate-new-buffer " *clone-delivery-owner*")) clone
+        (discussion-timer (run-at-time 3600 nil #'ignore))
+        (waiter-timer (run-at-time 3600 nil #'ignore))
+        (review-timer (run-at-time 3600 nil #'ignore)))
+    (unwind-protect
+        (progn
+          (with-current-buffer source
+            (setq-local gptel-mode t
+                        gptel-agent-discussion--timer discussion-timer
+                        gptel-agent-discussion--waiters (list (list nil nil nil waiter-timer))
+                        gptel-agent-review--delivery-timer review-timer)
+            (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
+            (add-hook 'kill-buffer-hook #'gptel-agent-review--cleanup nil t)
+            (setq clone (clone-buffer " *clone-delivery-timers*")))
+          (kill-buffer clone)
+          (dolist (timer (list discussion-timer waiter-timer review-timer))
+            (should (memq timer timer-list)))
+          (kill-buffer source)
+          (dolist (timer (list discussion-timer waiter-timer review-timer))
+            (should-not (memq timer timer-list))))
+      (when (buffer-live-p clone) (kill-buffer clone))
+      (when (buffer-live-p source) (kill-buffer source))
+      (mapc #'cancel-timer (list discussion-timer waiter-timer review-timer)))))
 
 (provide 'gptel-agent-chat-test)
 ;;; gptel-agent-chat-test.el ends here
