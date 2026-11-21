@@ -97,6 +97,68 @@
         (should (equal (nreverse checked) (list first second outside)))
         (should (equal (nreverse launched) (list first second)))))))
 
+(defun gptel-agent-web-test--literal-url (path)
+  "Fetch literal PATH with real curl, directly and through a redirect."
+  (unless (executable-find "curl") (ert-skip "curl is unavailable"))
+  (gptel-agent-web-test--with-queue
+    (let ((process-environment (copy-sequence process-environment))
+          server clients requests)
+      (setenv "NO_PROXY" "127.0.0.1")
+      (setenv "no_proxy" "127.0.0.1")
+      (unwind-protect
+          (progn
+            (setq server
+                  (condition-case err
+                      (make-network-process
+                       :name "gptel-web-literal-url" :family 'ipv4 :server t
+                       :host "127.0.0.1" :service t :noquery t :coding 'binary
+                       :log (lambda (_server client _message) (push client clients))
+                       :filter
+                       (lambda (client data)
+                         (let ((request (concat (process-get client 'request) data)))
+                           (process-put client 'request request)
+                           (when (and (not (process-get client 'answered))
+                                      (string-match-p "\r\n\r\n" request))
+                             (process-put client 'answered t)
+                             (unless (string-match "\\`GET \\([^ ]+\\) HTTP/" request)
+                               (ert-fail (format "Unexpected HTTP request: %S" request)))
+                             (let* ((target (match-string 1 request))
+                                    (redirect (equal target "/redirect"))
+                                    (body (if redirect "" (concat "Literal URL: " target))))
+                               (push target requests)
+                               (process-send-string
+                                client
+                                (concat (if redirect "HTTP/1.0 302 Found\r\n" "HTTP/1.0 200 OK\r\n")
+                                        (when redirect (concat "Location: " path "\r\n"))
+                                        "Content-Type: text/plain\r\nConnection: close\r\n"
+                                        (format "Content-Length: %d\r\n\r\n" (string-bytes body)) body))
+                               (delete-process client))))))
+                    (file-error (ert-skip (error-message-string err)))))
+            (let* ((base (format "http://127.0.0.1:%d" (process-contact server :service)))
+                   (target (concat base path)))
+              (dolist (guarded '(nil t))
+                (dolist (redirect '(nil t))
+                  (let* ((initial (if redirect (concat base "/redirect") target))
+                         (expected (if redirect (list "/redirect" path) (list path)))
+                         (gptel-agent-policy--active-check
+                          (when guarded
+                            (lambda (args)
+                              (member (plist-get args :url) (list initial target)))))
+                         result)
+                    (setq requests nil)
+                    (gptel-agent--read-url (lambda (value) (setq result value)) initial)
+                    (gptel-agent-web-test--wait (lambda () result))
+                    (should (equal result (concat "Literal URL: " path)))
+                    (should (equal (nreverse requests) expected)))))))
+        (dolist (client clients) (when (process-live-p client) (delete-process client)))
+        (when (and server (process-live-p server)) (delete-process server))))))
+
+(ert-deftest gptel-agent-web-url-brackets-remain-literal ()
+  (gptel-agent-web-test--literal-url "/api?filter[name]=abc"))
+
+(ert-deftest gptel-agent-web-url-braces-never-expand-requests ()
+  (gptel-agent-web-test--literal-url "/api?fields={name,email}"))
+
 (ert-deftest gptel-agent-web-async-completes-once-in-owning-buffer ()
   (gptel-agent-web-test--with-queue
     (let (job results)
