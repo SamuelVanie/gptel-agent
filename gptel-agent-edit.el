@@ -535,10 +535,22 @@ providers which require every schema field, but never select a mode."
       (when (plist-get change :modes) (set-file-modes path (plist-get change :modes))))))
 
 (defun gptel-agent-edit-validate (changes)
-  "Check CHANGES against disk, including unsaved visiting buffers."
+  "Check CHANGES against disk and reject text the file encoding cannot save.
+Validate every file before history is recorded or working files are written,
+including unsaved visiting buffers."
   (gptel-agent-edit--validate-file-parents changes)
   (let (gptel-agent-edit--staged-changes)
     (dolist (change changes)
+      ;; `write-region' silently substitutes unsupported characters when its
+      ;; coding system is forced.  Undecided encodings are different: ASCII
+      ;; and new files may still choose a suitable encoding for their text.
+      (when-let* ((content (plist-get change :after))
+                  (coding (plist-get change :coding))
+                  ((not (eq (coding-system-type coding) 'undecided)))
+                  (position (unencodable-char-position
+                             0 (length content) coding nil content)))
+        (error "Cannot encode U+%04X in %s using %s; use compatible text or explicitly change the file encoding before retrying. No changes were applied"
+               (aref content position) (plist-get change :path) coding))
       (let ((current (gptel-agent-edit--snapshot (plist-get change :path))))
         (unless (equal (plist-get current :before) (plist-get change :before))
           (error "File changed since preview; review again: %s" (plist-get change :path)))))))
