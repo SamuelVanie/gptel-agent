@@ -41,7 +41,7 @@ Prevent nested pumps: one write's timeout must not unwind another write.")
 
 (cl-defstruct (gptel-agent--job (:constructor gptel-agent--make-job))
   id process buffer command directory started-at limit (base 0) (cursor 0)
-  waiters send input-disabled last-send)
+  waiters send input-disabled last-send eof input-closed last-eof)
 
 (cl-defstruct (gptel-agent--process-send
                (:constructor gptel-agent--make-process-send))
@@ -51,6 +51,10 @@ Prevent nested pumps: one write's timeout must not unwind another write.")
 (cl-defstruct (gptel-agent--process-waiter
                (:constructor gptel-agent--make-process-waiter))
   job source callback offset max-chars view timer fsm cleanup)
+
+(cl-defstruct (gptel-agent--process-eof
+               (:constructor gptel-agent--make-process-eof))
+  job source callback send deadline timer fsm cleanup reason)
 
 (defun gptel-agent--process-owner ()
   "Return the live top-level conversation owning the current tool call."
@@ -92,10 +96,20 @@ Prevent nested pumps: one write's timeout must not unwind another write.")
              (gptel-agent--job-command job)
              (gptel-agent--job-directory job)
              (gptel-agent--job-started-at job))
-     (when (gptel-agent--job-input-disabled job)
+     (cond
+      ((gptel-agent--job-input-disabled job)
        "input_status: disabled (an interrupted write may retain unsent bytes; start a new job for further input)\n")
-     (when (gptel-agent--job-send job) "input_status: pending\n")
-     (gptel-agent--job-last-send job))))
+      ((gptel-agent--job-input-closed job) "input_status: closed\n")
+      ((gptel-agent--job-eof job) "input_status: eof_pending\n")
+      ((gptel-agent--job-send job) "input_status: pending\n"))
+     (format "input_available: %s\n"
+             (if (and (process-live-p process)
+                      (not (gptel-agent--job-input-disabled job))
+                      (not (gptel-agent--job-input-closed job))
+                      (not (gptel-agent--job-eof job))
+                      (not (gptel-agent--job-send job))) "yes" "no"))
+     (gptel-agent--job-last-send job)
+     (gptel-agent--job-last-eof job))))
 
 (defun gptel-agent--process-dispose (job &optional notify)
   "Kill JOB's live process group and release its output buffer.
@@ -104,6 +118,11 @@ Cancel pending waits, or resolve them before removal when NOTIFY is non-nil."
     (gptel-agent--process-finish-wait waiter (and notify "removed")))
   (when-let* ((send (gptel-agent--job-send job)))
     (gptel-agent--process-stop-send send "removed" (not notify)))
+  (when-let* ((eof (gptel-agent--job-eof job)))
+    (if notify
+        ;; The pump defers callbacks until any other job's write unwinds.
+        (setf (gptel-agent--process-eof-reason eof) "removed")
+      (gptel-agent--process-finish-eof eof "cancelled" t)))
   (let ((process (gptel-agent--job-process job)))
     (when (processp process)
       ;; Unlike signalling a raw PID, this targets the subprocess group,
@@ -279,13 +298,11 @@ Offsets count decoded characters."
             (format
              (concat "send_reason: %s\ninput_bytes: %d\n"
                      "written_bytes_min: %d\nwritten_bytes_max: %d\n"
-                     "input_available: %s\n%s%s"
+                     "%s%s"
                      "Counts bound bytes accepted by the pipe; acceptance does not prove consumption.\n")
              reason (length (gptel-agent--process-send-bytes send))
              (gptel-agent--process-send-offset send)
              (gptel-agent--process-send-attempted-end send)
-             (if (and (process-live-p (gptel-agent--job-process job))
-                      (not (gptel-agent--job-input-disabled job))) "yes" "no")
              (if-let* ((err (gptel-agent--process-send-error send)))
                  (concat "write_error: " err "\n") "")
              (if (equal reason "sent") ""
@@ -409,6 +426,10 @@ FSM owns cancellation.  Only one send per job may be outstanding."
     (error "Bounded send requires a local POSIX pipe job"))
   (when (gptel-agent--job-input-disabled job)
     (error "Input is disabled after an interrupted write; start a new job for further input"))
+  (when (gptel-agent--job-input-closed job)
+    (error "Stdin is already closed; start a new job for further input"))
+  (when (gptel-agent--job-eof job)
+    (error "EOF is pending for this job; further sends are rejected"))
   (when (gptel-agent--job-send job)
     (error "A send is already pending for this job; wait for its result"))
   (unless (stringp input) (error "send requires an input string"))
@@ -439,6 +460,111 @@ FSM owns cancellation.  Only one send per job may be outstanding."
             (cons cleanup (plist-get (gptel-fsm-info fsm) :post))))
     (setf (gptel-agent--process-send-timer send)
           (run-at-time 0.001 nil #'gptel-agent--process-pump-send send)))
+  nil)
+
+(defun gptel-agent--process-finish-eof (eof reason &optional silently detail)
+  "Resolve EOF once with REASON and optional DETAIL.
+SILENTLY suppresses the callback for cancellation or source destruction."
+  (let* ((job (gptel-agent--process-eof-job eof))
+         (source (gptel-agent--process-eof-source eof))
+         (fsm (gptel-agent--process-eof-fsm eof))
+         (cleanup (gptel-agent--process-eof-cleanup eof)))
+    (when (eq eof (gptel-agent--job-eof job))
+      (setf (gptel-agent--job-eof job) nil
+            (gptel-agent--job-last-eof job)
+            (concat "eof_reason: " reason "\n"
+                    (when detail (concat "eof_detail: " detail "\n"))))
+      (when-let* ((timer (gptel-agent--process-eof-timer eof)))
+        (cancel-timer timer)
+        (setf (gptel-agent--process-eof-timer eof) nil))
+      (when fsm
+        (setf (plist-get (gptel-fsm-info fsm) :post)
+              (remq cleanup (plist-get (gptel-fsm-info fsm) :post))))
+      (when (buffer-live-p source)
+        (with-current-buffer source
+          (remove-hook 'kill-buffer-hook cleanup t)
+          (when (and (not silently)
+                     (or (null fsm) (eq (gptel-fsm-state fsm) 'TOOL)))
+            (condition-case err
+                (funcall (gptel-agent--process-eof-callback eof)
+                         (gptel-agent--process-summary job))
+              (error (message "Process EOF callback failed: %s"
+                              (error-message-string err))))))))))
+
+(defun gptel-agent--process-pump-eof (eof)
+  "Close EOF's pipe only after its preceding send succeeds.
+Never enter native EOF or deliver callbacks inside another write's watchdog."
+  (let* ((job (gptel-agent--process-eof-job eof))
+         (process (gptel-agent--job-process job))
+         (send (gptel-agent--process-eof-send eof)))
+    (when (eq eof (gptel-agent--job-eof job))
+      (setf (gptel-agent--process-eof-timer eof) nil)
+      (cond
+       (gptel-agent--process-writing nil)
+       ((gptel-agent--process-eof-reason eof)
+        (gptel-agent--process-finish-eof eof (gptel-agent--process-eof-reason eof)))
+       ((gptel-agent--job-input-closed job)
+        (gptel-agent--process-finish-eof eof "already_closed"))
+       ((not (process-live-p process))
+        (gptel-agent--process-finish-eof eof "exit"))
+       ((>= (float-time) (gptel-agent--process-eof-deadline eof))
+        (gptel-agent--process-finish-eof eof "timeout"))
+       ((gptel-agent--job-send job) nil)
+       ((or (gptel-agent--job-input-disabled job)
+            (and send (not (equal (gptel-agent--process-send-reason send) "sent"))))
+        (gptel-agent--process-finish-eof
+         eof "input_failed" nil
+         "Stdin was not closed because preceding input failed or was cancelled; inspect its send result. Disabled input requires a new job."))
+       (t
+        (let ((failure
+               (condition-case err
+                   (progn
+                     ;; Successful managed sends leave no retained suffix.
+                     ;; Never call this on disabled input: native EOF would
+                     ;; flush the opaque suffix left by an interrupted send.
+                     (let ((gptel-agent--process-writing t))
+                       (process-send-eof process)
+                       (setf (gptel-agent--job-input-closed job) t))
+                     nil)
+                 (error (error-message-string err)))))
+          (gptel-agent--process-finish-eof
+           eof (if failure "error" "closed") nil failure))))
+      (when (eq eof (gptel-agent--job-eof job))
+        (setf (gptel-agent--process-eof-timer eof)
+              (run-at-time 0.001 nil #'gptel-agent--process-pump-eof eof))))))
+
+(defun gptel-agent--process-close-input (callback job timeout-ms fsm)
+  "Queue closing JOB's stdin and report to CALLBACK, owned by FSM.
+TIMEOUT-MS (default 5000, maximum 60000) includes preceding input delivery.
+Timeout or cancellation removes only EOF, leaving any send unchanged."
+  (setq timeout-ms (or timeout-ms 5000))
+  (unless (and (integerp timeout-ms) (<= 0 timeout-ms 60000))
+    (error "timeout_ms must be between 0 and 60000"))
+  (when (gptel-agent--job-input-disabled job)
+    (error "Input is disabled after an interrupted write; EOF cannot safely close stdin because it would flush retained bytes. Start a new job"))
+  (when (gptel-agent--job-eof job)
+    (error "EOF is already pending for this job; wait for its result"))
+  ;; Repeating successful EOF is harmless, even after the job has exited.
+  (unless (gptel-agent--job-input-closed job)
+    (unless (process-live-p (gptel-agent--job-process job))
+      (error "Process is no longer running:\n%s" (gptel-agent--process-summary job)))
+    (when (or (memq system-type '(windows-nt ms-dos))
+              (file-remote-p (gptel-agent--job-directory job)))
+      (error "EOF requires a local POSIX pipe job")))
+  (let* ((eof (gptel-agent--make-process-eof
+               :job job :source (current-buffer) :callback callback
+               :send (gptel-agent--job-send job)
+               :deadline (+ (float-time) (/ timeout-ms 1000.0)) :fsm fsm))
+         (cleanup (lambda (&rest _)
+                    (gptel-agent--process-finish-eof eof "cancelled" t))))
+    (setf (gptel-agent--process-eof-cleanup eof) cleanup
+          (gptel-agent--job-eof job) eof)
+    (add-hook 'kill-buffer-hook cleanup nil t)
+    (when fsm
+      (setf (plist-get (gptel-fsm-info fsm) :post)
+            (cons cleanup (plist-get (gptel-fsm-info fsm) :post))))
+    (setf (gptel-agent--process-eof-timer eof)
+          (run-at-time 0.001 nil #'gptel-agent--process-pump-eof eof)))
   nil)
 
 (defun gptel-agent--process-wait
@@ -483,7 +609,8 @@ owns the wait so cancellation cannot revive an obsolete request."
     (callback action &optional process-id input offset max-chars view until timeout-ms fsm)
   "Dispatch Process ACTION and deliver its result to CALLBACK.
 PROCESS-ID identifies a job.  INPUT is used by send.  OFFSET, MAX-CHARS and
-VIEW select read/wait output; UNTIL controls wait; TIMEOUT-MS bounds wait/send.
+VIEW select read/wait output; UNTIL controls wait.
+TIMEOUT-MS bounds wait/send/eof.
 Optional FSM comes from the request-local dispatcher for cancellation cleanup.
 Report operation errors through CALLBACK so the model can correct its call."
   ;; Some gptel versions only catch errors from synchronous tools.  Process is
@@ -491,20 +618,26 @@ Report operation errors through CALLBACK so the model can correct its call."
   ;; request error handler (which may still carry a successful HTTP status).
   (let ((result
          (condition-case err
-             (if (member action '("wait" "send"))
+             (if (member action '("wait" "send" "eof"))
                  (let ((job (with-current-buffer (gptel-agent--process-owner)
                               (cl-find process-id gptel-agent--processes
                                        :key #'gptel-agent--job-id :test #'equal))))
                    (unless job
                      (error "Unknown process_id in this session: %s" process-id))
-                   (if (equal action "send")
-                       (gptel-agent--process-send-input callback job input timeout-ms fsm)
-                     (gptel-agent--process-wait
-                      callback job offset max-chars view until timeout-ms fsm)))
+                   (pcase action
+                     ("send"
+                      (gptel-agent--process-send-input callback job input timeout-ms fsm))
+                     ("eof"
+                      (when (or input offset max-chars view until)
+                        (error "eof accepts only process_id and timeout_ms; omit input and read/wait arguments"))
+                      (gptel-agent--process-close-input callback job timeout-ms fsm))
+                     ("wait"
+                      (gptel-agent--process-wait
+                       callback job offset max-chars view until timeout-ms fsm))))
                (gptel-agent--manage-process
                 action process-id input offset max-chars view))
            (error (concat "Error: " (error-message-string err))))))
-    ;; Wait/send deliver their own results and return nil.  Keep immediate callbacks
+    ;; Wait/send/eof deliver their own results and return nil.  Keep callbacks
     ;; outside the error handler: a downstream failure must not deliver twice.
     (when result (funcall callback result)))
   nil)
@@ -512,14 +645,20 @@ Report operation errors through CALLBACK so the model can correct its call."
 (defun gptel-agent--manage-process (action &optional process-id input offset max-chars view)
   "Perform ACTION on PROCESS-ID in this conversation only.
 INPUT is queued for `send'; OFFSET, MAX-CHARS and VIEW control `read'.
-Use `gptel-agent--process-tool' for wait/send completion callbacks."
-  (if (equal action "send")
+Use `gptel-agent--process-tool' for wait/send/eof completion callbacks."
+  (if (member action '("send" "eof"))
       (let ((job (with-current-buffer (gptel-agent--process-owner)
                    (cl-find process-id gptel-agent--processes
                             :key #'gptel-agent--job-id :test #'equal))))
         (unless job (error "Unknown process_id in this session: %s" process-id))
-        (gptel-agent--process-send-input #'ignore job input nil nil)
-        (concat "Input queued; this is not a write confirmation.\n"
+        (if (equal action "send")
+            (gptel-agent--process-send-input #'ignore job input nil nil)
+          (when (or input offset max-chars view)
+            (error "eof accepts only process_id; omit input and read arguments"))
+          (gptel-agent--process-close-input #'ignore job nil nil))
+        (concat (if (equal action "send")
+                    "Input queued; this is not a write confirmation.\n"
+                  "EOF queued; this is not a close confirmation.\n")
                 (gptel-agent--process-summary job)))
     (with-current-buffer (gptel-agent--process-owner)
       (if (equal action "list")

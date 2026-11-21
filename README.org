@@ -735,6 +735,7 @@ The =Process= tool manages these jobs using the returned ID:
 {"action":"read","process_id":"bash-1","view":"tail","max_chars":8000}
 {"action":"wait","process_id":"bash-1","until":"exit","timeout_ms":30000}
 {"action":"send","process_id":"bash-1","input":"yes\n"}
+{"action":"eof","process_id":"bash-1"}
 {"action":"interrupt","process_id":"bash-1"}
 {"action":"kill","process_id":"bash-1"}
 {"action":"remove","process_id":"bash-1"}
@@ -777,8 +778,8 @@ deadline or cancellation. Pipe writes are serialized across jobs to prevent
 one write's cancellation from unwinding another; time waiting for that turn
 counts toward the total deadline. A queued send's callback can arrive after
 its deadline if another write is still active, but it will not write after
-its deadline. Other tools can still progress. Sends require local
-POSIX pipes; remote and Windows jobs still support the other actions.
+its deadline. Other tools can still progress. Sending input and closing stdin
+require local POSIX pipes; remote and Windows jobs still support read/control.
 
 Results report =send_reason= (=sent=, =timeout=, =exit= or
 =error=), =input_bytes=, =written_bytes_min= and =written_bytes_max=.
@@ -786,7 +787,7 @@ Successful sends have equal counts: all bytes were accepted by the pipe,
 which does not prove the program consumed or executed them. If a write is
 interrupted, the counts bound its possibly delivered prefix. The unattempted
 remainder is discarded, but Emacs can retain an opaque suffix of that one
-chunk. It does not flush that suffix automatically. Further sends are
+chunk. It does not flush that suffix automatically. Further sends and EOF are
 permanently disabled for that job to prevent accidental delivery of retained
 bytes. Start a new job for further input; inspect effects before repeating a
 partially delivered command. Read, interrupt and kill remain available.
@@ -797,6 +798,28 @@ an active write is unwound by its watchdog, with the same uncertainty and
 input-disable rule. The job survives if its owning conversation survives.
 Its latest send outcome (including cancellation) is available through
 =Process list/read=. Cancelling a send before any write leaves input usable.
+
+=eof= closes the job's stdin pipe without sending a byte. Use it after streamed
+input for EOF-driven commands such as =wc -c=, =sort= or =python -=; sending
+Ctrl-D to a pipe sends a literal byte and does not close input. For example,
+start =wc -c= with =Bash background=true=, =send= the string =abc\n=, call
+=eof=, then =wait= for a successful exit and a count of 4. Closing stdin can
+trigger execution, so =eof= follows the same tool confirmation as =send=.
+It accepts only =process_id= and optional =timeout_ms= besides =action=.
+
+EOF waits asynchronously for an already pending send to succeed before closing
+input. While EOF is pending, further sends and duplicate EOF requests are
+rejected. If that send fails or is cancelled, EOF returns =eof_reason=input_failed=
+and does not close stdin. The EOF deadline defaults to 5000 ms (0–60000);
+zero closes nothing. Timeout or cancellation of EOF leaves stdin open and does
+not cancel the preceding send. Once closed, further sends fail and repeated
+EOF returns =eof_reason=already_closed=, including after the job exits. EOF on
+a completed job whose stdin was never closed returns an error. Results report
+=eof_reason= (=closed=, =already_closed=, =timeout=, =input_failed=, =exit=,
+=removed= or =error=); job summaries show =input_status=eof_pending= or =closed=.
+The latest EOF outcome, including cancellation, remains visible in =list/read=.
+An active write in another job can delay the EOF callback past its deadline;
+EOF will not close stdin after that deadline.
 
 Each job retains the most recent =gptel-agent-process-output-limit= characters
 (default 200000). Older output is discarded and a read reports any missing
@@ -823,8 +846,8 @@ foreground of the managed shell: do not append =&=, use =nohup= or daemonize.
 Detached descendants are outside this lifecycle. Input uses pipes, so terminal
 UI programs and shell job control are not supported. Some programs buffer
 output when connected to a pipe. Remote process support depends on the Emacs
-file handler. Sending input follows normal tool confirmation; reading,
-listing and stopping owned jobs need no tool-specific confirmation.
+file handler. Sending input or closing stdin follows normal tool confirmation;
+reading, listing and stopping owned jobs need no tool-specific confirmation.
 
 The default agent includes =Process=. Custom agents using
 background Bash should add =Process= to their tools as well.

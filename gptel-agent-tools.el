@@ -4352,7 +4352,8 @@ handoff for oversized output. Check partial effects before retrying; use \
 background=true and Process for intentional longer runs.
 - Foreground stdin is /dev/null, so implicit reads receive EOF. \
 Use pipes, file redirection or heredocs to supply input within the command. \
-For interactive jobs, use background=true and Process send.
+For interactive jobs, use background=true and Process send; use Process eof \
+to close stdin when finished supplying input.
 - For servers, watchers or jobs you can work alongside, set background=true. \
 This returns a session-owned process_id immediately. Do other useful work, then \
 use `Process` wait with until=exit when you need completion; use read with \
@@ -4407,7 +4408,8 @@ conversation buffer kills its jobs and releases their output.
 Actions: list shows running and completed jobs with commands and status; read \
 returns available stdout+stderr without waiting; wait waits until exit or its \
 deadline and returns status plus output; send asynchronously writes UTF-8 input \
-(include a newline when needed); interrupt sends SIGINT to the process group; \
+(include a newline when needed); eof closes stdin after pending input succeeds; \
+interrupt sends SIGINT to the process group; \
 kill sends SIGKILL to the process group; remove forgets a completed job and \
 its retained output. Use interrupt for a graceful stop, then kill if needed.
 
@@ -4438,12 +4440,28 @@ interrupted chunk has uncertain delivery. Such interruption disables further \
 input: Emacs may retain an unsent suffix, which is not flushed automatically. \
 Start a new job for more input; do not blindly repeat partial commands. \
 Cancellation drops unattempted input but cannot retract bytes already accepted. \
-Send requires a local POSIX job; read/control remain available otherwise.
+Sending input and closing stdin require a local POSIX job; read/control remain \
+available otherwise.
+
+Use eof after streamed input for commands such as wc -c, sort or python -. \
+Ctrl-D is a literal byte on these pipes, not EOF. Closing stdin can trigger \
+execution and requires confirmation, like send. eof accepts only process_id \
+and optional timeout_ms (default 5000, maximum 60000; zero closes nothing). \
+It waits for the pending send to succeed; failed or cancelled input returns \
+eof_reason=input_failed without closing stdin. Pending EOF rejects later sends \
+and duplicate EOF. EOF timeout/cancellation leaves stdin open and does not \
+cancel the preceding send. Interrupted writes disable EOF as well as send, so \
+uncertain retained bytes cannot be flushed. Once closed, sends fail and repeated \
+EOF returns already_closed, even after exit. A dead job never closed by EOF \
+returns an error. eof_reason is closed, already_closed, timeout, input_failed, \
+exit, removed or error; input_status reports eof_pending or closed. Another \
+job's active write can delay the callback past the EOF deadline, but EOF will \
+not close stdin after that deadline. Use wait for exit.
 These are pipes, not an interactive terminal. Do not daemonize jobs or use \
 shell job control: detached children cannot be managed as part of the group."
  :args '((:name "action" :type string
-          :enum ["list" "read" "wait" "send" "interrupt" "kill" "remove"]
-          :description "Operation to perform on this session's background jobs.")
+          :enum ["list" "read" "wait" "send" "eof" "interrupt" "kill" "remove"]
+          :description "Operation to perform on this session's background jobs. eof closes stdin after pending input succeeds and requires confirmation.")
          (:name "process_id" :type string :optional t
           :description "ID returned by Bash or Process list. Required except for list; never an OS PID.")
          (:name "input" :type string :optional t
@@ -4457,9 +4475,9 @@ shell job control: detached children cannot be managed as part of the group."
          (:name "until" :type string :optional t :enum ["exit"]
           :description "For wait: wait for process termination (default exit), not merely new output.")
          (:name "timeout_ms" :type integer :optional t :minimum 0 :maximum 60000
-          :description "For wait/send: deadline in milliseconds (wait default 30000, send default 5000). With zero, wait returns a snapshot and send writes nothing. Timeout does not stop the job."))
+          :description "For wait/send/eof: deadline in milliseconds (wait default 30000, send/eof default 5000). With zero, wait returns a snapshot, send writes nothing and eof leaves stdin open. Timeout does not stop the job."))
  :category "gptel-agent"
- :confirm (lambda (action &rest _) (equal action "send"))
+ :confirm (lambda (action &rest _) (member action '("send" "eof")))
  :include t
  :async t)
 

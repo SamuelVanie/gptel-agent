@@ -346,6 +346,15 @@
                       (gptel-agent--process-tool (lambda (result) (setq retry result))
                                                  "send" id "must-not-appear")
                       (should (string-prefix-p "Error: " retry))
+                      ;; Native EOF also flushes Emacs's opaque write queue.
+                      ;; Reject it after both timeout and request cancellation,
+                      ;; then verify the actual consumer never receives it.
+                      (setq retry nil)
+                      (gptel-agent--process-tool (lambda (result) (setq retry result))
+                                                 "eof" id)
+                      (should (string-prefix-p "Error: " retry))
+                      (should (string-match-p "retained bytes" retry))
+                      (should-not (gptel-agent--job-eof job))
                       ;; Signal-only controls must not flush Emacs's retained
                       ;; C write queue.  The consumer deliberately ignores INT.
                       (gptel-agent--manage-process "interrupt" id)
