@@ -76,6 +76,10 @@
 (defvar gptel-agent--enabled-agents)
 (defvar gptel-agent--saved-tool-results (make-hash-table :test #'equal)
   "Saved tool result paths and the extraction contracts issued for them.")
+(defvar gptel-agent--tool-results-storage nil
+  "Private local result directory and its original filesystem identity.
+This is a cons of the directory name and its device/inode identifier.
+Only directories freshly created by this Emacs process are used.")
 (defvar-local gptel-agent--result-file-scope nil
   "The only saved tool result file accessible to a result explorer.")
 (defconst gptel-agent--hrule
@@ -712,7 +716,7 @@ request owner, which may differ from the buffer displaying the approval."
 
 (cl-defstruct (gptel-agent--bash (:constructor gptel-agent--make-bash))
   process buffer source callback query limit preview-chars preview-lines
-  (chars 0) (newlines 0) file fsm post-hook done)
+  (chars 0) (newlines 0) file file-identity fsm post-hook done)
 
 (defvar-local gptel-agent--bash-jobs nil
   "Foreground Bash calls owned by this buffer.")
@@ -742,7 +746,8 @@ request owner, which may differ from the buffer displaying the approval."
         (kill-buffer (gptel-agent--bash-buffer job)))
       (when-let* ((file (gptel-agent--bash-file job))
                   ((not keep-file)))
-        (when (file-exists-p file) (delete-file file))))))
+        (gptel-agent--delete-tool-result
+         file (gptel-agent--bash-file-identity job))))))
 
 (defun gptel-agent--bash-cleanup ()
   "Cancel foreground Bash calls belonging to the current buffer."
@@ -756,14 +761,13 @@ request owner, which may differ from the buffer displaying the approval."
   "Create JOB's log and write its retained output before appending new chunks."
   (unless (gptel-agent--bash-file job)
     (with-current-buffer (gptel-agent--bash-buffer job)
-      (let ((directory (gptel-agent--tool-results-directory))
+      (let ((result (gptel-agent--create-tool-result "bash"))
             (coding-system-for-write 'utf-8-unix)
             (write-region-inhibit-fsync t))
-        (make-directory directory t)
-        (setf (gptel-agent--bash-file job)
-              (make-temp-file (expand-file-name "bash-" directory) nil ".txt"))
-        (write-region (point-min) (point-max)
-                      (gptel-agent--bash-file job) nil 'silent)))))
+        (setf (gptel-agent--bash-file job) (car result)
+              (gptel-agent--bash-file-identity job) (cdr result))
+        (gptel-agent--write-tool-result
+         (car result) (cdr result) (point-min) (point-max))))))
 
 (defun gptel-agent--bash-filter (job process output)
   "Spool OUTPUT for JOB, keeping only a bounded prefix in PROCESS's buffer."
@@ -777,7 +781,8 @@ request owner, which may differ from the buffer displaying the approval."
           (when-let* ((file (gptel-agent--bash-file job)))
             (let ((coding-system-for-write 'utf-8-unix)
                   (write-region-inhibit-fsync t))
-              (write-region output nil file t 'silent)))
+              (gptel-agent--write-tool-result
+               file (gptel-agent--bash-file-identity job) output nil t)))
           (let ((remaining (- (max (gptel-agent--bash-limit job)
                                    (gptel-agent--bash-preview-chars job))
                               (buffer-size))))
@@ -1088,31 +1093,113 @@ ARG-VALUES is a list: (path line-number new-str)"
   (gptel-agent-edit-apply
    (gptel-agent-edit-prepare "Write" (list :file_path file-path :content content))))
 
+(defun gptel-agent--check-tool-results-parents (directory)
+  "Ensure DIRECTORY and its ancestors cannot be replaced by another user.
+DIRECTORY must be canonical and local.  Shared writable ancestors must be
+sticky, as with /tmp, and every ancestor must belong to root or this user."
+  (let ((path (directory-file-name directory)))
+    (while path
+      (let* ((attributes (file-attributes path 'integer))
+             (modes (file-modes path)))
+        (unless (and (eq (file-attribute-type attributes) t)
+                     (member (file-attribute-user-id attributes) (list 0 (user-uid)))
+                     modes
+                     (or (zerop (logand modes #o022))
+                         (not (zerop (logand modes #o1000)))))
+          (signal 'file-error (list "Unsafe tool result directory ancestor" path))))
+      (let ((parent (directory-file-name (file-name-directory path))))
+        (setq path (unless (equal parent path) parent))))))
+
 (defun gptel-agent--tool-results-directory ()
-  "Return the directory used for persisted oversized tool results."
-  (expand-file-name "gptel-agent-temp"
-                    (temporary-file-directory)))
+  "Return a private local directory for persisted oversized tool results.
+Create it atomically, with mode 0700, instead of adopting an existing path.
+Validate its ownership, permissions and identity before every reuse; never
+repair or remove an unsafe existing directory."
+  (unless gptel-agent--tool-results-storage
+    ;; The function `temporary-file-directory' can choose a remote directory.
+    ;; Results must stay local, including when saved from a remote buffer.
+    (unless (and (file-name-absolute-p temporary-file-directory)
+                 (not (file-remote-p temporary-file-directory)))
+      (signal 'file-error '("Tool result temporary directory must be local and absolute")))
+    (let ((root (file-truename temporary-file-directory)))
+      (gptel-agent--check-tool-results-parents root)
+      (let* ((directory (make-temp-file
+                         (expand-file-name "gptel-agent-results-" root) t))
+             (attributes (file-attributes directory 'integer)))
+        (setq gptel-agent--tool-results-storage
+              (cons directory (file-attribute-file-identifier attributes))))))
+  (let* ((directory (car gptel-agent--tool-results-storage))
+         ;; A trailing slash would cause lstat to follow a directory symlink.
+         (path (directory-file-name directory))
+         (attributes (file-attributes path 'integer)))
+    (gptel-agent--check-tool-results-parents (file-name-directory path))
+    (unless (and (eq (file-attribute-type attributes) t)
+                 (equal (file-attribute-user-id attributes) (user-uid))
+                 (equal (file-modes path) #o700)
+                 (equal (file-attribute-file-identifier attributes)
+                        (cdr gptel-agent--tool-results-storage)))
+      (signal 'file-error (list "Unsafe private tool result directory" directory)))
+    directory))
+
+(defun gptel-agent--create-tool-result (prefix)
+  "Create a private result file for PREFIX; return its path and identity."
+  (let* ((directory (gptel-agent--tool-results-directory))
+         (file (make-temp-file
+                (expand-file-name
+                 (concat (file-name-nondirectory prefix) "-") directory)
+                nil ".txt")))
+    (cons file (file-attribute-file-identifier (file-attributes file 'integer)))))
+
+(defun gptel-agent--check-tool-result (file identity)
+  "Check that FILE is still the private regular result with IDENTITY."
+  (let ((directory (gptel-agent--tool-results-directory))
+        (attributes (file-attributes file 'integer)))
+    (unless (and (equal (file-name-directory file) (file-name-as-directory directory))
+                 ;; Check the lstat mode string, rejecting symlinks and special
+                 ;; files without following them, even for a missing target.
+                 (equal (file-attribute-modes attributes) "-rw-------")
+                 (equal (file-attribute-user-id attributes) (user-uid))
+                 (equal (file-attribute-link-number attributes) 1)
+                 (equal (file-attribute-file-identifier attributes) identity))
+      (signal 'file-error (list "Unsafe tool result file" file)))))
+
+(defun gptel-agent--write-tool-result (file identity start end &optional append)
+  "Write START through END to private FILE with IDENTITY, optionally APPEND.
+The private directory and protected ancestors prevent other users from
+replacing path components between validation and the write."
+  (gptel-agent--check-tool-result file identity)
+  (write-region start end file append 'silent))
+
+(defun gptel-agent--delete-tool-result (file identity)
+  "Delete FILE only while it is still the private result with IDENTITY.
+Leave changed paths untouched.  Cleanup failures must not prevent delivery
+of the tool's capture error to its callback."
+  (condition-case nil
+      (progn
+        (gptel-agent--check-tool-result file identity)
+        (delete-file file))
+    (file-error nil)))
 
 (defun gptel-agent--save-tool-result (prefix query)
   "Save the current buffer as a tool result and return its absolute path.
 
 PREFIX identifies the producing tool.  When QUERY is non-nil, register the
 exact file/query pair as a valid result-explorer scope contract."
-  (let ((directory (gptel-agent--tool-results-directory)))
-    (unless (file-directory-p directory)
-      (make-directory directory t))
-    (let ((file (make-temp-file
-                 (expand-file-name (format "%s-" prefix) directory)
-                 nil ".txt")))
-      (write-region nil nil file nil 'silent)
-      (when query
-        (puthash file
-                 (list :query query
-                       :tool prefix
-                       :chars (buffer-size)
-                       :lines (line-number-at-pos (point-max)))
-                 gptel-agent--saved-tool-results))
-      file)))
+  (pcase-let* ((`(,file . ,identity) (gptel-agent--create-tool-result prefix))
+               (saved nil))
+    (unwind-protect
+        (progn
+          (gptel-agent--write-tool-result file identity nil nil)
+          (when query
+            (puthash file
+                     (list :query query
+                           :tool prefix
+                           :chars (buffer-size)
+                           :lines (line-number-at-pos (point-max)))
+                     gptel-agent--saved-tool-results))
+          (setq saved t)
+          file)
+      (unless saved (gptel-agent--delete-tool-result file identity)))))
 
 (defun gptel-agent--result-explorer-handoff (prefix file query)
   "Return an Agent handoff for saved PREFIX result FILE and extraction QUERY."

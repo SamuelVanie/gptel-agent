@@ -1528,6 +1528,14 @@ the parent agent can verify with =Read=.  Preview size is controlled by
 =gptel-agent-tool-result-preview-chars= and
 =gptel-agent-tool-result-preview-lines=.
 
+Saved results use a fresh private local directory, even for remote commands.
+On POSIX systems its permissions are 0700 and result files are 0600. Ownership,
+permissions and filesystem identities are checked before writes; unsafe or
+replaced paths cause a tool error and are left untouched. Shared temporary
+directories must prevent other users from replacing entries (as with sticky
+=/tmp=), and their ancestors must belong to your account or root. Existing
+=gptel-agent-temp= directories are neither reused nor removed.
+
 =Glob= and =Grep= run asynchronously. Directory enumeration and metadata reads
 use an isolated Python 3 subprocess when available, otherwise a clean batch
 Emacs subprocess. =Grep= prefers =rg=, then =grep -E=, then a separate batch
