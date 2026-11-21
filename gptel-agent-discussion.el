@@ -341,6 +341,19 @@ and can be inspected with DiscussionControl read without waking the owner."
 
 (defun gptel-agent-discussion--localize (fsm)
   "Attach conversation ownership and Discussion tools to request FSM."
+  (let* ((info (gptel-fsm-info fsm))
+         (buffer (plist-get info :buffer)))
+    (when (and (buffer-live-p buffer)
+               (buffer-local-value 'gptel-agent-discussion--self buffer)
+               (not (plist-get info :dry-run))
+               (not (plist-get info :discussion-attached)))
+      ;; Custom prompt hooks can omit the ordinary localizers, leaving
+      ;; inherited tools bound to the managing request.  Rebind on every
+      ;; child turn, including restored discussions.  Skill must precede
+      ;; Agent so newly merged grants also get request-local dispatchers.
+      (unless (plist-member info :skill-registry)
+        (gptel-agent--localize-skill-tool fsm))
+      (gptel-agent--localize-agent-tool fsm)))
   (let* ((info (gptel-fsm-info fsm)) (buffer (plist-get info :buffer))
          (enabled (cl-find-if (lambda (tool)
                                 (member (gptel-agent--builtin-tool-name tool)

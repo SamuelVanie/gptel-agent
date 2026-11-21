@@ -1119,6 +1119,112 @@ CLOSE-FIRST closes monitoring while the editable transcript is still live."
       (should-not (gptel-agent-discussion--interaction-overlays interaction))
       (should (equal (buffer-string) "Keep this transcript\n")))))
 
+(ert-deftest gptel-agent-discussion-request-error-cancels-worker-keeps-owner ()
+  (gptel-agent-test--with-main-presets
+    (gptel-agent-discussion-test--with-chat
+     (gptel-make-preset 'discussion-test-worker
+       :parents 'gptel-agent
+       :agent--registry-snapshot
+       '(("gptel-agent" :agents ("test-worker"))
+         ("test-worker" :description "Test worker" :system "Complete the task"
+          :tools ("TodoWrite")))
+       :prompt-transform-functions
+       '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize))
+     (gptel-agent-workers-test--tool
+      fsm "Discussion" '(:title "Worker task" :prompt "Investigate"
+                                :preset "discussion-test-worker"))
+     (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+     (let* ((child (gptel-agent-discussion--chat-buffer chat))
+            (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+       (with-current-buffer child (setq-local gptel-confirm-tool-calls nil))
+       (gptel-agent-workers-test--tool
+        child-fsm "Agent" '(:subagent_type "test-worker" :description "Investigate"
+                                           :prompt "Find evidence" :background t))
+       (let ((run (car (hash-table-values gptel-agent--runs))))
+         (should (gptel-agent--run-active-p run))
+         (should (eq child-fsm (gptel-agent--run-parent-fsm run)))
+         ;; The ordinary discussion's transport failure stops its active
+         ;; worker, even when the worker's own request has not failed.
+         (setf (plist-get (gptel-fsm-info child-fsm) :status) "Transport failure"
+               (plist-get (gptel-fsm-info child-fsm) :error) "connection reset")
+         (gptel--fsm-transition child-fsm 'ERRS)
+         (should (eq (gptel-agent--run-state run) 'cancelled))
+         (should (eq (gptel-agent--run-terminal-reason run) 'parent-stopped))
+         (should (equal (gptel-agent--run-result run) "Error: Owning request stopped."))
+         ;; Terminal runs release request references, but neither their
+         ;; conversation nor the discussion loses its owning buffer.
+         (should-not (gptel-agent--run-parent-fsm run))
+         (should (eq child (gptel-agent--run-parent-buffer run)))
+         (should (eq 'failed (gptel-agent-discussion--chat-state chat)))
+         (should (equal "connection reset" (gptel-agent-discussion--chat-result chat)))
+         (should (eq parent (gptel-agent-discussion--chat-owner chat)))
+         (should (eq chat (buffer-local-value 'gptel-agent-discussion--self child)))
+         (should (memq chat (buffer-local-value 'gptel-agent-discussion--children parent)))
+         (with-current-buffer child
+           (goto-char (point-max)) (insert "Retry after the transport failure") (gptel-send))
+         (let ((retry-fsm (gptel-agent-discussion--chat-fsm chat)))
+           (should-not (eq retry-fsm child-fsm))
+           (should (gptel-agent-discussion--live-p chat retry-fsm))
+           (gptel-agent-workers-test--tool
+            retry-fsm "DiscussionReport" '(:message "RECOVERED-DISCUSSION-REPORT"))
+           (should (equal "RECOVERED-DISCUSSION-REPORT"
+                          (plist-get (car (buffer-local-value
+                                           'gptel-agent-discussion--inbox parent)) :text)))))))))
+
+(ert-deftest gptel-agent-discussion-custom-transforms-bind-workers-to-child ()
+  (dolist (transforms '(nil (ignore)))
+    (ert-info ((format "Custom prompt transforms: %S" transforms))
+      (gptel-agent-discussion-test--with-chat
+       (gptel-agent-workers-test--answer fsm "Ready")
+       (with-current-buffer parent
+         (setq-local gptel-agent--agent-snapshot
+                     '(("researcher" :system "Research" :task-timeout nil
+                        :max-request-rounds nil))
+                     gptel-prompt-transform-functions
+                     '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize))
+         (push (gptel-get-tool "Agent") gptel-tools)
+         (goto-char (point-max)) (insert "Create a discussion") (gptel-send)
+         (setq fsm gptel-agent-discussion--fsm))
+       (let ((gptel--known-presets (copy-tree gptel--known-presets)))
+         ;; The custom preset inherits tools, including the parent's localized
+         ;; Agent dispatcher, while replacing the normal prompt transforms.
+         (gptel-make-preset 'discussion-custom-transforms
+           :prompt-transform-functions transforms)
+         (gptel-agent-workers-test--tool
+          fsm "Discussion" '(:title "Worker owner" :prompt "Delegate work"
+                                    :preset "discussion-custom-transforms"))
+         (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+         (let* ((child (gptel-agent-discussion--chat-buffer chat))
+                (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+           (with-current-buffer child (setq-local gptel-confirm-tool-calls nil))
+           (dotimes (turn 2)
+             (when (> turn 0)
+               (with-current-buffer child
+                 (goto-char (point-max)) (insert "Delegate another task") (gptel-send)
+                 (setq child-fsm gptel-agent-discussion--fsm)))
+             (gptel-agent-workers-test--tool
+              child-fsm "Agent" '(:subagent_type "researcher" :description "Research"
+                                              :prompt "Find evidence" :background t))
+             (let ((run (car (hash-table-values gptel-agent--runs))))
+               (should (eq (gptel-agent--run-parent-buffer run) child))
+               (should (eq (gptel-agent--run-parent-fsm run) child-fsm))
+               (should-not (gptel-agent--workers-active (gptel-agent--workers-for fsm)))
+               (when (zerop turn) (gptel-abort parent))
+               (should (gptel-agent--run-active-p run))
+               (should (gptel-agent-discussion--live-p chat child-fsm))
+               (gptel-agent-workers-test--answer child-fsm "Waiting for evidence")
+               (should (eq (gptel-fsm-state child-fsm) 'AGWT))
+               (gptel-agent-workers-test--answer
+                (gptel-agent--run-fsm run) "CHILD-OWNED-EVIDENCE")
+               (gptel-agent-workers-test--wake child-fsm)
+               (should (eq (gptel-fsm-state child-fsm) 'WAIT))
+               (should (string-match-p "CHILD-OWNED-EVIDENCE"
+                                       (gptel-agent-workers-test--data child-fsm)))
+               (should-not (string-match-p "CHILD-OWNED-EVIDENCE"
+                                           (gptel-agent-workers-test--data fsm)))
+               (gptel-agent-workers-test--answer child-fsm "Research complete")
+               (should (eq (gptel-agent-discussion--chat-state chat) 'idle))))))))))
+
 (ert-deftest gptel-agent-discussion-worker-approval-stays-local-and-settles ()
   (dolist (background '(nil t))
     (dolist (decision '(approve cancel))

@@ -511,6 +511,33 @@
              (gptel-agent-discussion--interaction-calls pending) (car overlays))))
         (should (= executions 1))))))
 
+(ert-deftest gptel-agent-skills-discussion-custom-transforms-bind-own-request ()
+  (dolist (parent-finished '(nil t))
+    (let ((gptel-agent-skills-test--extra-tools '("Discussion"))
+          (gptel--known-presets (copy-tree gptel--known-presets)))
+      (gptel-agent-skills-test--with-chat "allowed-tools: SkillMutation\n"
+        (with-current-buffer parent (setq-local gptel-confirm-tool-calls nil))
+        (gptel-make-preset 'discussion-skill-custom-transforms
+          :prompt-transform-functions '(ignore))
+        (gptel-agent-workers-test--tool
+         fsm "Discussion" '(:title "Independent skill" :prompt "Load the skill"
+                                   :preset "discussion-skill-custom-transforms"))
+        (let* ((chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+               (child (gptel-agent-discussion--chat-buffer chat))
+               (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+          (when parent-finished
+            (gptel-agent-workers-test--answer fsm "Parent finished"))
+          ;; An inherited Skill dispatcher must activate grants on the child's
+          ;; request, even when its preset replaces the usual transforms.
+          (gptel-agent-skills-test--load child-fsm)
+          (should (gptel-agent-skills-test--tool child-fsm "SkillMutation"))
+          (should (member "SkillMutation" (gptel-agent-skills-test--wire-names child-fsm)))
+          (should (buffer-local-value 'gptel-agent--skill-tools child))
+          (should-not (gptel-agent-skills-test--tool fsm "SkillMutation"))
+          (should-not (buffer-local-value 'gptel-agent--skill-tools parent))
+          (gptel-agent-workers-test--tool child-fsm "SkillMutation" nil)
+          (should (= executions 1)))))))
+
 (ert-deftest gptel-agent-skills-worker-followup-binds-new-request ()
   (let ((gptel-agent-skills-test--extra-tools '("Agent")))
     (gptel-agent-skills-test--with-chat "allowed-tools: SkillMutation\n"
