@@ -963,7 +963,9 @@ PARENT-FSM supplies the managing request's tool policy ceiling."
             (dolist (symbol '(gptel-agent--current-agent gptel-agent--registry-snapshot
                                                          gptel-agent--agent-snapshot gptel-agent--enabled-agents
                                                          gptel-agent--enabled-skills))
-              (when (boundp symbol)
+              ;; Captured request settings, including an explicit nil skill
+              ;; selection, take precedence over subsequent owner changes.
+              (when (and (boundp symbol) (not (assq symbol config)))
                 (set (make-local-variable symbol)
                      (copy-tree (buffer-local-value symbol owner)))))
             (setq-local gptel-context nil gptel-use-context nil)

@@ -1616,7 +1616,11 @@ separate from grants so discussions can inherit tools without pre-approvals."
     (setq-local gptel-agent-skill-dirs directories
                 gptel-agent--enabled-skills enabled)
     (setf (gptel-fsm-info fsm)
-          (plist-put info :skill-base-tools
+          (plist-put info :skill-config
+                     (list (cons 'gptel-agent-skill-dirs (copy-sequence directories))
+                           (cons 'gptel-agent--enabled-skills (copy-sequence enabled)))))
+    (setf (gptel-fsm-info fsm)
+          (plist-put (gptel-fsm-info fsm) :skill-base-tools
                      (mapcar #'gptel-agent--skill-copy-tool gptel-tools)))
     (setf (gptel-fsm-info fsm)
           (plist-put (gptel-fsm-info fsm) :skill-tools active))
@@ -3389,7 +3393,8 @@ Use the output marker's buffer, including for nested worker approvals."
 
 (defun gptel-agent--copy-parent-request-config (parent-buffer child-buffer &optional fsm)
   "Copy owned settings from PARENT-BUFFER to CHILD-BUFFER.
-When FSM is supplied, exclude its conversation-specific skill grants."
+When FSM is supplied, inherit its captured skill configuration while
+excluding conversation-specific skill grants."
   (dolist (symbol gptel-agent--request-config-variables)
     (when (boundp symbol)
       (let* ((info (and fsm (gptel-fsm-info fsm)))
@@ -3400,6 +3405,8 @@ When FSM is supplied, exclude its conversation-specific skill grants."
                      ((and (eq symbol 'gptel-tools)
                              (plist-member info :skill-base-tools))
                       (plist-get info :skill-base-tools))
+                     ((assq symbol (plist-get info :skill-config))
+                      (alist-get symbol (plist-get info :skill-config)))
                      (t (buffer-local-value symbol parent-buffer)))))
         (with-current-buffer child-buffer
           (set (make-local-variable symbol)
