@@ -39,6 +39,10 @@ Keep this value when reloading the module, just like the counter.")
 
 (defun gptel-agent-chat--clone ()
   "Clear copied peer identity and request state in a cloned buffer."
+  ;; An indirect chat shares text with its live owner.  It is a reading view,
+  ;; not another place to edit the transcript or launch concurrent requests.
+  (when (and (buffer-base-buffer) (or gptel-mode gptel-agent--child-chat-p))
+    (setq buffer-read-only t))
   (gptel-agent--todo-header-detach)
   (when (local-variable-p 'kill-buffer-hook)
     (setq kill-buffer-hook (copy-sequence kill-buffer-hook)))
@@ -91,13 +95,30 @@ Keep this value when reloading the module, just like the counter.")
   "Whether BUFFER is a live top-level gptel chat, never a generated child."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
-         (and gptel-mode
+         (and gptel-mode (not (buffer-base-buffer))
               (not gptel-agent--child-chat-p)
               (not gptel-agent--supervised-run)
               ;; Also recognize children created before this module loaded.
               (not (bound-and-true-p gptel-agent-discussion--self))
               (not (bound-and-true-p gptel-agent-review-aside-mode))
               (not (bound-and-true-p gptel-agent-review-aside--path))))))
+
+(defun gptel-agent-chat--guard-indirect-request (&optional _prompt &rest args)
+  "Reject requests using an indirect chat's shared transcript.
+ARGS are the keyword arguments to `gptel-request'.  Check both the source
+and explicit response buffer before any prompt transforms can run."
+  (dolist (buffer (list (current-buffer) (plist-get args :buffer)
+                       (when (markerp (plist-get args :position))
+                         (marker-buffer (plist-get args :position)))))
+    (setq buffer (and (or (bufferp buffer) (stringp buffer)) (get-buffer buffer)))
+    (when-let* (((buffer-live-p buffer))
+                (base (buffer-base-buffer buffer))
+                ((or (buffer-local-value 'gptel-mode buffer)
+                     (buffer-local-value 'gptel-agent--child-chat-p buffer)
+                     (buffer-local-value 'gptel-mode base)
+                     (buffer-local-value 'gptel-agent--child-chat-p base))))
+      (user-error "Send from base chat %s; indirect chat views share its transcript"
+                  (buffer-name base)))))
 
 (defun gptel-agent-chat--id (buffer)
   "Return BUFFER's session-stable ID, allocating it on first discovery."
@@ -260,6 +281,8 @@ even without MainChat in the recipient's tools, allowing one-way messages."
 (add-hook 'gptel-prompt-transform-functions #'gptel-agent-chat--localize t)
 ;; Reset before optional persistence hooks allocate the clone's saved identity.
 (add-hook 'clone-buffer-hook #'gptel-agent-chat--clone -90)
+(add-hook 'clone-indirect-buffer-hook #'gptel-agent-chat--clone -90)
+(advice-add 'gptel-request :before #'gptel-agent-chat--guard-indirect-request)
 
 (provide 'gptel-agent-chat)
 ;;; gptel-agent-chat.el ends here

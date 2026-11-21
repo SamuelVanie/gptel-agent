@@ -1237,6 +1237,12 @@ are excluded. Each chat has its own immutable snapshot and a persistent parent I
 restored main chat can list, read and message its existing discussions and
 create new ones. The child buffers remain ordinary editable gptel chats.
 
+Indirect clones of a chat share its transcript and open as read-only views.
+Requests, background work and saved-session ownership stay with the base chat;
+send new prompts from that buffer. Closing a view leaves that work running.
+If you explicitly unlock and edit a view, its shared text is saved with the
+base session. Use =clone-buffer= for an independent conversation instead.
+
 Each family also has a small checkpoint manifest naming every member's saved
 version. Changed chats are written in small batches, and the manifest is
 replaced atomically only after every required version is ready. Until then,
