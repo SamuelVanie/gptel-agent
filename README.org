@@ -697,6 +697,11 @@ hiding or killing only the review list does not discard proposals.
 
 =Bash= normally waits for a command to finish. Prefer this foreground mode
 for tests, builds and commands whose result is needed before proceeding.
+Foreground commands receive stdin from =/dev/null=, so an implicit input read
+cannot leave the agent waiting indefinitely. Pipes, file redirection and
+heredocs inside the command still work. Use a background job and =Process=
+=send= for commands that need interactive input. Invalid Bash arguments and
+process launch failures return tool errors so the agent can correct its call.
 Set =background= to =true= for servers, watchers or jobs the agent can work
 alongside. It immediately returns a =process_id=,
 leaving the agent free to run other commands and inspect output later:

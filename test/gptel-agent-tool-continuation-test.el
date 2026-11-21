@@ -285,6 +285,68 @@ chunks when SPLIT is non-nil.  Network transport alone is mocked."
                         "COMMAND-INTRODUCTION" (gptel-agent-workers-test--data fsm)))))
       (when (buffer-live-p source) (kill-buffer source)))))
 
+(ert-deftest gptel-agent-tool-continuation-process-wait-timeout-and-exit ()
+  (gptel-agent-workers-test--with-chat
+    (cl-labels ((wait-for (predicate)
+                 (let ((deadline (+ (float-time) 5)))
+                   (while (and (not (funcall predicate)) (< (float-time) deadline))
+                     (accept-process-output nil 0.02))
+                   (should (funcall predicate)))))
+      (let* ((process
+              (with-current-buffer parent
+                (setq-local gptel-tools (list (gptel-get-tool "Process"))
+                            gptel-pre-tool-call-functions
+                            (list #'gptel-agent--detect-repetition))
+                (gptel-agent--localize-agent-tool fsm)
+                (setf (plist-get (gptel-fsm-info fsm) :tools) gptel-tools)
+                (gptel-agent--execute-bash
+                 #'ignore "printf ready; read -r answer; printf finished; exit 7"
+                 "Check completion" t)))
+             (job (process-get process 'gptel-agent-job))
+             ;; Keep the reported argument spelling: unknown max_char is
+             ;; ignored by schema dispatch and must not disrupt continuation.
+             (args (list :until "exit" :action "wait"
+                         :process_id (gptel-agent--job-id job) :input ""
+                         :offset 0 :max_char 3000 :view "unread" :timeout_ms 1000)))
+        (should (= (length requests) 1))
+        (gptel-agent-workers-test--tool fsm "Process" args)
+        (let* ((call (car (plist-get (gptel-fsm-info fsm) :tool-use)))
+               (waiter (car (gptel-agent--job-waiters job)))
+               (timer (gptel-agent--process-waiter-timer waiter)))
+          (should (eq (gptel-fsm-state fsm) 'TOOL))
+          (should (timerp timer))
+          (wait-for (lambda () (= (length requests) 2)))
+          (should (eq (gptel-fsm-state fsm) 'WAIT))
+          (should (string-match-p "wait_reason: timeout" (plist-get call :result)))
+          (should (string-match-p "status: run" (plist-get call :result)))
+          (should (string-suffix-p "ready" (plist-get call :result)))
+          (should (string-match-p "wait_reason: timeout" (prin1-to-string (cdar requests))))
+          (should (process-live-p process))
+          (should-not (gptel-agent--job-waiters job))
+          (should-not (gptel-agent--process-waiter-timer waiter))
+          (should-not (memq timer timer-list)))
+        ;; A subsequent identical wait must use the same live job and resume
+        ;; the model again when the process exits, without a stale timer firing.
+        (gptel-agent-workers-test--tool fsm "Process" args)
+        (let* ((call (car (plist-get (gptel-fsm-info fsm) :tool-use)))
+               (waiter (car (gptel-agent--job-waiters job)))
+               (timer (gptel-agent--process-waiter-timer waiter)))
+          (should (eq (gptel-fsm-state fsm) 'TOOL))
+          (process-send-string process "continue\n")
+          (wait-for (lambda () (= (length requests) 3)))
+          (should (eq (gptel-fsm-state fsm) 'WAIT))
+          (should (string-match-p "wait_reason: exit" (plist-get call :result)))
+          (should (string-match-p "status: exit\nexit_code: 7" (plist-get call :result)))
+          (should (string-suffix-p "readyfinished" (plist-get call :result)))
+          (let ((payload (prin1-to-string (cdar requests))))
+            (should (string-match-p "wait_reason: timeout" payload))
+            (should (string-match-p "wait_reason: exit" payload)))
+          (should-not (gptel-agent--job-waiters job))
+          (should-not (gptel-agent--process-waiter-timer waiter))
+          (should-not (memq timer timer-list)))
+        (gptel-agent-workers-test--answer fsm "The command exited with code 7.")
+        (should (eq (gptel-fsm-state fsm) 'DONE))))))
+
 (ert-deftest gptel-agent-tool-continuation-keeps-complete-signed-blocks ()
   (let* ((content [(:type "thinking" :thinking "Reasoning" :signature "OPAQUE-SIGNATURE")
                   (:type "text" :text "Before" :citations [(:type "page_location" :page 1)])

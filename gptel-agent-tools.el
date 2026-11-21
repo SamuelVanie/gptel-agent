@@ -817,7 +817,11 @@ ARG-VALUES is the list of arguments for the tool call."
         (let ((process
                (make-process
                 :name "gptel-agent-bash" :buffer (gptel-agent--bash-buffer job)
-                :command (list "bash" "-c" command)
+                ;; Foreground calls have no input API.  Use /dev/null rather
+                ;; than an open (or closed) pipe: commands like rg inspect
+                ;; stdin's type to choose between input and directory search.
+                ;; Command-local pipes, redirections and heredocs still work.
+                :command (list "bash" "-c" (concat "exec </dev/null\n" command))
                 :connection-type 'pipe :file-handler t :noquery t
                 :filter (apply-partially #'gptel-agent--bash-filter job)
                 :sentinel (lambda (process _event)
@@ -844,21 +848,43 @@ CALLBACK is called with the command output string when the process finishes.
 COMMAND is the bash command string to execute.  QUERY states what should be
 extracted from the result if it is too large to return directly.
 When BACKGROUND is t, return a session-owned job ID immediately.
-Otherwise spill oversized output incrementally to disk.  Optional FSM owns
-foreground execution so cancelling the request also stops its commands."
-  (unless (and (stringp query)
-               (not (string-empty-p (string-trim query))))
-    (error "QUERY must state what should be extracted from Bash output"))
-  (unless (memq background '(nil t :json-false))
-    (error "background must be a boolean"))
-  (if (eq background t)
-      (let* ((process (gptel-agent--start-background-process command))
-             (job (process-get process 'gptel-agent-job)))
-        (funcall callback
-                 (concat (gptel-agent--process-summary job)
-                         "Use Process wait (until=exit) for completion, or read with view=tail for recent output.\n"))
-        process)
-    (gptel-agent--start-foreground-bash callback command query fsm)))
+Otherwise run with stdin from /dev/null and spill oversized output
+incrementally to disk.  Optional FSM owns foreground execution so cancelling
+the request also stops its commands.  Validation and launch errors are
+delivered through CALLBACK so the agent can correct the call."
+  (let (process result callback-called)
+    (condition-case err
+        (progn
+          (unless (stringp command)
+            (error "command must be a string"))
+          (unless (and (stringp query)
+                       (not (string-empty-p (string-trim query))))
+            (error "QUERY must state what should be extracted from Bash output"))
+          (unless (memq background '(nil t :json-false))
+            (error "background must be a boolean"))
+          (if (eq background t)
+              (progn
+                (setq process (gptel-agent--start-background-process command))
+                (setq result
+                      (concat
+                       (gptel-agent--process-summary
+                        (process-get process 'gptel-agent-job))
+                       "Use Process wait (until=exit) for completion, or read with view=tail for recent output.\n")))
+            (setq process
+                  (gptel-agent--start-foreground-bash
+                   (lambda (value)
+                     (setq callback-called t)
+                     (funcall callback value))
+                   command query fsm))))
+      (error
+       ;; A file handler may deliver a result during launch.  A downstream
+       ;; callback error must propagate, never become a second tool result.
+       (if callback-called
+           (signal (car err) (cdr err))
+         (setq result (concat "Error: " (error-message-string err))))))
+    ;; Keep immediate callbacks outside the startup error handler as well.
+    (when result (funcall callback result))
+    process))
 
 ;;; Code tools
 ;;;; Diagnostics from flymake
@@ -4141,6 +4167,9 @@ directory. Agent and Discussion accept directory for a child's workspace.
 - For parallel commands, make multiple `Bash` calls in one message
 - Prefer foreground Bash (background=false, the default) for tests, builds and \
 commands whose result you need before proceeding. It waits for completion.
+- Foreground stdin is /dev/null, so implicit reads receive EOF. \
+Use pipes, file redirection or heredocs to supply input within the command. \
+For interactive jobs, use background=true and Process send.
 - For servers, watchers or jobs you can work alongside, set background=true. \
 This returns a session-owned process_id immediately. Do other useful work, then \
 use `Process` wait with until=exit when you need completion; use read with \

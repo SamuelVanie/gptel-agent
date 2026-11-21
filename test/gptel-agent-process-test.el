@@ -173,9 +173,14 @@
   (with-temp-buffer
     (let ((before (buffer-list)))
       (dolist (failure '(nil error))
-        (cl-letf (((symbol-function 'make-process)
-                   (lambda (&rest _) (when failure (error "Cannot start")))))
-          (should-error (gptel-agent--execute-bash #'ignore "ignored" "Test" t)))
+        (let (results)
+          (cl-letf (((symbol-function 'make-process)
+                     (lambda (&rest _) (when failure (error "Cannot start")))))
+            (should-not
+             (gptel-agent--execute-bash
+              (lambda (result) (push result results)) "ignored" "Test" t)))
+          (should (= (length results) 1))
+          (should (string-prefix-p "Error: " (car results))))
         (should-not gptel-agent--processes)
         (should-not
          (cl-find-if
@@ -315,6 +320,125 @@
                                  "wait" id nil nil 5 "unread")
       (should (string-suffix-p "ready" (car results)))
       (should (= (gptel-agent--job-cursor job) 5)))))
+
+(ert-deftest gptel-agent-process-wait-finishes-redirected-test-pipelines ()
+  ;; Model a test runner whose full log goes to disk, followed by a summary
+  ;; grep and an explicit exit preserving the test runner's status.
+  (dolist (case '(("redirect" 0) ("pipeline" 7) ("silent" 7)))
+    (dolist (finished-first '(nil t))
+      (let ((directory (make-temp-file "gptel-process-log-test-" t))
+            (gptel-confirm-tool-calls nil)
+            (gptel-agent-use-project-instructions nil))
+        (unwind-protect
+            (gptel-agent-process-test--with-session
+              (let* ((default-directory (file-name-as-directory directory))
+                     (gate (expand-file-name "continue" directory))
+                     (log (expand-file-name "tests.log" directory))
+                     (fixture
+                      (format
+                       (concat "{ printf 'Tests run: 3, Failures: 0\\n'; "
+                               "while [ ! -f %s ]; do sleep 0.01; done; "
+                               "(exit %d); }")
+                       (shell-quote-argument gate) (cadr case)))
+                     (command
+                      (if (equal (car case) "pipeline")
+                          (concat fixture " 2>&1 | tee tests.log >/dev/null; "
+                                  "result=${PIPESTATUS[0]}; ")
+                        (concat fixture " >tests.log 2>&1; result=$?; ")))
+                     (command
+                      (concat (when (equal (car case) "silent")
+                                "exec >/dev/null 2>&1; ")
+                              command "grep 'Tests run' tests.log; exit \"$result\""))
+                     (process (gptel-agent--execute-bash
+                               #'ignore command "Read test summary" t))
+                     (job (process-get process 'gptel-agent-job))
+                     (backend (gptel-make-openai-responses
+                               "process-log-test" :key "unused"
+                               :host "example.invalid" :models '(test)))
+                     (call (list :name "Process" :args
+                                 (list :action "wait"
+                                       :process_id (gptel-agent--job-id job)
+                                       :until "exit" :timeout_ms 60000)))
+                     (fsm (gptel-make-fsm
+                           :table gptel-send--transitions
+                           :handlers '((TOOL gptel--handle-tool-use))
+                           :info (list :buffer session :backend backend
+                                       :callback #'ignore :tool-use (list call)))))
+                (gptel-agent-process-test--wait (lambda () (file-exists-p log)))
+                (when finished-first
+                  (with-temp-file gate)
+                  (gptel-agent-process-test--wait
+                   (lambda () (not (process-live-p process)))))
+                (setq-local gptel-tools (list (gptel-get-tool "Process")))
+                (gptel-agent--localize-agent-tool fsm)
+                (setf (plist-get (gptel-fsm-info fsm) :tools) gptel-tools)
+                (gptel--fsm-transition fsm 'TOOL)
+                (let* ((waiters (copy-sequence (gptel-agent--job-waiters job)))
+                       (timers (mapcar #'gptel-agent--process-waiter-timer waiters)))
+                  (unless finished-first
+                    (should (eq (gptel-fsm-state fsm) 'TOOL))
+                    (should (= (length waiters) 1))
+                    (should (timerp (car timers)))
+                    (should-not (plist-get call :result))
+                    (with-temp-file gate))
+                  (gptel-agent-process-test--wait
+                   (lambda () (plist-get call :result)))
+                  (let ((result (plist-get call :result)))
+                    (should (eq (gptel-fsm-state fsm) 'TRET))
+                    (should (string-prefix-p "wait_reason: exit\n" result))
+                    (should (string-match-p
+                             (format "status: exit\nexit_code: %d\n" (cadr case))
+                             result))
+                    (should (string-suffix-p
+                             (if (equal (car case) "silent")
+                                 "STDOUT+STDERR:\n(no new output)"
+                               "STDOUT+STDERR:\nTests run: 3, Failures: 0\n")
+                             result)))
+                  (should-not (gptel-agent--job-waiters job))
+                  (dolist (timer timers) (should-not (memq timer timer-list)))
+                  (dolist (waiter waiters)
+                    (should-not (gptel-agent--process-waiter-timer waiter))
+                    (gptel-agent--process-finish-wait waiter "timeout"))
+                  (gptel-agent--process-sentinel job process "finished\n")
+                  (should (= (length (plist-get (gptel-fsm-info fsm) :tool-result)) 1))
+                  (should (eq (gptel-fsm-state fsm) 'TRET)))))
+          (delete-directory directory t))))))
+
+(ert-deftest gptel-agent-process-wait-reported-arguments-return-timeout ()
+  (gptel-agent-process-test--with-job
+      (process "printf ready; read -r answer; printf done")
+    (let* ((gptel-confirm-tool-calls nil)
+           (gptel-agent-use-project-instructions nil)
+           (job (process-get process 'gptel-agent-job))
+           (backend (gptel-make-openai-responses
+                     "process-timeout-test" :key "unused"
+                     :host "example.invalid" :models '(test)))
+           ;; Preserve the reported arguments, including the misspelled
+           ;; max_char (ignored by schema mapping; max_chars uses its default).
+           (call (list :name "Process" :args
+                       (list :until "exit" :action "wait"
+                             :process_id (gptel-agent--job-id job)
+                             :input "" :offset 0 :max_char 3000
+                             :view "unread" :timeout_ms 1000)))
+           (fsm (gptel-make-fsm
+                 :table gptel-send--transitions
+                 :handlers '((TOOL gptel--handle-tool-use))
+                 :info (list :buffer (current-buffer) :backend backend
+                             :callback #'ignore :http-status "200"
+                             :status "HTTP/2 200" :tool-use (list call)))))
+      (setq-local gptel-tools (list (gptel-get-tool "Process")))
+      (gptel-agent--localize-agent-tool fsm)
+      (setf (plist-get (gptel-fsm-info fsm) :tools) gptel-tools)
+      (gptel--fsm-transition fsm 'TOOL)
+      (gptel-agent-process-test--wait (lambda () (plist-get call :result)))
+      (should (eq (gptel-fsm-state fsm) 'TRET))
+      (should-not (plist-get (gptel-fsm-info fsm) :error))
+      (should (string-prefix-p "wait_reason: timeout\n" (plist-get call :result)))
+      (should (string-match-p "\nstatus: run\n" (plist-get call :result)))
+      (should (string-suffix-p "STDOUT+STDERR:\nready" (plist-get call :result)))
+      (should (process-live-p process))
+      (should-not (gptel-agent--job-waiters job))
+      (should (= (length (plist-get (gptel-fsm-info fsm) :tool-result)) 1)))))
 
 (ert-deftest gptel-agent-process-wait-validates-before-parking ()
   (gptel-agent-process-test--with-job (process "read -r answer")

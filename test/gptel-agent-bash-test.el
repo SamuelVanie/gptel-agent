@@ -3,6 +3,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'gptel-agent)
+(require 'gptel-openai-responses)
 
 (defun gptel-agent-bash-test--wait (predicate)
   "Service subprocesses for up to ten seconds until PREDICATE succeeds."
@@ -30,6 +31,15 @@
     (let ((coding-system-for-read 'utf-8-unix)) (insert-file-contents file))
     (buffer-string)))
 
+(defun gptel-agent-bash-test--gate (directory name)
+  "Return a shell command waiting for file NAME in DIRECTORY."
+  (format "while [ ! -f %s ]; do sleep 0.01; done"
+          (shell-quote-argument (expand-file-name name directory))))
+
+(defun gptel-agent-bash-test--release (directory name)
+  "Release the shell gate named NAME in DIRECTORY."
+  (with-temp-file (expand-file-name name directory)))
+
 (ert-deftest gptel-agent-bash-spools-large-output-before-exit ()
   (gptel-agent-bash-test--with-session (source directory)
     (let* ((gptel-agent-tool-result-max-chars 20000)
@@ -39,7 +49,9 @@
            (process (gptel-agent--execute-bash
                      (lambda (result)
                        (push result results) (setq callback-buffer (current-buffer)))
-                     "printf '%1048576s' x; printf '%1048576s' y; read -r answer; printf '\nfinished\n'"
+                     (concat "printf '%1048576s' x; printf '%1048576s' y; "
+                             (gptel-agent-bash-test--gate directory "continue")
+                             "; printf '\nfinished\n'")
                      "Find the completion marker"))
            (job (process-get process 'gptel-agent-bash))
            (output (process-buffer process)))
@@ -52,7 +64,7 @@
       (let ((file (gptel-agent--bash-file job)))
         (should (= (file-attribute-size (file-attributes file)) (* 2 1024 1024)))
         (should-not (gethash file gptel-agent--saved-tool-results))
-        (process-send-string process "continue\n")
+        (gptel-agent-bash-test--release directory "continue")
         (gptel-agent-bash-test--wait (lambda () results))
         (should (= (length results) 1))
         (should (eq callback-buffer source))
@@ -88,6 +100,69 @@
         (should-not (buffer-live-p output))
         (should-not gptel-agent--bash-jobs)))))
 
+(ert-deftest gptel-agent-bash-foreground-stdin-readers-complete ()
+  ;; Foreground jobs cannot receive Process send input.  An inherited open
+  ;; pipe used to leave each of these commands and its tool request waiting.
+  (dolist (background '(nil :json-false))
+    (dolist (case '(("cat" "")
+                    ("grep needle"
+                     "Command failed with exit code 1:\nSTDOUT+STDERR:\n")
+                    ("read -r answer; printf 'finished\n'" "finished\n")))
+      (gptel-agent-bash-test--with-session (source directory)
+        (let* ((gptel-confirm-tool-calls nil)
+               (gptel-agent-use-project-instructions nil)
+               (backend (gptel-make-openai-responses
+                         "bash-test" :key "unused" :host "example.invalid"
+                         :models '(test)))
+               (call (list :name "Bash" :args
+                           (append (list :command (car case) :query "Read output")
+                                   (when background (list :background background)))))
+               (fsm (gptel-make-fsm
+                     :table gptel-send--transitions
+                     :handlers '((TOOL gptel--handle-tool-use))
+                     :info (list :buffer source :backend backend
+                                 :callback #'ignore :tool-use (list call)))))
+          (setq-local gptel-tools (list (gptel-get-tool "Bash")))
+          (gptel-agent--localize-agent-tool fsm)
+          (setf (plist-get (gptel-fsm-info fsm) :tools) gptel-tools)
+          (gptel--fsm-transition fsm 'TOOL)
+          (gptel-agent-bash-test--wait
+           (lambda () (plist-get call :result)))
+          (should (equal (plist-get call :result) (cadr case)))
+          (should (eq (gptel-fsm-state fsm) 'TRET))
+          (should-not gptel-agent--bash-jobs))))))
+
+(ert-deftest gptel-agent-bash-foreground-preserves-explicit-input ()
+  (gptel-agent-bash-test--with-session (source directory)
+    (let ((input-file (expand-file-name "input.txt" directory)))
+      (with-temp-file input-file (insert "file input\n"))
+      (dolist (case (list '("printf 'pipe input\n' | cat" "pipe input\n")
+                         '("cat <<'EOF'\nhere document\nEOF" "here document\n")
+                         '("cat <<< 'here string'" "here string\n")
+                         (list (concat "cat < " (shell-quote-argument input-file))
+                               "file input\n")))
+        (let (results)
+          (gptel-agent--execute-bash
+           (lambda (result) (push result results)) (car case) "Read output")
+          (gptel-agent-bash-test--wait (lambda () results))
+          (should (equal results (list (cadr case))))
+          (should-not gptel-agent--bash-jobs))))))
+
+(ert-deftest gptel-agent-bash-ripgrep-without-path-searches-directory ()
+  (skip-unless (executable-find "rg"))
+  (gptel-agent-bash-test--with-session (source directory)
+    (let ((default-directory (file-name-as-directory directory)) results)
+      (with-temp-file (expand-file-name "input.txt" directory)
+        (insert "needle\n"))
+      ;; Merely sending EOF to a pipe still makes ripgrep search that pipe,
+      ;; giving an empty result instead of searching the working directory.
+      (gptel-agent--execute-bash
+       (lambda (result) (push result results))
+       "rg --no-config --no-heading --color never needle" "Find the matching line")
+      (gptel-agent-bash-test--wait (lambda () results))
+      (should (equal results '("input.txt:needle\n")))
+      (should-not gptel-agent--bash-jobs))))
+
 (ert-deftest gptel-agent-bash-spill-preserves-unicode-across-chunks-and-limits ()
   (gptel-agent-bash-test--with-session (source directory)
     (let* ((gptel-agent-tool-result-max-chars 8)
@@ -97,18 +172,22 @@
            results
            (process (gptel-agent--execute-bash
                      (lambda (result) (push result results))
-                     "printf 'é猫\n'; read -r answer; printf 'café世界\nlast'; read -r answer; exit 9"
+                     (concat "printf 'é猫\n'; "
+                             (gptel-agent-bash-test--gate directory "next")
+                             "; printf 'café世界\nlast'; "
+                             (gptel-agent-bash-test--gate directory "done")
+                             "; exit 9")
                      "Find the error"))
            (job (process-get process 'gptel-agent-bash)))
       (gptel-agent-bash-test--wait (lambda () (= (gptel-agent--bash-chars job) 3)))
       (should-not (gptel-agent--bash-file job))
-      (process-send-string process "next\n")
+      (gptel-agent-bash-test--release directory "next")
       (gptel-agent-bash-test--wait (lambda () (= (gptel-agent--bash-chars job) 14)))
       (should (= (buffer-size (process-buffer process)) 12))
       ;; Async completion uses the limits captured at launch, not later settings.
       (setq gptel-agent-tool-result-max-chars 1000
             gptel-agent-tool-result-preview-lines 10)
-      (process-send-string process "done\n")
+      (gptel-agent-bash-test--release directory "done")
       (gptel-agent-bash-test--wait (lambda () results))
       (let ((result (car results)) (file (gptel-agent--bash-file job)))
         (should (string-prefix-p "Command failed with exit code 9:" result))
@@ -135,7 +214,9 @@
            results
            (process (gptel-agent--execute-bash
                      (lambda (result) (push result results))
-                     "printf 'long output'; read -r answer" "Read output"))
+                     (concat "printf 'long output'; "
+                             (gptel-agent-bash-test--gate directory "continue"))
+                     "Read output"))
            (job (process-get process 'gptel-agent-bash))
            (output (process-buffer process)))
       (gptel-agent-bash-test--wait (lambda () (gptel-agent--bash-file job)))
@@ -156,7 +237,8 @@
       (gptel-agent--localize-agent-tool fsm)
       (let* ((foreground (funcall (gptel-tool-function (car gptel-tools))
                                   (lambda (result) (push result results))
-                                  "read -r answer" "Read output"))
+                                  (gptel-agent-bash-test--gate directory "continue")
+                                  "Read output"))
              (background (gptel-agent--execute-bash #'ignore "read -r answer" "Read output" t))
              (output (process-buffer foreground)))
         (should (eq (gptel-tool-function base-tool) #'gptel-agent--execute-bash))
@@ -173,7 +255,9 @@
   (gptel-agent-bash-test--with-session (source directory)
     (let* ((gptel--request-alist nil) results
            (process (gptel-agent--execute-bash
-                     (lambda (result) (push result results)) "read -r answer" "Read output")))
+                     (lambda (result) (push result results))
+                     (gptel-agent-bash-test--gate directory "continue")
+                     "Read output")))
       (gptel-abort source)
       (should-not (process-live-p process))
       (should-not gptel-agent--bash-jobs)
@@ -186,7 +270,9 @@
              (write (symbol-function 'write-region)) results
              (process (gptel-agent--execute-bash
                        (lambda (result) (push result results))
-                       "printf 'long output'; read -r answer" "Read output"))
+                       (concat "printf 'long output'; "
+                               (gptel-agent-bash-test--gate directory "continue"))
+                       "Read output"))
              (output (process-buffer process)))
         (cl-letf (((symbol-function 'write-region)
                    (lambda (start end filename &optional append &rest args)
@@ -205,9 +291,13 @@
 
 (ert-deftest gptel-agent-bash-launch-failure-does-not-leak ()
   (gptel-agent-bash-test--with-session (source directory)
-    (let ((buffers (buffer-list)))
+    (let ((buffers (buffer-list)) results)
       (cl-letf (((symbol-function 'make-process) (lambda (&rest _) (error "Launch failed"))))
-        (should-error (gptel-agent--execute-bash #'ignore "true" "Read output")))
+        (gptel-agent--execute-bash
+         (lambda (result) (push result results)) "true" "Read output"))
+      (should (= (length results) 1))
+      (should (string-prefix-p "Error: " (car results)))
+      (should (string-match-p "Launch failed" (car results)))
       (should-not gptel-agent--bash-jobs)
       (should (equal buffers (buffer-list)))
       (should-not (directory-files directory nil directory-files-no-dot-files-regexp)))))
