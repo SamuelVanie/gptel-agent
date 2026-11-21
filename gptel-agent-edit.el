@@ -115,10 +115,11 @@ Exact matches take precedence.  Never guess changed words or punctuation."
   (list change))
 
 (defun gptel-agent-edit--snapshot (path &optional must-exist)
-  "Read PATH into a change plist.  Require an existing file if MUST-EXIST."
-  (setq path (gptel-agent-path-resolve path 'file))
+  "Read PATH's canonical target into a change plist.
+Require an existing file if MUST-EXIST.  All file edits follow symlinks,
+including deletion, so application and history refer to the same target."
+  (setq path (file-truename (gptel-agent-path-resolve path 'file)))
   (when gptel-agent-edit--staged-changes
-    (setq path (file-truename path))
     (let ((parent (file-name-directory path)))
       (while (and parent (not (equal parent (file-name-directory (directory-file-name parent)))))
         (when (plist-get (gethash (directory-file-name parent) gptel-agent-edit--staged-changes) :after)
@@ -318,7 +319,7 @@ starting with additional plus or minus signs.  Never count file headers."
     (dolist (section sections)
       (pcase-let* ((`(,old ,new ,hunks) section)
                    (target (if directory (gptel-agent-edit--target old new path) path))
-                   (target (if gptel-agent-edit--staged-changes (file-truename target) target))
+                   (target (file-truename target))
                    (existing (cl-find target changes :key (lambda (c) (plist-get c :path))
                                       :test #'equal))
                    (change (or existing (gptel-agent-edit--snapshot target
