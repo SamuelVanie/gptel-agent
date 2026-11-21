@@ -1131,61 +1131,93 @@ Signals an error if:
 
 ;;; Commands
 
+(defun gptel-agent-compact--fail (info reason &optional summary)
+  "Record a compaction failure in INFO with REASON.
+When SUMMARY is available, retain it in a separate buffer for recovery."
+  (plist-put info :error reason)
+  (when (stringp summary)
+    (let ((summary-buffer (generate-new-buffer "*gptel-compaction-summary*")))
+      (with-current-buffer summary-buffer
+        (insert summary)
+        (goto-char (point-min))
+        (setq buffer-read-only t))
+      (plist-put info :summary-buffer summary-buffer)
+      (with-demoted-errors "Could not display compaction summary: %S"
+        (display-buffer summary-buffer))))
+  (when-let* ((buf (plist-get info :buffer))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (gptel--update-status " Error: Compaction failed" 'error)))
+  (message "Prompt compaction failed: %s%s" reason
+           (if-let* ((summary-buffer (plist-get info :summary-buffer)))
+               (format "; summary saved in %s" (buffer-name summary-buffer))
+             "")))
+
 (defun gptel-agent-compact--callback (resp info)
   "Callback for `gptel-agent-compact'.
 
 See `gptel-request' for the meanings of RESP and INFO."
-  (let ((buf (plist-get info :buffer))
-        (pos (plist-get info :position)))
+  (let ((buf (plist-get info :buffer)))
     (cond
-     ((not (buffer-live-p buf))
-      (user-error "Session buffer \"%s\" is no longer available"
-                  (buffer-name buf)))
-     ((null resp)                       ;error
-      (with-current-buffer buf
-        (gptel--update-status
-         (format " Error: %s" (gptel--to-string (plist-get info :status))) 'error))
-      (message
-       "Prompt compaction failed with error %S, see *Messages* buffer for details"
-       (plist-get info :status))
-      (let ((inhibit-message t))
-        (message "Error details:\n%S" (plist-get info :error))))
-     ((stringp resp)
-      (with-current-buffer buf
-        (goto-char pos)
-        (save-restriction
-          (if-let* ((region-markers (plist-get info :context)))
-              (apply #'narrow-to-region region-markers)
-            (narrow-to-region (point-min) pos))
-          (if (or buffer-read-only
-                  (get-char-property (point) 'read-only)
-                  (/= (previous-single-char-property-change (point) 'read-only)
-                      (point-min)))
-              (user-error "Cannot compact session: read-only text in buffer")
-            ;; Replace chat text
-            (delete-region (point-min) (point-max))
-            (insert resp)
-            (unless (eq (char-before) 10) (insert "\n"))))
-        (gptel--update-status " Ready" 'success)))
      ((and (consp resp) (eq (car resp) 'reasoning)) nil)
-     (t (with-current-buffer buf        ;Tool called -- should not happen!
-          (plist-put info :error "Compaction failed")
-          (gptel--update-status " Error: Compaction failed" 'error)
-          (message "Prompt compaction stalled or failed"))))))
+     ((null resp)                       ;error
+      (gptel-agent-compact--fail
+       info (or (plist-get info :error) (plist-get info :status)
+                "No summary received")))
+     ((stringp resp)
+      (plist-put info :summary resp)
+      ;; Callback errors are demoted by gptel.  Set :error explicitly so
+      ;; its state machine and post functions see failed replacements.
+      (condition-case err
+          (progn
+            (unless (buffer-live-p buf)
+              (error "Session buffer is no longer available"))
+            (with-current-buffer buf
+              (save-excursion
+                (save-restriction
+                  (widen)
+                  (let* ((context (plist-get info :context))
+                         (start (plist-get context :start))
+                         (end (plist-get context :end))
+                         (inhibit-read-only nil))
+                    (unless (and (markerp start) (markerp end)
+                                 (eq (marker-buffer start) buf)
+                                 (eq (marker-buffer end) buf)
+                                 (<= start end))
+                      (error "Selected text is no longer available"))
+                    (unless (equal (buffer-substring-no-properties start end)
+                                   (plist-get context :original))
+                      (error "Selected text changed while compaction was in progress"))
+                    (barf-if-buffer-read-only)
+                    ;; A failed insertion must not leave the original deleted.
+                    (atomic-change-group
+                      (goto-char start)
+                      (delete-region start end)
+                      (insert resp)
+                      (unless (eq (char-before) ?\n) (insert "\n"))))))
+              (gptel--update-status " Ready" 'success)))
+        (error (gptel-agent-compact--fail info (error-message-string err) resp))))
+     (t (gptel-agent-compact--fail
+         info (if (eq resp 'abort) "Compaction canceled"
+                "Compaction stalled or failed"))))))
 
 (defun gptel-agent-compact (&optional extra post-func confirm)
   "Compact contents of buffer up to point, or region if active.
 
-This will replace buffer text with an LLM generated summary.  For prompt
-compaction instructions see `gptel-agent-compact-prompt'.
+This will replace buffer text with an LLM generated summary, provided
+the selected text has not changed while the request was in progress.
+If replacement fails, keep the summary in a separate buffer instead.
+For prompt compaction instructions see `gptel-agent-compact-prompt'.
 
 With prefix argument, prompt for EXTRA instructions.
 
 POST-FUNC is a function to run after the compaction is complete.  It is
 called with one argument, the INFO plist of the compaction request.
 This plist contains request details, including the :error key which is
-non-nil if the compaction request failed.  See `gptel-request' for more
-information about INFO.
+non-nil if the request or replacement failed.  The :summary key holds
+the returned summary, and :summary-buffer holds its recovery buffer
+when replacement failed.  See `gptel-request' for more information
+about INFO.
 
 When CONFIRM is non-nil (the default in interactive use), seek
 confirmation before proceeding."
@@ -1203,6 +1235,14 @@ confirmation before proceeding."
   (let* ((gptel-include-reasoning)
          (gptel-use-tools)
          (gptel-org-branching-context)
+         (start (if (use-region-p) (region-beginning) (point-min)))
+         (end (if (use-region-p) (region-end) (gptel--at-word-end (point))))
+         ;; Track the original text, excluding new insertions at either
+         ;; boundary.  Outside edits can move the selection without
+         ;; invalidating the summary or being removed by its insertion.
+         (context (list :start (copy-marker start t)
+                        :end (copy-marker end nil)
+                        :original (buffer-substring-no-properties start end)))
          (fsm (gptel-request nil
                 :system
                 (if extra
@@ -1213,10 +1253,7 @@ confirmation before proceeding."
                   gptel-agent-compact-prompt)
                 :transforms (list 'gptel-agent-instructions--skip
                                   'gptel--transform-add-context)
-                :context (when (use-region-p)
-                           (pcase-let ((`(,from . ,to) (car (region-bounds))))
-                             (list (set-marker (make-marker) from)
-                                   (set-marker (make-marker) to))))
+                :context context
                 :callback #'gptel-agent-compact--callback)))
     (prog1 fsm
       (when (functionp post-func)
