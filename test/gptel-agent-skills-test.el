@@ -1069,4 +1069,66 @@
           (should (assoc "retry" (gptel-agent--ensure-skills))))
       (delete-directory root t))))
 
+
+(ert-deftest gptel-agent-skills-children-retain-request-config-and-preset-overrides ()
+  (dolist (captured-selection '(nil ("deploy")))
+    (dolist (override '(nil t))
+      (let ((gptel-agent-skills-test--extra-tools '("Agent" "Discussion"))
+            (gptel--known-presets (copy-tree gptel--known-presets)))
+        (gptel-make-preset 'skill-child-selection
+          :agent--enabled-skills '("deploy" "child-extra"))
+        (gptel-agent-skills-test--with-chat ""
+          (dolist (name '("captured" "later"))
+            (let ((directory (expand-file-name (concat name "/deploy") root)))
+              (make-directory directory t)
+              (with-temp-file (expand-file-name "SKILL.md" directory)
+                (insert "---\nname: deploy\ndescription: Project deployment\n---\n"
+                        (upcase name) "-DEPLOYMENT"))))
+          (gptel-agent-workers-test--answer fsm "Ready")
+          (with-current-buffer parent
+            (setq-local default-directory (file-name-as-directory root)
+                        gptel-agent-skill-dirs '("later")
+                        gptel-agent--skills nil
+                        gptel-agent--enabled-skills '("owner-before")
+                        gptel-confirm-tool-calls nil
+                        gptel-agent-preset
+                        (append '(:tools ("Skill"))
+                                (when override '(:agent--enabled-skills ("deploy" "child-extra"))))
+                        gptel-prompt-transform-functions
+                        (cons (lambda (request)
+                                ;; These are request-only settings, as supplied
+                                ;; by an inline preset in the prompt buffer.
+                                (when (eq (plist-get (gptel-fsm-info request) :buffer) parent)
+                                  (setq-local gptel-agent-skill-dirs '("captured")
+                                              gptel-agent--enabled-skills captured-selection)))
+                              gptel-prompt-transform-functions))
+            (goto-char (point-max)) (insert "Delegate") (gptel-send))
+          (setq fsm (caar requests))
+          (with-current-buffer parent
+            (setq-local gptel-agent--enabled-skills '("owner-after")))
+          (let ((gptel-agent--skills nil)
+                (expected-selection (if override '("deploy" "child-extra") captured-selection)))
+            (gptel-agent-workers-test--tool
+             fsm "Agent" '(:subagent_type "researcher" :description "Use captured skills"
+                            :prompt "Load deploy" :background t))
+            (let* ((run (car (hash-table-values gptel-agent--runs)))
+                   (child (gptel-agent--run-child-buffer run))
+                   (request (gptel-agent--run-fsm run)))
+              (should (equal (buffer-local-value 'gptel-agent-skill-dirs child) '("captured")))
+              (should (equal (buffer-local-value 'gptel-agent--enabled-skills child) expected-selection))
+              (gptel-agent-workers-test--tool request "Skill" '(:skill "deploy"))
+              (should (string-match-p "CAPTURED-DEPLOYMENT" (cdar requests)))
+              (gptel-agent-workers-test--answer request "Worker done"))
+            (gptel-agent-workers-test--tool
+             fsm "Discussion" (append '(:title "Captured skill selection" :prompt "Load deploy")
+                                      (when override '(:preset "skill-child-selection"))))
+            (let* ((chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+                   (child (gptel-agent-discussion--chat-buffer chat))
+                   (request (gptel-agent-discussion--chat-fsm chat)))
+              (should (equal (buffer-local-value 'gptel-agent-skill-dirs child) '("captured")))
+              (should (equal (buffer-local-value 'gptel-agent--enabled-skills child) expected-selection))
+              (gptel-agent-workers-test--tool request "Skill" '(:skill "deploy"))
+              (should (string-match-p "CAPTURED-DEPLOYMENT" (cdar requests)))
+              (gptel-agent-workers-test--answer request "Discussion done"))))))))
+
 (provide 'gptel-agent-skills-test)
