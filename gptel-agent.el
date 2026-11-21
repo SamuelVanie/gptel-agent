@@ -1260,6 +1260,38 @@ confirmation before proceeding."
         (let ((info (gptel-fsm-info fsm)))
           (plist-put info :post (cons post-func (plist-get info :post))))))))
 
+(defun gptel-agent--setup-header ()
+  "Install the agent preset selector in the native gptel header.
+Run before other `gptel-mode-hook' functions so optional display modes
+can save and compose the native header, including this selector."
+  (when (and gptel-mode gptel-use-header-line)
+    (let* ((modes '((gptel-agent "[Agent]" font-lock-keyword-face
+                               "Switch to planning preset")
+                   (gptel-plan  "[Plan]"  font-lock-doc-face
+                               "Switch to ask preset")
+                   (ask         "[Ask]"   font-lock-string-face
+                                "Switch to agent preset")))
+           (current 0)
+           (switch-mode
+            (lambda (&rest _)
+              (setq current (mod (1+ current) (length modes)))
+              (gptel--apply-preset
+               (car (nth current modes))
+               (lambda (sym val) (set (make-local-variable sym) val)))
+              (setq-local gptel-agent--current-agent
+                          (symbol-name (car (nth current modes))))
+              (force-mode-line-update)))
+           (display-mode
+            (lambda ()
+              (pcase-let ((`(,_ ,label ,face ,help) (nth current modes)))
+                (concat
+                 (propertize " " 'display '(space :align-to 0))
+                 (format "%s" (gptel-backend-name gptel-backend))
+                 (propertize (buttonize label switch-mode nil help)
+                             'face face))))))
+      (setcar header-line-format
+              `(:eval (funcall ,display-mode))))))
+
 ;;;###autoload
 (defun gptel-agent (&optional project-dir agent-preset)
   "Start a `gptel-agent' session in the current project.
@@ -1274,14 +1306,20 @@ this session, which defaults to the default `gptel-agent'."
              default-directory))
          'gptel-agent))
   (let ((gptel-buf
-         (gptel (generate-new-buffer-name
-                 (format "*gptel-agent:%s*"
-                         (cadr (nreverse (file-name-split project-dir)))))
-                nil
-                (and (use-region-p)
-                     (buffer-substring (region-beginning)
-                                       (region-end)))
-                'interactive)))
+         ;; Customize the native header before optional UI hooks compose it.
+         ;; Bind the default hook because the caller may have a local hook;
+         ;; gptel creates a new buffer, which uses the default value.
+         (cl-letf (((default-value 'gptel-mode-hook)
+                    (cons #'gptel-agent--setup-header
+                          (default-value 'gptel-mode-hook))))
+           (gptel (generate-new-buffer-name
+                   (format "*gptel-agent:%s*"
+                           (cadr (nreverse (file-name-split project-dir)))))
+                  nil
+                  (and (use-region-p)
+                       (buffer-substring (region-beginning)
+                                         (region-end)))
+                  'interactive))))
     (with-current-buffer gptel-buf
       (setq default-directory project-dir)
       (gptel-agent-update)              ;Update all agent definitions
@@ -1289,34 +1327,7 @@ this session, which defaults to the default `gptel-agent'."
        (or agent-preset 'gptel-agent)
        (lambda (sym val) (set (make-local-variable sym) val)))
       (setq-local gptel-agent--current-agent
-                  (symbol-name (or agent-preset 'gptel-agent)))
-      (when gptel-use-header-line
-        (let* ((modes '((gptel-agent "[Agent]" font-lock-keyword-face
-                                     "Switch to planning preset")
-                        (gptel-plan  "[Plan]"  font-lock-doc-face
-                                     "Switch to ask preset")
-                        (ask         "[Ask]"   font-lock-string-face
-                                     "Switch to agent preset")))
-               (current 0)
-               (switch-mode
-                (lambda (&rest _)
-                  (setq current (mod (1+ current) (length modes)))
-                  (gptel--apply-preset
-                   (car (nth current modes))
-                   (lambda (sym val) (set (make-local-variable sym) val)))
-                  (setq-local gptel-agent--current-agent
-                              (symbol-name (car (nth current modes))))
-                  (force-mode-line-update)))
-               (display-mode
-                (lambda ()
-                  (pcase-let ((`(,_ ,label ,face ,help) (nth current modes)))
-                    (concat
-                     (propertize " " 'display '(space :align-to 0))
-                     (format "%s" (gptel-backend-name gptel-backend))
-                     (propertize (buttonize label switch-mode nil help)
-                                 'face face))))))
-          (setcar header-line-format
-                  `(:eval (funcall ,display-mode))))))))
+                  (symbol-name (or agent-preset 'gptel-agent))))))
 
 (provide 'gptel-agent)
 
