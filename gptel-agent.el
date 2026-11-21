@@ -174,16 +174,20 @@ Use `gptel-agent-register' to populate this alist.")
   "Alist of parent names and sub-agent names added from Elisp.
 Use `gptel-agent-add-subagent' to extend a parent's declaration.")
 
-(defvar gptel-agent--skills nil
-  "Known skills alist.
+(defvar-local gptel-agent--skills nil
+  "Known skills alist for this conversation.
 
 The key is the name.  The value is a cons (LOCATION . SKILL-PLIST).
 LOCATION is the path to the skill's directory.  SKILL-PLIST contains
 its discovery metadata (:description and :disable-model-invocation),
 without tool declarations or body.")
 
-(defvar gptel-agent--enabled-skills nil
-  "List of currently enabled skill names.
+(defvar-local gptel-agent--skills-context nil
+  "Directory and configuration used for this buffer's skill discovery.
+Nil also permits an explicitly supplied skills registry to be used as-is.")
+
+(defvar-local gptel-agent--enabled-skills nil
+  "List of currently enabled skill names for this conversation.
 
 When nil, all automatically discoverable skills are considered enabled.
 Use `gptel-agent-toggle-skill' to manage this list interactively.")
@@ -482,9 +486,28 @@ ANCESTORS contains the true names of parent directories, to avoid cycles."
             (push file files))))
         (nconc sub-files (nreverse files))))))
 
+(defun gptel-agent--skills-context ()
+  "Return the current directory and skill discovery configuration."
+  (list (file-name-as-directory (file-truename default-directory))
+        (copy-sequence gptel-agent-skill-dirs)
+        gptel-agent--bundled-skill-dir))
+
+(defun gptel-agent--ensure-skills ()
+  "Return this buffer's skills, refreshing changed discovery scopes.
+An explicitly supplied registry without a discovery context is retained.
+Normal discovery always records its context and never changes the default
+registry inherited by other buffers."
+  (unless (or (and gptel-agent--skills (null gptel-agent--skills-context))
+              (equal gptel-agent--skills-context (gptel-agent--skills-context)))
+    (gptel-agent--update-skills))
+  gptel-agent--skills)
+
 (defun gptel-agent--update-skills ()
-  "Update the known skills list from `gptel-agent-skill-dirs'."
-  (setq gptel-agent--skills nil)
+  "Update this buffer's known skills from `gptel-agent-skill-dirs'."
+  ;; A failed refresh must not make its partial registry look explicitly
+  ;; supplied, or mark the old scope as successfully discovered.
+  (setq gptel-agent--skills nil
+        gptel-agent--skills-context 'refreshing)
   (mapc (lambda (dir)
           (when (file-directory-p dir)
             (dolist (skill-file (gptel-agent--skill-files dir))
@@ -512,6 +535,7 @@ ANCESTORS contains the true names of parent directories, to avoid cycles."
                  and when project-root
                  collect (expand-file-name dir project-root) into relative-dirs
                  finally return (nconc (nreverse absolute-dirs) (nreverse relative-dirs))))
+  (setq gptel-agent--skills-context (gptel-agent--skills-context))
   gptel-agent--skills)
 
 (defun gptel-agent--manual-skill-p (skill)
@@ -657,8 +681,7 @@ Skills with disable-model-invocation are excluded.
 The Skill tool's description is updated immediately without
 requiring `gptel-agent-update'."
   (interactive)
-  (unless gptel-agent--skills
-    (gptel-agent--update-skills))
+  (gptel-agent--ensure-skills)
   (let* ((all-skills (mapcar #'car (gptel-agent--model-skills gptel-agent--skills t)))
          (current (mapcar #'car (gptel-agent--model-skills gptel-agent--skills)))
          (selected

@@ -922,4 +922,151 @@
     (font-lock-ensure)
     (should-not (text-property-not-all (point-min) (point-max) 'display nil))))
 
+
+(defun gptel-agent-skills-test--scoped-tool (source)
+  "Return SOURCE's Skill dispatcher as localized in a temporary prompt buffer."
+  (with-temp-buffer
+    (setq-local default-directory temporary-file-directory
+                gptel-tools (list (gptel-get-tool "Skill")))
+    (gptel-agent--localize-skill-tool
+     (gptel-make-fsm :state 'TOOL :info (list :buffer source)))
+    (car gptel-tools)))
+
+(ert-deftest gptel-agent-skills-unselected-tool-does-not-discover ()
+  (with-temp-buffer
+    (setq-local gptel-tools nil gptel-agent--skill-tools nil)
+    (cl-letf (((symbol-function 'gptel-agent--ensure-skills)
+               (lambda () (ert-fail "A request without Skill scanned skill directories"))))
+      (gptel-agent--localize-skill-tool
+       (gptel-make-fsm :info (list :buffer (current-buffer)))))))
+
+(ert-deftest gptel-agent-skills-project-discovery-and-cd-are-isolated ()
+  (let* ((root (make-temp-file "gptel-skill-scopes-" t))
+         (first (generate-new-buffer " *skill-project-one*"))
+         (second (generate-new-buffer " *skill-project-two*"))
+         (gptel-agent-skill-dirs '(".skills"))
+         (gptel-agent--bundled-skill-dir (expand-file-name "no-bundled" root))
+         (gptel-agent--skills nil)
+         (gptel-agent--enabled-skills nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
+          (dolist (entry (list (cons first "FIRST") (cons second "SECOND")))
+            (let* ((directory (expand-file-name (cdr entry) root))
+                   (skill-directory (expand-file-name ".skills/deploy" directory)))
+              (make-directory skill-directory t)
+              (with-temp-file (expand-file-name "SKILL.md" skill-directory)
+                (insert "---\nname: deploy\ndescription: " (cdr entry)
+                        " deployment\n---\nDeploy " (cdr entry)))
+              (with-current-buffer (car entry)
+                (setq default-directory (file-name-as-directory directory))
+                (gptel-agent--update-skills))))
+          ;; Discovery in another chat cannot alter either a fresh request or
+          ;; a dispatcher whose request is already in flight.
+          (let ((old (gptel-agent-skills-test--scoped-tool first))
+                (other (gptel-agent-skills-test--scoped-tool second)))
+            (should (string-match-p "Deploy FIRST" (funcall (gptel-tool-function old) "deploy")))
+            (should (string-match-p "Deploy SECOND" (funcall (gptel-tool-function other) "deploy")))
+            (with-current-buffer second (gptel-agent--update-skills))
+            (should (string-match-p "FIRST deployment"
+                                    (gptel-tool-description (gptel-agent-skills-test--scoped-tool first))))
+            (with-current-buffer first
+              (cd (buffer-local-value 'default-directory second)))
+            (let ((next (gptel-agent-skills-test--scoped-tool first)))
+              (should (string-match-p "Deploy SECOND" (funcall (gptel-tool-function next) "deploy"))))
+            (should (string-match-p "Deploy FIRST" (funcall (gptel-tool-function old) "deploy")))
+            ;; Changing into a scope with no skills must clear the old registry.
+            (with-current-buffer first (cd root))
+            (let ((empty (gptel-agent-skills-test--scoped-tool first)))
+              (should (equal (funcall (gptel-tool-function empty) "deploy")
+                             "Error: skill deploy not found.")))
+            (should (string-match-p "Deploy SECOND" (funcall (gptel-tool-function other) "deploy")))
+            ;; Directory configuration changes also invalidate discovery even
+            ;; when the conversation itself has not moved.
+            (with-current-buffer first
+              (setq-local gptel-agent-skill-dirs
+                          (list (expand-file-name "SECOND/.skills" root))))
+            (let ((configured (gptel-agent-skills-test--scoped-tool first)))
+              (should (string-match-p "Deploy SECOND"
+                                      (funcall (gptel-tool-function configured) "deploy")))))
+          (should-not (default-value 'gptel-agent--skills)))
+      (kill-buffer first) (kill-buffer second) (delete-directory root t))))
+
+(ert-deftest gptel-agent-skills-selection-is-conversation-local ()
+  (let* ((first (generate-new-buffer " *skill-selection-one*"))
+         (second (generate-new-buffer " *skill-selection-two*"))
+         (gptel-agent--skills '(("deploy" "/unused" :description "Deploy")
+                               ("check" "/unused" :description "Check")))
+         (gptel-agent--enabled-skills nil)
+         (gptel--known-tools (copy-tree gptel--known-tools)))
+    (unwind-protect
+        (let ((old (gptel-agent-skills-test--scoped-tool first)))
+          (with-current-buffer first
+            (cl-letf (((symbol-function 'completing-read-multiple)
+                       (lambda (&rest _) '("check"))))
+              (gptel-agent-toggle-skill)))
+          (let ((next (gptel-agent-skills-test--scoped-tool first))
+                (other (gptel-agent-skills-test--scoped-tool second)))
+            (should (string-match-p "Deploy" (gptel-tool-description old)))
+            (should (string-match-p "Deploy" (gptel-tool-description other)))
+            (should-not (string-match-p "Deploy" (gptel-tool-description next)))
+            (should (string-match-p "not enabled for this request"
+                                    (funcall (gptel-tool-function next) "deploy"))))
+          (should-not (buffer-local-value 'gptel-agent--enabled-skills second))
+          (should-not (default-value 'gptel-agent--enabled-skills)))
+      (kill-buffer first) (kill-buffer second))))
+
+(ert-deftest gptel-agent-skills-children-inherit-custom-discovery-configuration ()
+  (let ((gptel-agent-skills-test--extra-tools '("Agent" "Discussion")))
+    (gptel-agent-skills-test--with-chat ""
+      (let ((directory (expand-file-name "capabilities/deploy" root)))
+        (make-directory directory t)
+        (with-temp-file (expand-file-name "SKILL.md" directory)
+          (insert "---\nname: deploy\ndescription: Project deployment\n---\nPROJECT-DEPLOYMENT")))
+      (gptel-agent-workers-test--answer fsm "Ready")
+      (with-current-buffer parent
+        (setq-local default-directory (file-name-as-directory root)
+                    gptel-agent-skill-dirs '("capabilities")
+                    gptel-agent--skills nil
+                    gptel-agent--enabled-skills '("deploy")
+                    gptel-confirm-tool-calls nil
+                    gptel-agent-preset '(:tools ("Skill")))
+        (goto-char (point-max)) (insert "Delegate") (gptel-send))
+      (setq fsm (caar requests))
+      (let ((gptel-agent--skills nil)
+            (gptel-agent-skill-dirs '("nonexistent-global-directory")))
+        (gptel-agent-workers-test--tool
+         fsm "Agent" '(:subagent_type "researcher" :description "Use project skill"
+                        :prompt "Load deploy" :background t))
+        (let* ((run (car (hash-table-values gptel-agent--runs)))
+               (child (gptel-agent--run-child-buffer run))
+               (request (gptel-agent--run-fsm run)))
+          (should (equal (buffer-local-value 'gptel-agent-skill-dirs child) '("capabilities")))
+          (should (equal (buffer-local-value 'gptel-agent--enabled-skills child) '("deploy")))
+          (gptel-agent-workers-test--tool request "Skill" '(:skill "deploy"))
+          (should (string-match-p "PROJECT-DEPLOYMENT" (cdar requests)))
+          (gptel-agent-workers-test--answer request "Worker done"))
+        (gptel-agent-workers-test--tool fsm "Discussion" '(:title "Project skill" :prompt "Load deploy"))
+        (let* ((chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+               (child (gptel-agent-discussion--chat-buffer chat))
+               (request (gptel-agent-discussion--chat-fsm chat)))
+          (should (equal (buffer-local-value 'gptel-agent-skill-dirs child) '("capabilities")))
+          (should (equal (buffer-local-value 'gptel-agent--enabled-skills child) '("deploy")))
+          (gptel-agent-workers-test--tool request "Skill" '(:skill "deploy"))
+          (should (string-match-p "PROJECT-DEPLOYMENT" (cdar requests)))
+          (gptel-agent-workers-test--answer request "Discussion done"))))))
+
+(ert-deftest gptel-agent-skills-failed-discovery-retries-the-same-scope ()
+  (let* ((root (make-temp-file "gptel-skill-retry-" t))
+         (gptel-agent-skill-dirs (list root))
+         (gptel-agent--bundled-skill-dir root))
+    (unwind-protect
+        (with-temp-buffer
+          (with-temp-file (expand-file-name "SKILL.md" root)
+            (insert "---\nname: retry\n"))
+          (should-error (gptel-agent--ensure-skills))
+          (with-temp-file (expand-file-name "SKILL.md" root)
+            (insert "---\nname: retry\ndescription: Repaired skill\n---\nReady"))
+          (should (assoc "retry" (gptel-agent--ensure-skills))))
+      (delete-directory root t))))
+
 (provide 'gptel-agent-skills-test)

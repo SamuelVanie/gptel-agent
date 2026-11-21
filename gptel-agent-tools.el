@@ -67,10 +67,12 @@
 (declare-function gptel-agent--agent-plist "gptel-agent")
 (declare-function gptel-agent--agent-enabled-p "gptel-agent")
 (declare-function gptel-agent--skills-system-message "gptel-agent")
+(declare-function gptel-agent--ensure-skills "gptel-agent")
 (declare-function gptel-agent--manual-skill-p "gptel-agent")
 (declare-function gptel-agent--agents-tool-message "gptel-agent")
 
 (defvar gptel-agent--agents)
+(defvar gptel-agent-skill-dirs)
 (defvar gptel-agent--skills)
 (defvar gptel-agent--skill-tool-base-desc)
 (defvar gptel-agent--enabled-skills)
@@ -1588,15 +1590,31 @@ the new request.  Keep ordinary conversation tools and registry defaults
 separate from grants so discussions can inherit tools without pre-approvals."
   (let* ((info (gptel-fsm-info fsm))
          (source (plist-get info :buffer))
-         (skills (copy-tree gptel-agent--skills t))
-         (enabled (copy-sequence gptel-agent--enabled-skills))
+         ;; Prompt buffers copy only gptel's own settings.  Resolve discovery
+         ;; and selection from the owner unless a request preset overrides it.
+         (directories (copy-sequence
+                       (if (local-variable-p 'gptel-agent-skill-dirs)
+                           gptel-agent-skill-dirs
+                         (buffer-local-value 'gptel-agent-skill-dirs source))))
+         (enabled (copy-sequence
+                   (if (local-variable-p 'gptel-agent--enabled-skills)
+                       gptel-agent--enabled-skills
+                     (buffer-local-value 'gptel-agent--enabled-skills source))))
          (registry (cl-loop for (_ . entries) in gptel--known-tools
                             append (mapcar (lambda (entry)
                                              (gptel-agent--skill-copy-tool (cdr entry)))
                                            entries)))
          (active (and (buffer-live-p source)
                       (mapcar #'gptel-agent--skill-copy-tool
-                              (buffer-local-value 'gptel-agent--skill-tools source)))))
+                              (buffer-local-value 'gptel-agent--skill-tools source))))
+         (skills (when (gptel-agent--find-builtin-tool "Skill" (append gptel-tools active))
+                   (with-current-buffer source
+                     (let ((gptel-agent-skill-dirs directories))
+                       (copy-tree (gptel-agent--ensure-skills) t))))))
+    ;; Later child configuration snapshots must retain these resolved settings,
+    ;; not the unrelated defaults in the temporary prompt buffer.
+    (setq-local gptel-agent-skill-dirs directories
+                gptel-agent--enabled-skills enabled)
     (setf (gptel-fsm-info fsm)
           (plist-put info :skill-base-tools
                      (mapcar #'gptel-agent--skill-copy-tool gptel-tools)))
@@ -1859,6 +1877,7 @@ file/query pair registered for SOURCE's conversation (default current buffer)."
 (defconst gptel-agent--request-config-variables
   '(gptel-backend gptel-model gptel-stream gptel-system-prompt
     gptel-agent-use-project-instructions
+    gptel-agent-skill-dirs gptel-agent--enabled-skills
     gptel-tools gptel-use-tools gptel-use-context gptel-context
     gptel--request-params gptel-temperature gptel-max-tokens
     gptel-include-reasoning gptel-cache gptel-use-curl
