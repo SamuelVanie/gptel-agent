@@ -100,6 +100,23 @@
         (should (equal (map-nested-elt agent '(:function :parameters :properties :subagent_type :enum))
                        ["Alpha-worker"]))))))
 
+(ert-deftest gptel-agent-project-preset-reload-upgrades-active-chats-before-refresh ()
+  (gptel-agent-project-preset-test--with-projects
+    (with-temp-buffer
+      (setq default-directory alpha)
+      (let ((gptel--known-presets nil))
+        ;; This is the pair of private keys emitted by the old installer.
+        (gptel-make-preset 'gptel-plan
+          :system "Bravo gptel-plan" :agent--current-agent "gptel-plan"
+          :agent--registry-snapshot '(:eval (gptel-agent--refresh-registry)))
+        (gptel-make-preset 'ask :system "User instructions")
+        (load "gptel-agent" nil t)
+        (should-not (assq 'gptel-agent gptel--known-presets))
+        (should (equal (gptel-get-preset 'ask) '(:system "User instructions")))
+        (gptel-preset 'gptel-plan)
+        (gptel-request "Use the current project")
+        (should (equal (pop requests) '("Alpha gptel-plan" 111)))))))
+
 (ert-deftest gptel-agent-project-preset-honors-explicit-overrides ()
   (gptel-agent-project-preset-test--with-projects
     (with-temp-buffer
