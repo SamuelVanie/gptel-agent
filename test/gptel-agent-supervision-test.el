@@ -46,6 +46,45 @@
       (gptel-agent-workers-test--answer fsm "Revised answer")
       (should (eq (gptel-fsm-state fsm) 'DONE)))))
 
+(ert-deftest gptel-agent-supervision-narrowed-report-preserves-history ()
+  (dolist (delivery '(flush settle))
+    (dolist (stream '(nil t))
+      (ert-info ((format "Delivery: %s, streaming: %s" delivery stream))
+        (let ((gptel-agent-workers-test--stream stream))
+          (gptel-agent-supervision-test--with-chat
+           (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+           (gptel-agent-workers-test--answer fsm "Provisional answer" stream)
+           (should (eq (gptel-fsm-state fsm) 'AGWT))
+           (with-current-buffer parent
+             (let ((before (buffer-string))
+                   (end (point-max))
+                   (count (length requests)))
+               (narrow-to-region 2 12)
+               (goto-char 4)
+               (gptel-agent-discussion--emit chat 'report "NARROWED-ACTIVE-REPORT")
+               (pcase delivery
+                 ('flush (gptel-agent-discussion--flush parent))
+                 ('settle (gptel-agent--supervision-settle scope)))
+               (should (eq fsm gptel-agent-discussion--fsm))
+               (should (eq (gptel-fsm-state fsm) 'WAIT))
+               (should (= (1+ count) (length requests)))
+               (should-not gptel-agent-discussion--inbox)
+               (should (equal (list (point-min) (point-max) (point)) '(2 12 4)))
+               (save-restriction
+                 (widen)
+                 (should (equal before (buffer-substring (point-min) end)))
+                 (save-excursion
+                   (goto-char end)
+                   (search-forward "NARROWED-ACTIVE-REPORT")
+                   (should-not (get-text-property (1- (point)) 'gptel))))
+               (let ((data (gptel-agent-workers-test--data fsm)))
+                 (should (string-match-p "Initial parent request" data))
+                 (should (string-match-p "Provisional answer" data))
+                 (should (= 1 (gptel-agent-workers-test--count "NARROWED-ACTIVE-REPORT" data))))
+               (gptel-agent-discussion--flush parent)
+               (gptel-agent--supervision-settle scope)
+               (should (= (1+ count) (length requests)))))))))))
+
 (ert-deftest gptel-agent-supervision-approval-is-owned-and-stop-is-idempotent ()
   (gptel-agent-supervision-test--with-chat
     (should-error (gptel-agent-supervise parent) :type 'user-error)
@@ -145,6 +184,43 @@
             (should-not (string-match-p "Raw evidence for worker" (gptel-agent--run-response run)))
             (gptel-agent-workers-test--answer child "Final evidence")
             (should (eq (gptel-agent--run-state run) 'completed)))
+        (when (buffer-live-p (gptel-agent-discussion--chat-buffer chat))
+          (kill-buffer (gptel-agent-discussion--chat-buffer chat)))))))
+
+(ert-deftest gptel-agent-supervision-narrowed-worker-report-keeps-buffer-ownership ()
+  (gptel-agent-workers-test--with-chat
+    (with-current-buffer parent
+      (setq-local gptel-agent-preset '(:tools ("Discussion" "DiscussionControl"))
+                  gptel-prompt-transform-functions
+                  '(gptel-agent--localize-agent-tool gptel-agent-discussion--localize)))
+    (let* ((run (gptel-agent-workers-test--launch fsm "test-worker"))
+           (child (gptel-agent--run-fsm run))
+           (buffer (gptel-agent--run-child-buffer run))
+           (chat (gptel-agent-discussion-test--spawn child buffer)))
+      (unwind-protect
+          (progn
+            (should (eq (marker-buffer (plist-get (gptel-fsm-info child) :position)) parent))
+            (with-current-buffer parent (narrow-to-region 2 12) (goto-char 4))
+            (with-current-buffer buffer
+              (let ((before (buffer-string)) (end (point-max)))
+                (narrow-to-region 2 12)
+                (goto-char 4)
+                (gptel-agent-discussion--emit chat 'report "NARROWED-WORKER-REPORT")
+                ;; Deliver at the request boundary with the worker's real callback.
+                (gptel-agent-discussion--before-wait child)
+                (should (equal (list (point-min) (point-max) (point)) '(2 12 4)))
+                (save-restriction
+                  (widen)
+                  (should (equal before (buffer-substring (point-min) end)))
+                  (should (string-match-p "NARROWED-WORKER-REPORT"
+                                          (buffer-substring end (point-max)))))))
+            (with-current-buffer parent
+              (should (equal (list (point-min) (point-max) (point)) '(2 12 4)))
+              (save-restriction
+                (widen)
+                (should-not (string-match-p "NARROWED-WORKER-REPORT" (buffer-string)))))
+            (should (string-match-p "NARROWED-WORKER-REPORT" (gptel-agent-workers-test--data child)))
+            (should-not (string-match-p "NARROWED-WORKER-REPORT" (gptel-agent--run-response run))))
         (when (buffer-live-p (gptel-agent-discussion--chat-buffer chat))
           (kill-buffer (gptel-agent-discussion--chat-buffer chat)))))))
 

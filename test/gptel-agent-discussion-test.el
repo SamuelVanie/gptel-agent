@@ -275,6 +275,122 @@
      (gptel-agent-discussion--flush (gptel-agent-discussion--chat-buffer chat))
      (should (= count (length requests))))))
 
+(ert-deftest gptel-agent-discussion-narrowed-draft-detection ()
+  (dolist (draft '("" " \n\t" "UNSENT-DRAFT"))
+    (with-temp-buffer
+      (insert "Earlier history\n")
+      (setq gptel-agent-discussion--draft-start (point-marker))
+      (insert draft)
+      (dolist (end (list (1- gptel-agent-discussion--draft-start)
+                        (marker-position gptel-agent-discussion--draft-start)))
+        (save-restriction
+          (narrow-to-region 2 end)
+          (goto-char 3)
+          (should (eq (not (null (gptel-agent-discussion--draft-p)))
+                      (equal draft "UNSENT-DRAFT")))
+          (should (= (point-min) 2))
+          (should (= (point-max) end))
+          (should (= (point) 3)))))))
+
+(ert-deftest gptel-agent-discussion-narrowed-reports-stay-queued ()
+  (dolist (restriction '(before-draft at-draft history-hidden))
+    (ert-info ((format "Restriction: %s" restriction))
+      (gptel-agent-discussion-test--with-chat
+       (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+       (gptel-agent-workers-test--answer fsm "Parent done")
+       (with-current-buffer parent
+         (unless (eq restriction 'history-hidden)
+           (goto-char (point-max)) (insert "UNSENT-DRAFT"))
+         (let ((text (buffer-string)) (count (length requests)))
+           (narrow-to-region
+            (if (eq restriction 'history-hidden) 10 (point-min))
+            (pcase restriction
+              ('before-draft (1- gptel-agent-discussion--draft-start))
+              ('at-draft gptel-agent-discussion--draft-start)
+              (_ (point-max))))
+           (goto-char (+ (point-min) 2))
+           (let ((bounds (list (point-min) (point-max) (point))))
+             (gptel-agent-discussion--emit chat 'report "QUEUED-REPORT")
+             (let ((timer gptel-agent-discussion--timer))
+               (should (timerp timer))
+               (gptel-agent-discussion--flush parent)
+               (should-not (memq timer timer-list)))
+             (should (= count (length requests)))
+             (should (eq fsm gptel-agent-discussion--fsm))
+             (should (= 1 (length gptel-agent-discussion--inbox)))
+             (should-not gptel-agent-discussion--timer)
+             (should (equal bounds (list (point-min) (point-max) (point))))
+             (widen)
+             (should (equal text (buffer-string))))))))))
+
+(ert-deftest gptel-agent-discussion-narrowed-resume-needs-full-context ()
+  (gptel-agent-discussion-test--with-chat
+   (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+   (gptel-agent-workers-test--answer fsm "Parent done")
+   (with-current-buffer parent
+     (goto-char (point-max)) (insert "UNSENT-DRAFT")
+     (narrow-to-region 10 gptel-agent-discussion--draft-start)
+     (goto-char 12)
+     (gptel-agent-discussion--emit chat 'report "RESUMED-REPORT")
+     (gptel-agent-discussion--flush parent)
+     (setq gptel-agent-discussion--paused t)
+     (let ((count (length requests))
+           (bounds (list (point-min) (point-max) (point))))
+       (should (string-match-p
+                "[Ww]iden"
+                (error-message-string
+                 (should-error (gptel-agent-discussion-resume) :type 'user-error))))
+       (should gptel-agent-discussion--paused)
+       (should-not gptel-agent-discussion--timer)
+       (should (= 1 (length gptel-agent-discussion--inbox)))
+       (should (= count (length requests)))
+       (should (equal bounds (list (point-min) (point-max) (point))))
+       (widen)
+       (should-error (gptel-agent-discussion-resume) :type 'user-error)
+       (should gptel-agent-discussion--paused)
+       (delete-region gptel-agent-discussion--draft-start (point-max))
+       (goto-char 12)
+       (gptel-agent-discussion-resume)
+       (should-not gptel-agent-discussion--paused)
+       (gptel-agent-discussion--flush parent)
+       (should (= (1+ count) (length requests)))
+       (should (= (point) 12))
+       (should-not gptel-agent-discussion--inbox)
+       (let ((data (gptel-agent-workers-test--data gptel-agent-discussion--fsm)))
+         (should (string-match-p "Initial parent request" data))
+         (should (string-match-p "Parent done" data))
+         (should-not (string-match-p "UNSENT-DRAFT" data))
+         (should (= 1 (gptel-agent-workers-test--count "RESUMED-REPORT" data))))
+       (gptel-agent-discussion--flush parent)
+       (should (= (1+ count) (length requests)))))))
+
+(ert-deftest gptel-agent-discussion-narrowed-terminal-keeps-draft-boundary ()
+  (dolist (state '(DONE ABRT ERRS))
+    (ert-info ((format "Terminal state: %s" state))
+      (gptel-agent-discussion-test--with-chat
+       (let* (draft-start
+              ;; Narrow after ordinary response finalization, before Discussion
+              ;; records its boundary, as a user post-response hook can do.
+              (gptel-post-response-functions
+               (list (lambda (&rest _)
+                       (setq draft-start (point-max))
+                       (narrow-to-region 2 12)
+                       (goto-char 4)))))
+         (pcase state
+           ('DONE (gptel-agent-workers-test--answer fsm "Parent done"))
+           ('ABRT (gptel-abort parent))
+           ('ERRS (setf (plist-get (gptel-fsm-info fsm) :error) "Test error")
+                  (gptel--fsm-transition fsm 'ERRS)))
+         (with-current-buffer parent
+           (should (eq (gptel-fsm-state fsm) state))
+           (should (= gptel-agent-discussion--draft-start draft-start))
+           (should-not (gptel-agent-discussion--draft-p))
+           (should (equal (list (point-min) (point-max) (point)) '(2 12 4)))
+           (widen)
+           (should-not (gptel-agent-discussion--draft-p))
+           (goto-char (point-max)) (insert "NEW-DRAFT")
+           (should (gptel-agent-discussion--draft-p))))))))
+
 (ert-deftest gptel-agent-discussion-user-sends-ordinary-followup ()
   (gptel-agent-discussion-test--with-chat
    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
@@ -572,6 +688,39 @@
    (should (eq (gptel-fsm-state fsm) 'WAIT))
    (should (= 1 (gptel-agent-workers-test--count "WAITED-REPORT" (gptel-agent-workers-test--data fsm))))
    (should-not (buffer-local-value 'gptel-agent-discussion--waiters parent))))
+
+(ert-deftest gptel-agent-discussion-narrowed-waiter-preserves-history ()
+  (dolist (delivery '(report timeout closed))
+    (ert-info ((format "Waiter delivery: %s" delivery))
+      (gptel-agent-discussion-test--with-chat
+       (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+       (gptel-agent-workers-test--tool fsm "DiscussionControl" '(:action "wait"))
+       (should (eq (gptel-fsm-state fsm) 'TOOL))
+       (with-current-buffer parent
+         (let ((before (buffer-string)) (end (point-max)) (count (length requests))
+               (text (pcase delivery
+                       ('report "NARROWED-WAITED-REPORT")
+                       ('timeout "status: timeout")
+                       ('closed "status: no_eligible_work"))))
+           (narrow-to-region 2 12)
+           (goto-char 4)
+           (pcase delivery
+             ('report (gptel-agent-discussion--emit chat 'report text))
+             ('timeout (funcall (timer--function (nth 3 (car gptel-agent-discussion--waiters)))))
+             ('closed (gptel-agent-discussion--close chat)))
+           (gptel-agent-discussion--flush parent)
+           (should (eq (gptel-fsm-state fsm) 'WAIT))
+           (should (= (1+ count) (length requests)))
+           (should-not gptel-agent-discussion--waiters)
+           (should-not gptel-agent-discussion--inbox)
+           (should (equal (list (point-min) (point-max) (point)) '(2 12 4)))
+           (save-restriction
+             (widen)
+             (should (equal before (buffer-substring (point-min) end)))
+             (should (string-match-p text (buffer-substring end (point-max)))))
+           (let ((data (gptel-agent-workers-test--data fsm)))
+             (should (string-match-p "Initial parent request" data))
+             (should (= 1 (gptel-agent-workers-test--count text data))))))))))
 
 (ert-deftest gptel-agent-discussion-owner-abort-pauses-notifications-child-survives ()
   (gptel-agent-discussion-test--with-chat
