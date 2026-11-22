@@ -350,7 +350,7 @@ Its lightweight session/result record remains available to AgentControl.")
   tool-calls web-tool-calls finalization-reason
   finalization-requested finalization-started
   ;; Append new fields to preserve accessors in already compiled consumers.
-  session background result delivered)
+  session background result delivered directory)
 
 (cl-defstruct (gptel-agent--workers
                (:constructor gptel-agent--make-workers))
@@ -755,7 +755,7 @@ request owner, which may differ from the buffer displaying the approval."
 (cl-defstruct (gptel-agent--bash (:constructor gptel-agent--make-bash))
   process buffer source callback query limit preview-chars preview-lines
   (chars 0) (newlines 0) file file-identity fsm post-hook
-  timeout timeout-timer timed-out done file-limit finishing cancelled)
+  timeout timeout-timer timed-out done file-limit finishing cancelled directory)
 
 (defvar-local gptel-agent--bash-jobs nil
   "Foreground Bash calls owned by this buffer.")
@@ -971,6 +971,7 @@ Bound execution with `gptel-agent-bash-timeout', captured at launch."
     (error "gptel-agent-bash-timeout must be a positive finite number of seconds"))
   (let* ((job (gptel-agent--make-bash
                :source (current-buffer) :callback callback :query query :fsm fsm
+               :directory default-directory
                :timeout gptel-agent-bash-timeout
                :file-limit gptel-agent-result-file-limit
                :limit gptel-agent-tool-result-max-chars
@@ -3834,7 +3835,8 @@ category names after preset hooks.  They apply only to new conversations."
                 (setq-local gptel-tools (cl-remove "MainChat" gptel-tools
                                                    :key #'gptel-agent--builtin-tool-name :test #'equal))
                 (gptel-agent--reset-tool-call-counts)
-                (setf (gptel-agent--run-configuration run)
+                (setf (gptel-agent--run-directory run) default-directory
+                      (gptel-agent--run-configuration run)
                       (if previous (gptel-agent--run-configuration previous)
                         (list :backend gptel-backend :model gptel-model
                               :stream gptel-stream :system gptel-system-prompt
