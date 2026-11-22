@@ -64,11 +64,13 @@
 (declare-function gptel-agent-discussion--inbox-p "gptel-agent-discussion")
 (declare-function gptel-agent-discussion--cancel-descendants "gptel-agent-discussion")
 (declare-function gptel-agent-chat--localize "gptel-agent-chat")
+(autoload 'gptel-agent--directory-registry "gptel-agent")
 (declare-function gptel-agent--agent-plist "gptel-agent")
 (declare-function gptel-agent--agent-enabled-p "gptel-agent")
 (declare-function gptel-agent--skills-system-message "gptel-agent")
 (declare-function gptel-agent--ensure-skills "gptel-agent")
 (declare-function gptel-agent--manual-skill-p "gptel-agent")
+(declare-function gptel-agent--skill-enabled-p "gptel-agent")
 (declare-function gptel-agent--agents-tool-message "gptel-agent")
 
 (defvar gptel-agent--agents)
@@ -285,7 +287,8 @@ from the Agent overlay until the user kills them or closes the parent chat."
   "Request-stable snapshot of agent definitions available in this buffer.")
 
 (defvar-local gptel-agent--registry-snapshot nil
-  "Project-local snapshot of all discovered agent definitions.")
+  "Project-local snapshot of all discovered agent definitions.
+A local nil requests discovery in this buffer's working directory.")
 
 (defvar-local gptel-agent--supervised-run nil
   "The `gptel-agent--run' owned by this sub-agent buffer.")
@@ -1637,7 +1640,7 @@ separate from grants so discussions can inherit tools without pre-approvals."
                        (if (local-variable-p 'gptel-agent-skill-dirs)
                            gptel-agent-skill-dirs
                          (buffer-local-value 'gptel-agent-skill-dirs source))))
-         (enabled (copy-sequence
+         (enabled (copy-tree
                    (if (local-variable-p 'gptel-agent--enabled-skills)
                        gptel-agent--enabled-skills
                      (buffer-local-value 'gptel-agent--enabled-skills source))))
@@ -1659,7 +1662,7 @@ separate from grants so discussions can inherit tools without pre-approvals."
     (setf (gptel-fsm-info fsm)
           (plist-put info :skill-config
                      (list (cons 'gptel-agent-skill-dirs (copy-sequence directories))
-                           (cons 'gptel-agent--enabled-skills (copy-sequence enabled)))))
+                           (cons 'gptel-agent--enabled-skills (copy-tree enabled)))))
     (setf (gptel-fsm-info fsm)
           (plist-put (gptel-fsm-info fsm) :skill-base-tools
                      (mapcar #'gptel-agent--skill-copy-tool gptel-tools)))
@@ -1678,7 +1681,7 @@ separate from grants so discussions can inherit tools without pre-approvals."
             (gptel-tool-function tool)
             (lambda (skill &optional args)
               (let ((gptel-agent--skills skills))
-                (if (and enabled (not (member skill enabled))
+                (if (and (not (gptel-agent--skill-enabled-p skill enabled))
                          (not (gptel-agent--manual-skill-p (assoc skill skills))))
                     (format "Error: skill %s is not enabled for this request." skill)
                   (gptel-agent--get-skill skill args fsm registry))))))))
@@ -3800,7 +3803,6 @@ category names after preset hooks.  They apply only to new conversations."
                     (gptel-agent--run-max-request-rounds run)
                     max-request-rounds)
               (unless previous
-                (setq preset (gptel-agent--resolve-subagent-preset preset))
                 (gptel-agent--copy-parent-request-config
                  parent-buffer child-buffer parent-fsm))
               (with-current-buffer child-buffer
@@ -3816,7 +3818,7 @@ category names after preset hooks.  They apply only to new conversations."
                               (and result-explorer-p result-file)
                               gptel--preset nil)
                   (gptel-agent--apply-subagent-configuration
-                   preset agent-plist)
+                   (gptel-agent--resolve-subagent-preset preset) agent-plist)
                   (when selection
                     (setq-local gptel-backend (car selection)
                                 gptel-model (cadr selection)))
@@ -5254,18 +5256,22 @@ delegate to itself.  These constraints also apply to explicit declarations."
        (not (and parent-agent
                  (equal (downcase name) (downcase parent-agent))))))
 
-(defun gptel-agent--snapshot-agent-definitions (&optional ignore-selection)
+(defun gptel-agent--snapshot-agent-definitions (&optional ignore-selection request-registry)
   "Return request-stable definitions allowed by this parent agent.
 
 The parent's `agents' field names its available sub-agents.  An absent
 field allows all discovered sub-agents; an empty list allows none.
 Main presets and the caller itself are always excluded.  Children can
 narrow, but not expand, the inherited snapshot.
-IGNORE-SELECTION ignores the conversation's interactive selection."
+IGNORE-SELECTION ignores the conversation's interactive selection.
+REQUEST-REGISTRY supplies definitions from an inline preset for this turn."
   (let* ((inherited gptel-agent--agent-snapshot)
-         (source (or inherited
+         (source (or inherited request-registry
                      gptel-agent--registry-snapshot
-                     (gptel-agent--full-agent-definitions)))
+                     (if (local-variable-p 'gptel-agent--registry-snapshot)
+                         (setq-local gptel-agent--registry-snapshot
+                                     (gptel-agent--directory-registry))
+                       (gptel-agent--full-agent-definitions))))
          (current gptel-agent--current-agent)
          (definition (cdr (assoc current source)))
          (declared (plist-member definition :agents))
@@ -5350,17 +5356,16 @@ FSM's live request buffer even when confirmed from another buffer."
     (let* ((source-buffer (plist-get (gptel-fsm-info fsm) :buffer))
            (prompt-agent (and (local-variable-p 'gptel-agent--current-agent)
                               gptel-agent--current-agent))
-           ;; gptel copies only its own buffer-local variables into the prompt
-           ;; transform buffer.  Read our project/agent identity from the
-           ;; explicit request buffer recorded in FSM, unless an @preset has
-           ;; supplied a request-specific identity.  Keep the source registry,
-           ;; inherited restrictions and interactive selection in either case.
+           (prompt-registry (and (local-variable-p 'gptel-agent--registry-snapshot)
+                                 gptel-agent--registry-snapshot))
+           ;; An @preset can supply a fresh identity and project registry.
+           ;; The source chat still owns delegation restrictions and selection.
            (snapshot
             (if (buffer-live-p source-buffer)
                 (with-current-buffer source-buffer
                   (let ((gptel-agent--current-agent
                          (or prompt-agent gptel-agent--current-agent)))
-                    (gptel-agent--snapshot-agent-definitions)))
+                    (gptel-agent--snapshot-agent-definitions nil prompt-registry)))
               (gptel-agent--snapshot-agent-definitions)))
            (tool (gptel--copy-tool base-tool))
            (args (copy-tree (gptel-tool-args base-tool)))

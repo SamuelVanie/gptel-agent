@@ -820,7 +820,7 @@
           "disable-model-invocation: true\nallowed-tools: SkillMutation\n"
         (let ((gptel-agent-skill-dirs (list root))
               (gptel-agent--bundled-skill-dir root)
-              (gptel-agent--enabled-skills '("another-skill"))
+              (gptel-agent--enabled-skills 'none)
               (reference (expand-file-name "checklist.md" root)))
           (with-temp-file reference (insert "Read on demand"))
           (write-region "Read checklist.md.\n" nil file t 'silent)
@@ -939,6 +939,48 @@
                (lambda () (ert-fail "A request without Skill scanned skill directories"))))
       (gptel-agent--localize-skill-tool
        (gptel-make-fsm :info (list :buffer (current-buffer)))))))
+
+(ert-deftest gptel-agent-skills-none-survives-send-and-restore ()
+  (require 'gptel-agent-session)
+  ;; Existing records store nil for the untouched default.
+  (dolist (selection '(nil none))
+    (gptel-agent-skills-test--with-chat ""
+      (gptel-agent-workers-test--answer fsm "Ready")
+      (let ((session (expand-file-name "chat.eld" root)))
+        (with-current-buffer parent
+          (when selection
+            (cl-letf (((symbol-function 'completing-read-multiple)
+                       (lambda (_prompt choices _pred _match initial &rest _)
+                         (should (equal choices '("test-skill")))
+                         (should (equal initial "test-skill"))
+                         nil)))
+              (gptel-agent-toggle-skill)))
+          (gptel-agent-session-export-buffer parent session))
+        (let ((restored (gptel-agent-session-import-buffer session)))
+          (unwind-protect
+              (dolist (buffer (list parent restored))
+                (with-current-buffer buffer
+                  (should (eq gptel-agent--enabled-skills selection))
+                  (goto-char (point-max))
+                  (insert "Use a skill")
+                  (gptel-send))
+                (setq fsm (caar requests))
+                (should (eq (not (string-match-p "Test capability" (cdar requests)))
+                            (eq selection 'none)))
+                (gptel-agent-skills-test--load fsm)
+                (should (string-match-p
+                         (if selection "not enabled for this request" "SKILL-WORKFLOW-INSTRUCTIONS")
+                         (cdar requests)))
+                (gptel-agent-workers-test--answer fsm "Ready"))
+            (kill-buffer restored)))
+        (when selection
+          (with-current-buffer parent
+            (cl-letf (((symbol-function 'completing-read-multiple)
+                       (lambda (_prompt choices _pred _match initial &rest _)
+                         (should (equal initial ""))
+                         choices)))
+              (gptel-agent-toggle-skill))
+            (should (equal gptel-agent--enabled-skills '("test-skill")))))))))
 
 (ert-deftest gptel-agent-skills-project-discovery-and-cd-are-isolated ()
   (let* ((root (make-temp-file "gptel-skill-scopes-" t))
@@ -1071,7 +1113,7 @@
 
 
 (ert-deftest gptel-agent-skills-children-retain-request-config-and-preset-overrides ()
-  (dolist (captured-selection '(nil ("deploy")))
+  (dolist (captured-selection '(nil none ("deploy")))
     (dolist (override '(nil t))
       (let ((gptel-agent-skills-test--extra-tools '("Agent" "Discussion"))
             (gptel--known-presets (copy-tree gptel--known-presets)))
@@ -1117,7 +1159,10 @@
               (should (equal (buffer-local-value 'gptel-agent-skill-dirs child) '("captured")))
               (should (equal (buffer-local-value 'gptel-agent--enabled-skills child) expected-selection))
               (gptel-agent-workers-test--tool request "Skill" '(:skill "deploy"))
-              (should (string-match-p "CAPTURED-DEPLOYMENT" (cdar requests)))
+              (should (string-match-p (if (eq expected-selection 'none)
+                                          "not enabled for this request"
+                                        "CAPTURED-DEPLOYMENT")
+                                      (cdar requests)))
               (gptel-agent-workers-test--answer request "Worker done"))
             (gptel-agent-workers-test--tool
              fsm "Discussion" (append '(:title "Captured skill selection" :prompt "Load deploy")
@@ -1128,7 +1173,10 @@
               (should (equal (buffer-local-value 'gptel-agent-skill-dirs child) '("captured")))
               (should (equal (buffer-local-value 'gptel-agent--enabled-skills child) expected-selection))
               (gptel-agent-workers-test--tool request "Skill" '(:skill "deploy"))
-              (should (string-match-p "CAPTURED-DEPLOYMENT" (cdar requests)))
+              (should (string-match-p (if (eq expected-selection 'none)
+                                          "not enabled for this request"
+                                        "CAPTURED-DEPLOYMENT")
+                                      (cdar requests)))
               (gptel-agent-workers-test--answer request "Discussion done"))))))))
 
 (provide 'gptel-agent-skills-test)

@@ -126,7 +126,9 @@ or conformance.
 
 **** Anywhere in Emacs
 
-Place =(gptel-agent-update)= in your config.
+Place =(gptel-agent-update)= in your config. Selecting an agent preset resolves
+relative entries in =gptel-agent-dirs= from the chat's working directory.
+A restored chat also discovers its workers there on first use.
 
 As with gptel, you can use gptel-agent in any buffer, including read-only
 buffers and the minibuffer.
@@ -1098,6 +1100,9 @@ or results no longer in context are loaded normally. Discovery and
 of this check.
 
 Discovery and interactive skill selection belong to each conversation.
+All automatic skills start enabled. Clearing the selection with
+=gptel-agent-toggle-skill= disables all automatic skills for subsequent
+requests, including after reopening the conversation.
 Changing its working directory or skill-directory configuration refreshes
 discovery for its next request. Requests already running keep their discovery
 snapshots. Workers and discussions inherit the configuration and selection,

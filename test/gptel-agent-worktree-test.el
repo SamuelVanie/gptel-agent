@@ -217,6 +217,28 @@
                                 (gptel-agent-worktree-test--git
                                  (file-name-as-directory path) "branch" "--show-current")))))))
 
+(ert-deftest gptel-agent-worktree-loads-plan-from-committed-checkout ()
+  (gptel-agent-worktree-test--with-repo
+    (let ((gptel-agent-dirs '("agents")) (gptel-agent-skill-dirs nil)
+          gptel--known-presets gptel-agent--agents gptel-agent--agent-files
+          gptel-agent--registered-agents gptel-agent--file-cache
+          (file (expand-file-name "agents/gptel-plan.md" repo)))
+      (make-directory (file-name-directory file))
+      (with-temp-file file (insert "---\ndescription: Plan\n---\nCommitted Plan"))
+      (gptel-agent-worktree-test--git repo "add" "agents")
+      (gptel-agent-worktree-test--git repo "commit" "--quiet" "-m" "Add plan")
+      (with-temp-file file (insert "---\ndescription: Plan\n---\nUncommitted Plan"))
+      (gptel-agent-discussion-test--with-chat
+        (with-current-buffer parent
+          (setq default-directory repo)
+          (gptel-agent-update))
+        (let ((result (gptel-agent-worktree-test--dispatch fsm '(:preset "gptel-plan" :worktree t))))
+          (should-not (string-prefix-p "Error:" result)))
+        (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+        (should (equal (buffer-local-value 'gptel-system-prompt
+                                           (gptel-agent-discussion--chat-buffer chat))
+                       "Committed Plan"))))))
+
 (ert-deftest gptel-agent-worktree-overrides-preset-directory-before-sending ()
   (gptel-agent-worktree-test--with-repo
     (let ((gptel--known-presets (copy-tree gptel--known-presets)))

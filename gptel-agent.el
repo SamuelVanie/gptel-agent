@@ -187,10 +187,10 @@ without tool declarations or body.")
 Nil also permits an explicitly supplied skills registry to be used as-is.")
 
 (defvar-local gptel-agent--enabled-skills nil
-  "List of currently enabled skill names for this conversation.
-
-When nil, all automatically discoverable skills are considered enabled.
-Use `gptel-agent-toggle-skill' to manage this list interactively.")
+  "Automatic skill selection for this conversation.
+Nil enables all discoverable skills, a list enables the named skills,
+and `none' disables all automatic skills.  Use
+`gptel-agent-toggle-skill' to manage this selection interactively.")
 
 (defvar-local gptel-agent--enabled-agents nil
   "Interactive sub-agent selection for this conversation.
@@ -542,22 +542,26 @@ registry inherited by other buffers."
   "Return non-nil if discovery entry SKILL is hidden from automatic discovery."
   (eq (plist-get (cddr skill) :disable-model-invocation) t))
 
+(defun gptel-agent--skill-enabled-p (name selection)
+  "Return non-nil when automatic skill NAME is enabled by SELECTION."
+  (or (null selection)
+      (and (listp selection) (member name selection))))
+
 (defun gptel-agent--model-skills (skills &optional include-disabled)
   "Return automatically discoverable entries from SKILLS.
 Honor `gptel-agent--enabled-skills' unless INCLUDE-DISABLED is non-nil."
   (cl-remove-if-not
    (lambda (skill)
      (and (not (gptel-agent--manual-skill-p skill))
-          (or include-disabled (null gptel-agent--enabled-skills)
-              (member (car skill) gptel-agent--enabled-skills))))
+          (or include-disabled
+              (gptel-agent--skill-enabled-p (car skill) gptel-agent--enabled-skills))))
    skills))
 
 (defun gptel-agent--skills-system-message (agent-skills)
   "Parse AGENT-SKILLS and return the message describing known skills.
 
-Only skills whose names are in `gptel-agent--enabled-skills' are
-included.  When `gptel-agent--enabled-skills' is nil, all discoverable
-skills are included.  Manual skills are always excluded.
+Honor the automatic selection in `gptel-agent--enabled-skills'.
+Manual skills are always excluded.
 
 AGENT-SKILLS is a alist of skill names and associated plist as value
  (See `gptel-agent--skills').  The plist is expected to have
@@ -601,21 +605,49 @@ AGENTS is an alist of agent names and associated plist as value
   (gptel-agent--update-agents)
   (gptel-agent--full-agent-definitions))
 
+(defun gptel-agent--directory-registry ()
+  "Discover full definitions in the current directory without publishing them."
+  (let (gptel-agent--agents gptel-agent--agent-files)
+    ;; Native @preset lookup runs between matching and deleting the mention.
+    (save-match-data (gptel-agent--refresh-registry))))
+
+(defvar-local gptel-agent--prompt-source nil
+  "Source chat for project preset lookups in a temporary gptel prompt.")
+
+(defun gptel-agent--copy-preset-scope (original source start end body)
+  "Keep SOURCE's working directory and agent configuration available to BODY."
+  (funcall original source start end
+           (lambda ()
+             (setq-local gptel-agent--prompt-source source)
+             (funcall body))))
+
+(advice-add 'gptel--with-buffer-copy-internal :around #'gptel-agent--copy-preset-scope)
+
+(defvar gptel-agent--comparing-preset nil
+  "Non-nil while displaying the preset state of an existing chat.")
+
+(defun gptel-agent--resolve-project-preset (spec)
+  "Resolve a project marker in SPEC into a native gptel preset.
+Only entries installed by `gptel-agent-update' carry the marker.  The
+caller applies the returned settings with its own scope and setter."
+  (if-let* ((agent (plist-get spec :gptel-agent-project-preset)))
+      (with-current-buffer (or gptel-agent--prompt-source (current-buffer))
+        (let* ((registry (or (and gptel-agent--comparing-preset
+                                  gptel-agent--registry-snapshot)
+                             (gptel-agent--directory-registry)))
+               (entry (assoc agent registry)))
+          (when entry
+            (append (gptel-agent--plist-without-keys (cdr entry) '(:agents))
+                    (list :agent--current-agent agent)
+                    (unless gptel-agent--comparing-preset
+                      (list :agent--registry-snapshot registry))))))
+    spec))
+
+(advice-add 'gptel-get-preset :filter-return #'gptel-agent--resolve-project-preset)
+
 (defun gptel-agent--preset-mismatch (original name)
-  "Call ORIGINAL on preset NAME without comparing its runtime registry.
-The registry snapshot is computed at activation, not a user setting.
-gptel's fast preset comparison compares the literal :eval spec with its
-result, incorrectly marking even a freshly applied agent preset modified."
-  (let* ((entry (or (assoc name gptel--known-presets)
-                    (and (stringp name)
-                         (assq (intern-soft name) gptel--known-presets))))
-         (gptel--known-presets
-          (if (plist-member (cdr entry) :agent--registry-snapshot)
-              (cons (cons (car entry)
-                          (gptel-agent--plist-without-keys
-                           (cdr entry) '(:agent--registry-snapshot)))
-                    (remq entry gptel--known-presets))
-            gptel--known-presets)))
+  "Compare NAME's settings, reusing the chat's snapshot when available."
+  (let ((gptel-agent--comparing-preset t))
     (funcall original name)))
 
 (with-eval-after-load 'gptel-transient
@@ -634,17 +666,20 @@ result, incorrectly marking even a freshly applied agent preset modified."
   (gptel-agent--update-skill-tool)
   (gptel-agent--update-agent-tool)
 
-  ;; Include identity in the preset itself so menu selection, inheritance,
-  ;; and @preset activation enforce the same parent declaration as the
-  ;; dedicated session command.  Use normal preset keys to honor its setter.
-  (dolist (name '("gptel-agent" "gptel-plan" "ask"))
-    (when-let* ((plist (gptel-agent--agent-plist name)))
-      (apply #'gptel-make-preset (intern name)
-             (append
-              (gptel-agent--plist-without-keys plist '(:agents))
-              (list :agent--current-agent name
-                    :agent--registry-snapshot
-                    '(:eval (gptel-agent--refresh-registry)))))))
+  ;; gptel shares its menu across buffers.  Register names, never a project's
+  ;; settings, and leave any explicitly registered same-name preset alone.
+  (dolist (name '(gptel-agent gptel-plan ask))
+    (let ((registered (cdr (assq name gptel--known-presets))))
+      (when (and (assoc (symbol-name name) gptel-agent--registry-snapshot)
+                 (or (null registered)
+                     ;; Adapt presets generated before a package reload.
+                     (and (equal (plist-get registered :agent--current-agent)
+                                 (symbol-name name))
+                          (equal (plist-get registered :agent--registry-snapshot)
+                                 '(:eval (gptel-agent--refresh-registry))))))
+        (gptel-make-preset name
+          :description (format "Use the %s definition from this directory." name)
+          :gptel-agent-project-preset (symbol-name name)))))
   gptel-agent--agents)
 
 ;;;###autoload
@@ -676,7 +711,7 @@ their original schema and registry snapshot."
 (defun gptel-agent-toggle-skill ()
   "Toggle which skills are enabled for the Skill tool.
 
-Prompts for skills to enable.  Skills not selected will be disabled.
+Prompts for skills to enable.  An empty selection disables all automatic skills.
 Skills with disable-model-invocation are excluded.
 The Skill tool's description is updated immediately without
 requiring `gptel-agent-update'."
@@ -689,10 +724,10 @@ requiring `gptel-agent-update'."
            "Enable skills: "
            all-skills nil t
            (mapconcat #'identity current ","))))
-    (setq gptel-agent--enabled-skills selected)
+    (setq gptel-agent--enabled-skills (or selected 'none))
     (gptel-agent--update-skill-tool)
     (message "Skills updated: %s enabled."
-             (length gptel-agent--enabled-skills))))
+             (length selected))))
 
 (defun gptel-agent-skill-capf ()
   "Complete /skill references to manually invoked skills at point.

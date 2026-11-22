@@ -88,5 +88,62 @@
       (should (eq first (car (buffer-local-value 'gptel-tools parent))))
       (should (eq second (car (buffer-local-value 'gptel-tools child)))))))
 
+(ert-deftest gptel-agent-session-tools-restored-send-discovers-workers-in-workspace ()
+  (gptel-agent-session-test--with-store
+    (let* ((gptel-agent-dirs '("agents/"))
+           (gptel-agent-skill-dirs nil)
+           (gptel-agent-use-project-instructions nil)
+           (gptel--known-presets (copy-tree gptel--known-presets))
+           gptel-agent--registered-agents gptel-agent--additional-subagents
+           gptel-agent--agents gptel-agent--agent-files gptel-agent--file-cache
+           (alpha (expand-file-name "alpha/" gptel-agent-session-directory))
+           (bravo (expand-file-name "bravo/" gptel-agent-session-directory))
+           (empty (expand-file-name "empty/" gptel-agent-session-directory))
+           (file (expand-file-name "chat.eld" gptel-agent-session-directory))
+           (source (gptel-agent-session-test--buffer " *workspace-source*" "Review the task."))
+           record request)
+      (make-directory empty)
+      (dolist (project (list alpha bravo))
+        (let ((name (file-name-nondirectory (directory-file-name project))))
+          (make-directory (expand-file-name "agents/" project) t)
+          (with-temp-file (expand-file-name "agents/worker.md" project)
+            (insert "---\nname: " name "-worker\ndescription: " name "\n---\n" name))))
+      (with-current-buffer source
+        (setq default-directory alpha)
+        (gptel-agent-update)
+        (setq-local gptel-tools (list (gptel-get-tool "Agent"))
+                    gptel-use-tools t gptel-use-curl t gptel-stream nil
+                    gptel-system-prompt "Saved custom prompt")
+        (setq record (gptel-agent-session-buffer-record source))
+        (gptel-agent-session-export-buffer source file))
+      (with-temp-buffer
+        (setq default-directory bravo)
+        (gptel-agent-update))
+      (dolist (kind '(standalone external empty))
+        (let ((chat (if (eq kind 'standalone)
+                        (gptel-agent-session-import-buffer file)
+                      (gptel-agent-session-buffer-from-record record t))))
+          (with-current-buffer chat
+            (should (eq gptel-agent-session-managed-externally (not (eq kind 'standalone))))
+            (should (equal gptel-system-prompt "Saved custom prompt"))
+            (should (equal default-directory alpha))
+            ;; A host can set the node workspace after importing its record.
+            (when (eq kind 'empty) (setq default-directory empty))
+            (setq request nil)
+            (cl-letf (((symbol-function 'gptel-curl-get-response)
+                       (lambda (fsm) (setq request fsm)))
+                      ((symbol-function 'gptel--url-get-response)
+                       (lambda (&rest _) (ert-fail "Unexpected URL transport"))))
+              (gptel-send))
+            (should request)
+            (let* ((tools (plist-get (gptel-fsm-info request) :tools))
+                   (agent (cl-find "Agent" tools :key #'gptel-tool-name :test #'equal)))
+              (if (eq kind 'empty)
+                  (should-not agent)
+                (should (equal (plist-get (car (gptel-tool-args agent)) :enum)
+                               ["alpha-worker"]))))
+            ;; First use in a restored chat must leave other callers' registry alone.
+            (should (equal (mapcar #'car gptel-agent--agents) '("bravo-worker")))))))))
+
 (provide 'gptel-agent-session-tools-test)
 ;;; gptel-agent-session-tools-test.el ends here

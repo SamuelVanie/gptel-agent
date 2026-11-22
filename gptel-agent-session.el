@@ -970,6 +970,9 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
                              (format "Configure saved backend %S before sending in %s"
                                      (plist-get record :backend) (buffer-name))))
           (setq default-directory (plist-get record :directory))
+          ;; Definitions are host configuration, separate from saved settings.
+          ;; Discover them on first use, after the host sets its workspace.
+          (setq-local gptel-agent--registry-snapshot nil)
           (gptel-mode 1)
           (gptel--restore-props (plist-get record :bounds))
           (gptel-agent-session--fold-tool-blocks (plist-get record :bounds))

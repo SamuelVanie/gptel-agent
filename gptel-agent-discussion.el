@@ -1024,12 +1024,13 @@ EXTRA-TOOLS appends registered tool names or categories after the preset."
   (gptel-agent-discussion--nonempty prompt "prompt")
   (unless (memq worktree '(nil t :json-false :null))
     (user-error "worktree must be a boolean"))
-  (let* ((spec (and preset (not (equal preset ""))
-                    (or (and-let* ((spec (or (gptel-get-preset preset)
-                                             (and (stringp preset) (intern-soft preset)
-                                                  (gptel-get-preset (intern-soft preset))))))
-                          (copy-tree spec))
-                        (user-error "Cannot find gptel preset %S" preset))))
+  ;; Reject unknown names before allocating a worktree.  Resolve the actual
+  ;; settings only once the child's final working directory is established.
+  (let* ((preset-name
+          (when (and preset (not (equal preset "")))
+            (or (car (assoc preset gptel--known-presets))
+                (and (stringp preset) (car (assq (intern-soft preset) gptel--known-presets)))
+                (user-error "Cannot find gptel preset %S" preset))))
          (selection (gptel-agent--delegation-model model))
          (extra-tools (gptel-agent--extra-tools extra-tools))
          (directory (with-current-buffer owner
@@ -1061,10 +1062,12 @@ EXTRA-TOOLS appends registered tool names or categories after the preset."
                 (set (make-local-variable symbol)
                      (copy-tree (buffer-local-value symbol owner)))))
             (setq-local gptel-context nil gptel-use-context nil)
-            (when spec
-              (gptel--apply-preset spec
-                                   (lambda (symbol value)
-                                     (set (make-local-variable symbol) value))))
+            (when preset-name
+              (gptel--apply-preset
+               (copy-tree (or (gptel-get-preset preset-name)
+                              (user-error "Cannot find gptel preset %S in %s"
+                                          preset-name default-directory)))
+               (lambda (symbol value) (set (make-local-variable symbol) value))))
             (gptel-agent--append-extra-tools extra-tools)
             (when parent-fsm
               (gptel-agent-policy-inherit
