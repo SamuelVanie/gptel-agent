@@ -1,67 +1,73 @@
 #+title: gptel-agent
 
-This is a collection of tools and prompts to use [[https://github.com/karthink/gptel][gptel]] "agentically" with any
-LLM, to autonomously perform tasks.
+=gptel-agent= lets a [[https://github.com/karthink/gptel][gptel]] chat in Emacs work with project files, search the
+web, evaluate Emacs Lisp, run shell commands, and delegate tasks. This project
+began as a fork of [[https://github.com/karthink/gptel-agent][karthink's gptel-agent]] and is now developed independently.
 
-It has access to
-- the web (via basic web search and URL fetching, including YouTube video
-  descriptions and transcripts),
-- local files (read/write/edit),
-- the state of Emacs (documentation and Elisp evaluation),
-- and Bash, if you are in a POSIX-y environment.
+*** What this fork adds
 
-By default, all actions except for web search, fetching URLs and reading local
-files require confirmation.  You can change this, add more tools and MCP servers
-etc as in regular gptel usage.
+- *Choose sub-agents and skills per chat.* Use =M-x gptel-agent-toggle-agent=
+  and =M-x gptel-agent-toggle-skill= to change which sub-agents the model can
+  call and which skills it can load, starting with the next request.
+- *Give a child extra tools.* When starting a sub-agent or discussion, the
+  agent can pass =extra_tools= to add registered tools or tool categories for
+  that task without editing the preset.
+- *Set tool policies.* A preset can allow or deny calls by tool name and
+  arguments, such as which directories a worker may read or which Bash
+  commands it may run. Sub-agents and discussions inherit these restrictions.
+- *Start and manage discussions.* The agent can open a separate gptel chat,
+  send follow-ups, read its replies, and close it when the work is done.
+  Use =M-x gptel-agent-discussions= to visit these chats yourself.
+- *Run Bash in the background.* The agent can start a long-running command,
+  continue working, then use =Process= to read output, send input, or stop it.
 
-gptel-agent can also delegate tasks to specialized "sub-agents" which don't
-share context with the main session.  In this demo, gptel-agent delegates a
-research task to two different sub-agents, who perform it in parallel and
-generate reports that gptel-agent uses to answer the question:
+The optional [[https://github.com/SamuelVanie/gptel-ui][gptel-ui]] package adds a reading view with speaker labels and
+foldable tool output. Use =C-c C-n= and =C-c C-p= to move between turns, or
+=C-c ]= and =C-c [= to jump to pending approvals across chat buffers.
+
+The demo shows two sub-agents researching in parallel and reporting their
+findings to the main chat.
 
 https://github.com/user-attachments/assets/03585600-3bb9-4bf7-b5c8-7e02a28c7a37
 
 *** How to install
 
-gptel-agent is on MELPA, so you can run =M-x package-install= ⏎ =gptel-agent= in Emacs.
+Install from this repository to get the features above. With the built-in
+=use-package= in Emacs 30 or newer, add this to your init file.
 
-#+html: </details>
+#+begin_src emacs-lisp
+(use-package gptel-agent
+  :vc (:url "https://github.com/SamuelVanie/gptel-agent" :rev :newest)
+  :config (gptel-agent-update))
+#+end_src
+
 #+html: <details><summary>
 **** Manual
 #+html: </summary>
 
-Clone or download this repository and run =M-x package-install-file⏎= on the
+Clone or download this repository and run =M-x package-install-file= on the
 repository directory.
-
-Or from =use-package= (Emacs 30+):
-
-#+begin_src emacs-lisp
-(use-package gptel-agent
-  :vc ( :url "https://github.com/karthink/gptel-agent"
-        :rev :newest)
-  :config (gptel-agent-update))         ;Read files from agents directories
-#+end_src
-
 
 #+html: </details>
 #+html: <details><summary>
 **** Straight or Elpaca
 #+html: </summary>
 
+Include the bundled =agents/= and =skills/= directories in the recipe.
+
 #+begin_src emacs-lisp
-(straight-use-package 'gptel-agent)
+(straight-use-package
+ '(gptel-agent :type git :host github :repo "SamuelVanie/gptel-agent"
+               :files (:defaults "agents" "skills")))
+(gptel-agent-update)
 #+end_src
 
-#+begin_src emacs-lisp
-(elpaca gptel-agent)
-#+end_src
-
-Or from =use-package=:
+For Elpaca, use the following recipe.
 
 #+begin_src emacs-lisp
-(use-package gptel-agent
-  :straight t ;use :ensure t for Elpaca
-  :config (gptel-agent-update))         ;Read files from agents directories
+(elpaca (gptel-agent :host github :repo "SamuelVanie/gptel-agent"
+                     :files (:defaults "agents" "skills"))
+  (gptel-agent-update))
 #+end_src
 
 #+html: </details>
