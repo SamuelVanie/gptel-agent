@@ -24,6 +24,9 @@ Select it in a gptel preset with :agent-tool-policy.  See
   "Policy names and their original workspaces inherited by this conversation.")
 
 (defvar gptel-agent-policy--definitions (make-hash-table :test #'eq))
+(defconst gptel-agent-policy--result-explorer-name 'gptel-agent--result-explorer
+  "Reserved policy identifying a result explorer's mandatory tool ceiling.")
+(defvar gptel-agent-policy--result-explorer-rules)
 (defvar-local gptel-agent-policy--inherited-snapshot nil
   "Compiled definitions retained by a live descendant.  Never serialized.")
 (defvar gptel-agent-policy--snapshot nil
@@ -59,7 +62,10 @@ An entry with a nil definition permanently denies that request's calls."
   (let ((snapshot (copy-sequence prior)))
     (dolist (entry ceiling snapshot)
       (when (or (equal entry selected) (not (assoc entry snapshot)))
-        (cl-pushnew (cons entry (gethash (car entry) gptel-agent-policy--definitions))
+        (cl-pushnew (cons entry
+                          (if (eq (car entry) gptel-agent-policy--result-explorer-name)
+                              gptel-agent-policy--result-explorer-rules
+                            (gethash (car entry) gptel-agent-policy--definitions)))
                     snapshot :test #'gptel-agent-policy--same-definition-p)))))
 
 (defun gptel-agent-policy-inherit (ceiling &optional snapshot)
@@ -76,6 +82,14 @@ For a live descendant also retain its parent's compiled SNAPSHOT."
   (dolist (definition snapshot)
     (cl-pushnew definition gptel-agent-policy--inherited-snapshot
                 :test #'gptel-agent-policy--same-definition-p)))
+
+(defun gptel-agent-policy-protect-result-explorer ()
+  "Retain the mandatory result-explorer ceiling in the current buffer.
+Keep any separately selected user policy, which can further narrow access.
+Call after applying child presets and their hooks."
+  (let* ((gptel-agent-tool-policy gptel-agent-policy--result-explorer-name)
+         (ceiling (list (car (gptel-agent-policy-buffer-ceiling)))))
+    (gptel-agent-policy-inherit ceiling (gptel-agent-policy--freeze ceiling))))
 
 (defun gptel-agent-policy--plist-p (value)
   "Whether VALUE is a plist with unique keyword keys."
@@ -281,6 +295,12 @@ When CONFIGURATION is non-nil, require a bare origin."
               (alist-get name compiled nil nil #'equal))))
     compiled))
 
+(defconst gptel-agent-policy--result-explorer-rules
+  (cons (gptel-agent-policy--compile-rules
+         '((:tool "ResultRead") (:tool "ResultGrep")))
+        nil)
+  "Canonical result-explorer rules, independent of user policy definitions.")
+
 ;;;###autoload
 (cl-defun gptel-agent-define-tool-policy (name &key allow deny)
   "Define NAME as a reusable policy with ALLOW and DENY rules.
@@ -294,6 +314,8 @@ workspace or a local directory string.  Any matching denial takes
 precedence.  Every protected call requires an explicit matching allow."
   (unless (and name (symbolp name) (not (keywordp name)))
     (error "Expected a symbol naming the tool policy"))
+  (when (eq name gptel-agent-policy--result-explorer-name)
+    (error "The result-explorer tool policy is reserved"))
   (let ((rules (cons (gptel-agent-policy--compile-rules allow)
                      (gptel-agent-policy--compile-rules deny))))
     ;; Install the request integration even when only this autoloaded public

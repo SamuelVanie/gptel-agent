@@ -121,12 +121,21 @@ reached final request construction yet.  Capture its existing limits first."
 (defun gptel-agent-policy--check (fsm tool args &optional required-field)
   "Check FSM's actual TOOL with named ARGS and optional REQUIRED-FIELD."
   (let* ((info (gptel-fsm-info fsm))
+         (ceiling (gptel-agent-policy-request-ceiling fsm))
+         (result-explorer
+          (assq gptel-agent-policy--result-explorer-name ceiling))
          (gptel-agent-policy--snapshot (plist-get info :agent-tool-policy-snapshot)))
     (and tool (buffer-live-p (plist-get info :buffer))
-         (or (and (null required-field)
+         ;; A same-named third-party tool is not a scoped result reader.
+         ;; Trusted workflow tools must also respect this mandatory ceiling
+         ;; and every narrower user policy attached to the result explorer.
+         (or (not result-explorer)
+             (and (equal (gptel-tool-category tool) "gptel-agent-result-explorer")
+                  (member (gptel-tool-name tool) '("ResultRead" "ResultGrep"))))
+         (or (and (not result-explorer) (null required-field)
                   (memq tool (plist-get info :agent-tool-policy-trusted)))
              (gptel-agent-policy--allows-p
-              (gptel-agent-policy-request-ceiling fsm) tool args
+              ceiling tool args
               (buffer-local-value 'default-directory (plist-get info :buffer))
               required-field)))))
 

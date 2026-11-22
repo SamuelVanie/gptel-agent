@@ -276,6 +276,16 @@ restoration, so load the corresponding trusted definitions in the restoring
 Emacs. A confirmation, outside-access grant, or runner's
 =:allow-unconfirmed-tools t= can never approve a policy denial.
 
+The built-in =result-explorer= always receives an inherited policy permitting
+only the package's =ResultRead= and =ResultGrep= tools. Extra tools can be added
+to its configuration, but policy enforcement denies their calls, including
+attempts to use =Agent=, =Discussion=, =Skill=, =Bash= or =Eval=. The reserved
+policy cannot be redefined through =gptel-agent-define-tool-policy=, cleared by
+presets, or bypassed by trusted-tool grants. Other inherited or selected
+policies can further restrict it. The permitted tools still enforce the exact
+saved-result file and query contract. This uses the existing request policy
+checks; it is not a sandbox for arbitrary trusted Emacs Lisp.
+
 A matching path constraint can authorize an individual built-in outside read.
 Use =under= for directory trees. Guarded recursive searches also check the
 canonical targets they encounter. Guarded =WebFetch= checks each redirect
@@ -1003,8 +1013,28 @@ both the backend and model for this discussion and its subsequent turns.
 Omitting =model= (or passing an empty string) keeps the preset's or inherited
 pair. Unknown choices fail before creating a buffer or worktree. Creation and
 =DiscussionControl list/read= results include the child's current backend and
-model. This option does not change the parent or the =Agent= tool's configuration;
-sub-agents continue to use =gptel-agent-preset= and their per-agent settings.
+model. This option does not change the parent or the shared =gptel-agent-preset=;
+sub-agents apply their own configuration layers and any explicit =Agent.model=.
+
+Both =Discussion= and =Agent= accept =extra_tools=, an optional array of
+registered tool names and/or category (group) names. For example, if
+=mcp-github= is registered:
+
+#+begin_src json
+{"title": "Investigate the issue", "prompt": "Investigate and report your findings.", "preset": "ask", "extra_tools": ["Read", "mcp-github"]}
+#+end_src
+
+Additions are resolved after all preset hooks and appended to the resulting
+tool list. They never replace existing tools or their settings; overlapping
+names are added only once, with existing tools taking precedence. Lookup uses
+gptel's usual rules: a category name expands its tools, otherwise the first
+registered tool with that name is selected. Omission, =null= and =[]= mean no
+additions. Unknown names fail startup without sending a child model request;
+tools registered by preset hooks are supported. Added tools retain their
+normal confirmations and policy restrictions. They do not activate tool use
+when the preset sets =:use-tools nil=. =MainChat= remains unavailable in children,
+and discussions still receive their own =DiscussionReport=. These are creation
+options; later discussion turns retain the selected configuration.
 
 Pass =worktree: true= to start the discussion in a new Git worktree. The tool
 instructs models to use this option only when the user explicitly requests a Git
@@ -1551,7 +1581,7 @@ Sub-agents can be configured to use specific models or other API parameters
 gptel presets.
 
 Each delegation snapshots its backend, model, streaming mode, system prompt,
-tools and request parameters.  Tasks are unlimited by default.  Add
+tools, tool-use mode and request parameters.  Tasks are unlimited by default.  Add
 =task-timeout= and/or =max-request-rounds= to an agent's frontmatter or Org
 properties to bound that agent; =nil= or =false= explicitly means unlimited.
 The built-in researcher uses a 3600 second timeout and 100 model request rounds;
@@ -1568,8 +1598,24 @@ set globally or buffer-locally on the parent request buffer.  Child request
 configuration is applied in this order: inherited parent settings, harness
 defaults, =gptel-agent-preset=, then per-agent frontmatter.  Thus unspecified
 parent settings are retained, the shared preset configures all sub-agents, and
-explicit per-agent settings take final precedence.  Preset parents, composition
-forms, and =:pre=/=:post= hooks are honored at each layer.
+explicit per-agent settings override the shared preset. Preset parents,
+composition forms, and =:pre=/=:post= hooks are honored at each layer.
+
+When creating an =Agent=, an optional =model= then overrides both backend and
+model, and =extra_tools= appends tools to that final configuration. The =model=
+must be an exact advertised =Backend:model= choice, as with =Discussion=:
+
+#+begin_src json
+{"subagent_type": "researcher", "description": "Investigate issue", "prompt": "Find the cause and return evidence.", "model": "MyBackend:my-model", "extra_tools": ["Read", "mcp-github"]}
+#+end_src
+
+Omitting =model=, using =null= or an empty string preserves the configured
+choice. These overrides affect only the new child, not its parent or siblings.
+The extra-tools lookup and confirmation rules are the same as for =Discussion=.
+An =Agent= follow-up with =agent_id= retains its original model, tools and
+tool-use mode; nonempty =model= or =extra_tools= overrides are rejected without
+changing its saved conversation. Disabled tool use stays disabled, including
+on follow-ups; normally enabled tools are restored after a synthesis turn.
 
 The Agent task overlay includes an =[Inspect sub-agent]= action.  Its buffer
 shows the prompt, model rounds, streamed output, tool arguments and results,

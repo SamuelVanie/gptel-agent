@@ -3268,6 +3268,15 @@ ARG-VALUES contains type, description, prompt and optional continuation args."
                 (format " [follow-up: %s]" id)
               "")
             (if (eq (nth 6 arg-values) t) " [background]" "")
+            (if-let* ((model (nth 8 arg-values))
+                      ((stringp model)) ((not (string-empty-p model))))
+                (format " [model: %S]" model)
+              "")
+            (if-let* ((extra-tools (nth 9 arg-values))
+                      ((not (memq extra-tools '(:null nil))))
+                      ((not (equal extra-tools []))))
+                (format "\n  extra_tools: %S" extra-tools)
+              "")
             "\n" (propertize (prin1-to-string prompt)
                              'line-prefix "  "
                              'wrap-prefix "  "
@@ -3452,6 +3461,55 @@ excluding conversation-specific skill grants."
           (set (make-local-variable symbol)
                (if (consp value) (copy-tree value) value)))))))
 
+(defun gptel-agent--delegation-models ()
+  "Return registered (NAME BACKEND MODEL) choices for child creation.
+Keep backend-qualified names and original model symbols, including metadata."
+  (cl-loop for (name . backend) in gptel--known-backends
+           append (cl-loop for model in (gptel-backend-models backend)
+                           collect (list (concat name ":" (gptel--model-name model))
+                                         backend model))))
+
+(defun gptel-agent--delegation-model (model)
+  "Resolve optional MODEL to its registered (BACKEND MODEL) pair."
+  (unless (member model '(nil "" :null))
+    (unless (stringp model)
+      (user-error "model must be a backend:model string"))
+    (or (cdr (assoc model (gptel-agent--delegation-models)))
+        (user-error "Cannot find gptel model %S; choose an advertised backend:model" model))))
+
+(defun gptel-agent--extra-tools (value)
+  "Validate optional extra_tools VALUE and return a list of selectors.
+Accept JSON arrays and Lisp lists of tool/category names.  Nil, JSON null,
+and empty arrays mean no additions; an empty name is not a selector."
+  (unless (memq value '(nil :null))
+    (unless (and (or (and (vectorp value) (not (recordp value)))
+                     (proper-list-p value))
+                 (seq-every-p (lambda (name)
+                                (and (stringp name) (not (string-blank-p name))))
+                              value))
+      (user-error "extra_tools must be an array of nonempty tool or category names"))
+    (append value nil)))
+
+(defun gptel-agent--append-extra-tools (selectors)
+  "Append SELECTORS to this child's tools without changing existing tools.
+Resolve names and categories exactly as gptel presets do, after preset hooks
+have registered their tools.  Keep the first exposed name, including existing
+request-local copies and their confirmation settings.  Publish only after all
+selectors resolve, and do not change `gptel-use-tools'."
+  (when (setq selectors (gptel-agent--extra-tools selectors))
+    (let ((names (mapcar #'gptel-tool-name gptel-tools)) additions)
+      (dolist (selector selectors)
+        (let ((resolved (gptel-get-tool selector)))
+          (dolist (tool (if (gptel-tool-p resolved) (list resolved) resolved))
+            (unless (member (gptel-tool-name tool) names)
+              (push (gptel-tool-name tool) names)
+              (push (gptel-agent--skill-copy-tool tool) additions)))))
+      ;; Native composition preserves the original list.  Applying a complete
+      ;; :tools preset here would also deduplicate preexisting tools by eq.
+      (setq-local gptel-tools
+                  (gptel--modify-value gptel-tools
+                                       (list :append (nreverse additions)))))))
+
 (defun gptel-agent--resolve-subagent-preset (preset)
   "Return an isolated preset spec for sub-agent PRESET.
 
@@ -3501,11 +3559,32 @@ The value must be nil (unlimited) or a non-negative integer."
                   key value))
     value))
 
+(defun gptel-agent--localize-child-tools (fsm)
+  "Bind child tools to FSM even when a custom preset omits localizers."
+  (unless (plist-member (gptel-fsm-info fsm) :skill-registry)
+    (gptel-agent--localize-skill-tool fsm))
+  ;; Do not overwrite wrappers installed by transforms following the normal
+  ;; localizers.  Explicit additions were already present when those ran.
+  (unless (plist-get (gptel-fsm-info fsm) :agent-tools-localized)
+    (gptel-agent--localize-agent-tool fsm))
+  (when (and (fboundp 'gptel-agent-discussion--localize)
+             (not (plist-member (gptel-fsm-info fsm) :discussion-config)))
+    (gptel-agent-discussion--localize fsm))
+  (when (fboundp 'gptel-agent-chat--localize)
+    (gptel-agent-chat--localize fsm))
+  ;; This transform runs last, so retain the effective mode even when a
+  ;; custom prompt transform overrides the preset's original selection.
+  (when-let* ((run (gptel-agent--run-from-fsm fsm)))
+    (setf (gptel-agent--run-configuration run)
+          (plist-put (copy-sequence (gptel-agent--run-configuration run))
+                     :use-tools gptel-use-tools))))
+
 (defun gptel-agent--resume-session (run fsm position callback)
   "Start RUN in FSM from its saved conversation, at POSITION with CALLBACK."
   (let* ((session (gptel-agent--run-session run))
          (info (copy-sequence (gptel-agent--session-request-info session)))
-         (data (copy-tree (plist-get info :data) t)))
+         (data (copy-tree (plist-get info :data) t))
+         (configuration (gptel-agent--run-configuration run)))
     (gptel--inject-prompt
      (plist-get info :backend) data
      (gptel--parse-list (plist-get info :backend)
@@ -3521,7 +3600,10 @@ The value must be nil (unlimited) or a non-negative integer."
                             (if (plist-member info :skill-base-tools)
                                 (plist-get info :skill-base-tools)
                               (plist-get info :tools)))
-                gptel-use-tools (and gptel-tools t))
+                gptel-use-tools
+                (if (plist-member configuration :use-tools)
+                    (plist-get configuration :use-tools)
+                  (and (plist-get info :tools) t)))
     ;; Every request-owned dispatcher must capture this new invocation's FSM.
     (gptel-agent--localize-skill-tool fsm)
     (gptel-agent--localize-agent-tool fsm)
@@ -3529,15 +3611,21 @@ The value must be nil (unlimited) or a non-negative integer."
       (gptel-agent-discussion--localize fsm))
     (when (fboundp 'gptel-agent-chat--localize)
       (gptel-agent-chat--localize fsm))
-    (plist-put info :tools gptel-tools)
-    (when gptel-tools
-      (setf (plist-get data :tools)
-            (gptel--parse-tools (plist-get info :backend) gptel-tools)))
+    ;; Localizers may add plist fields; retain their current head.  Configured
+    ;; tools remain available in the buffer even when tool use is disabled.
+    (setq info (gptel-fsm-info fsm))
+    (setq info (plist-put info :tools (and gptel-use-tools gptel-tools)))
+    (if (and gptel-use-tools gptel-tools)
+        (setq data (plist-put data :tools
+                              (gptel--parse-tools (plist-get info :backend) gptel-tools)))
+      (dolist (key gptel-agent--tool-request-keys) (cl-remf data key)))
+    (setf (gptel-fsm-info fsm) (plist-put info :data data))
     (gptel--fsm-transition fsm)))
 
 (defun gptel-agent--task (main-cb agent-type description prompt
                                   &optional parent-fsm agent-snapshot
-                                  result-file query agent-id background directory)
+                                  result-file query agent-id background directory
+                                  model extra-tools)
   "Call a gptel agent to do specific compound tasks.
 
 MAIN-CB is the main callback to return a value to the main loop.
@@ -3552,7 +3640,9 @@ BACKGROUND equal to t acknowledges launch immediately; completion is queued
 on PARENT-FSM and cannot finish that parent turn before delivery.
 DIRECTORY is an existing working directory, relative to the parent chat.
 If omitted, new agents inherit the parent's directory and follow-ups keep
-the child's current directory."
+the child's current directory.
+MODEL and EXTRA-TOOLS select a registered backend:model and append tool or
+category names after preset hooks.  They apply only to new conversations."
   (let* ((parent-info (and (gptel-fsm-p parent-fsm)
                            (gptel-fsm-info parent-fsm)))
          (parent-buffer (and parent-info (plist-get parent-info :buffer)))
@@ -3564,6 +3654,16 @@ the child's current directory."
                        (with-current-buffer parent-buffer
                          (cdr (assoc agent-id gptel-agent--sessions)))))
          (previous (and session (gptel-agent--session-run session)))
+         selection
+         (override-error
+          (condition-case err
+              (progn
+                (setq extra-tools (gptel-agent--extra-tools extra-tools)
+                      selection (gptel-agent--delegation-model model))
+                (when (and agent-id (or selection extra-tools))
+                  (user-error "model and extra_tools apply only when creating an Agent; omit them with agent_id"))
+                nil)
+            (error (error-message-string err))))
          (directory-error
           (when (buffer-live-p parent-buffer)
             (condition-case err
@@ -3593,6 +3693,9 @@ the child's current directory."
      ((and (gptel-agent--workers-for parent-fsm)
            (gptel-agent--workers-closed (gptel-agent--workers-for parent-fsm)))
       (funcall main-cb "Error: The owning request is already complete."))
+     (override-error
+      (with-current-buffer parent-buffer
+        (funcall main-cb (concat "Error: " override-error))))
      ((and agent-id
            (or (not previous)
                (not (buffer-live-p (gptel-agent--run-child-buffer previous)))
@@ -3712,7 +3815,20 @@ the child's current directory."
                               (and result-explorer-p result-file)
                               gptel--preset nil)
                   (gptel-agent--apply-subagent-configuration
-                   preset agent-plist))
+                   preset agent-plist)
+                  (when selection
+                    (setq-local gptel-backend (car selection)
+                                gptel-model (cadr selection)))
+                  (gptel-agent--append-extra-tools extra-tools))
+                ;; Preset hooks cannot relax the captured parent ceiling or
+                ;; the scoped worker's built-in policy and validated contract.
+                (gptel-agent-policy-inherit
+                 (gptel-agent-policy-request-ceiling parent-fsm)
+                 (plist-get (gptel-fsm-info parent-fsm) :agent-tool-policy-snapshot))
+                (when result-explorer-p
+                  (setq-local gptel-agent--current-agent agent-type
+                              gptel-agent--result-file-scope result-file)
+                  (gptel-agent-policy-protect-result-explorer))
                 ;; A custom preset may omit localizers.  Never carry a
                 ;; main-chat sender closure into a worker's request.
                 (setq-local gptel-tools (cl-remove "MainChat" gptel-tools
@@ -3723,6 +3839,7 @@ the child's current directory."
                         (list :backend gptel-backend :model gptel-model
                               :stream gptel-stream :system gptel-system-prompt
                               :tools (copy-sequence gptel-tools)
+                              :use-tools gptel-use-tools
                               :request-params (copy-tree gptel--request-params))))
                 (let ((inhibit-read-only t))
                   (goto-char (point-max))
@@ -3763,10 +3880,8 @@ the child's current directory."
                         (cl-remove 'gptel--transform-apply-preset
                                    gptel-prompt-transform-functions))
                        (transforms
-                        (if (memq #'gptel-agent--localize-agent-tool transforms)
-                            transforms
-                          (append transforms
-                                  (list #'gptel-agent--localize-agent-tool))))
+                        (append (remq #'gptel-agent--localize-child-tools transforms)
+                                (list #'gptel-agent--localize-child-tools)))
                        (task-callback
                         (lambda (resp info &optional raw)
                           (condition-case callback-error
@@ -5246,7 +5361,20 @@ FSM's live request buffer even when confirmed from another buffer."
                     (gptel-agent--snapshot-agent-definitions)))
               (gptel-agent--snapshot-agent-definitions)))
            (tool (gptel--copy-tool base-tool))
-           (args (copy-tree (gptel-tool-args base-tool))))
+           (args (copy-tree (gptel-tool-args base-tool)))
+           (model-arg (cl-find "model" args
+                               :key (lambda (arg) (plist-get arg :name)) :test #'equal))
+           (models (gptel-agent--delegation-models)))
+      (when model-arg
+        (setf (plist-get model-arg :description)
+              (concat
+               (plist-get (cl-find "model" (gptel-tool-args
+                                             (gptel-agent--registered-builtin-tool "Agent"))
+                                   :key (lambda (arg) (plist-get arg :name)) :test #'equal)
+                          :description)
+               "\nAvailable gptel models (backend:model):\n"
+               (if models (mapconcat #'car models "\n")
+                 "None registered; omit model to inherit."))))
       (setf (gptel-tool-description tool)
             (concat gptel-agent--agent-tool-base-desc "\n\n"
                     (gptel-agent--agent-snapshot-message snapshot))
@@ -5254,9 +5382,11 @@ FSM's live request buffer even when confirmed from another buffer."
             (plist-get (car args) :enum) (vconcat (mapcar #'car snapshot))
             (gptel-tool-function tool)
             (lambda (main-cb agent-type description prompt
-                             &optional result-file query agent-id background directory)
+                             &optional result-file query agent-id background directory
+                             model extra-tools)
               (gptel-agent--task main-cb agent-type description prompt
-                                 fsm snapshot result-file query agent-id background directory)))
+                                 fsm snapshot result-file query agent-id background directory
+                                 model extra-tools)))
       (setq-local
        gptel-tools
        (if snapshot
@@ -5278,7 +5408,9 @@ FSM's live request buffer even when confirmed from another buffer."
             (lambda (callback action &optional agent-id agent-ids message)
               (gptel-agent--control callback fsm action agent-id agent-ids message)))
       (setq-local gptel-tools
-                  (append (remq selected gptel-tools) (list control))))))
+                  (append (remq selected gptel-tools) (list control)))))
+  (setf (gptel-fsm-info fsm)
+        (plist-put (gptel-fsm-info fsm) :agent-tools-localized t)))
 
 (defun gptel-agent--update-agent-tool ()
   "Retain compatibility; Agent schemas are now built per request.
@@ -5288,10 +5420,11 @@ The registered tool is deliberately immutable.  See
   (gptel-agent--registered-builtin-tool "Agent"))
 
 (defun gptel-agent--task-tool-dispatch
-    (main-cb agent-type description prompt &optional result-file query agent-id background directory)
+    (main-cb agent-type description prompt &optional result-file query agent-id background directory
+             model extra-tools)
   "Dispatch an Agent tool call before request-local FSM ownership is attached."
   (gptel-agent--task main-cb agent-type description prompt
-                     nil nil result-file query agent-id background directory))
+                     nil nil result-file query agent-id background directory model extra-tools))
 
 (gptel-make-tool
  :name "Agent"
@@ -5330,7 +5463,16 @@ automatically appended.")
          ( :name "directory"
            :type string
            :optional t
-           :description "Existing working directory for the agent, including a different project. Relative paths resolve against the calling chat's directory. Omit or leave empty to inherit that directory for a new agent, or retain a resumed agent's current directory. An explicit directory also changes a resumed agent's directory."))
+           :description "Existing working directory for the agent, including a different project. Relative paths resolve against the calling chat's directory. Omit or leave empty to inherit that directory for a new agent, or retain a resumed agent's current directory. An explicit directory also changes a resumed agent's directory.")
+         ( :name "model"
+           :type string
+           :optional t
+           :description "Creation only: select an exact backend:model from the available gptel models. Overrides the inherited, shared-preset and per-agent backend/model after their hooks. Omit or leave empty to keep configured defaults. Omit with agent_id; follow-ups retain the original selection.")
+         ( :name "extra_tools"
+           :type array
+           :items (:type string)
+           :optional t
+           :description "Creation only: append registered tool names and/or category (group) names to the agent's configured tools after preset hooks, e.g. [\"Read\", \"mcp-github\"]. Existing tools and their settings are preserved; repeated names are not added twice. Omit or use [] for no additions; omit with agent_id. This does not enable disabled tool use or grant approvals or policy permissions. Result-explorer's policy still permits only ResultRead and ResultGrep."))
  :category "gptel-agent"
  :async t
  :confirm t

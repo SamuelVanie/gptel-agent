@@ -448,9 +448,9 @@ and can be inspected with DiscussionControl read without waking the owner."
             (setf (gptel-tool-function tool)
                   (if (equal name "Discussion")
                       (let ((config (plist-get info :discussion-config)))
-                        (lambda (callback title prompt &optional preset directory worktree model)
+                        (lambda (callback title prompt &optional preset directory worktree model extra-tools)
                           (gptel-agent-discussion--dispatch-create
-                           callback fsm config title prompt preset directory worktree model)))
+                           callback fsm config title prompt preset directory worktree model extra-tools)))
                     (lambda (callback action &optional id message request-id ids offset delete-branch)
                       (gptel-agent-discussion--control
                        callback fsm action id message request-id ids offset delete-branch))))
@@ -909,13 +909,10 @@ including on partial failure, so branch deletion can be retried separately."
 NAME includes the backend, so models offered by multiple backends and names
 containing colons remain unambiguous.  Keep the original model symbols and
 their metadata instead of interning their names."
-  (cl-loop for (name . backend) in gptel--known-backends
-           append (cl-loop for model in (gptel-backend-models backend)
-                           collect (list (concat name ":" (gptel--model-name model))
-                                         backend model))))
+  (gptel-agent--delegation-models))
 
 (defun gptel-agent-discussion--create
-    (owner config title prompt preset directory &optional worktree model parent-fsm)
+    (owner config title prompt preset directory &optional worktree model parent-fsm extra-tools)
   "Create an independent chat for OWNER using CONFIG, TITLE and PROMPT.
 Omitted or empty PRESET keeps inherited request settings.  Otherwise any
 registered gptel PRESET overrides the settings it specifies.
@@ -923,7 +920,8 @@ MODEL, when nonempty, is a registered backend:model choice applied after
 PRESET, including its hooks, overriding both backend and model.
 DIRECTORY selects its working directory.  When WORKTREE is t, create a
 new Git worktree from that directory and start the chat in its root.
-PARENT-FSM supplies the managing request's tool policy ceiling."
+PARENT-FSM supplies the managing request's tool policy ceiling.
+EXTRA-TOOLS appends registered tool names or categories after the preset."
   (gptel-agent-discussion--nonempty title "title")
   (gptel-agent-discussion--nonempty prompt "prompt")
   (unless (memq worktree '(nil t :json-false :null))
@@ -934,12 +932,8 @@ PARENT-FSM supplies the managing request's tool policy ceiling."
                                                   (gptel-get-preset (intern-soft preset))))))
                           (copy-tree spec))
                         (user-error "Cannot find gptel preset %S" preset))))
-         (selection
-          (unless (member model '(nil "" :null))
-            (unless (stringp model)
-              (user-error "model must be a backend:model string"))
-            (or (cdr (assoc model (gptel-agent-discussion--models)))
-                (user-error "Cannot find gptel model %S; choose an advertised backend:model" model))))
+         (selection (gptel-agent--delegation-model model))
+         (extra-tools (gptel-agent--extra-tools extra-tools))
          (directory (with-current-buffer owner
                       (gptel-agent-path-working-directory directory)))
          (worktree (and (eq worktree t)
@@ -973,6 +967,7 @@ PARENT-FSM supplies the managing request's tool policy ceiling."
               (gptel--apply-preset spec
                                    (lambda (symbol value)
                                      (set (make-local-variable symbol) value))))
+            (gptel-agent--append-extra-tools extra-tools)
             (when parent-fsm
               (gptel-agent-policy-inherit
                (gptel-agent-policy-request-ceiling parent-fsm)
@@ -1034,9 +1029,10 @@ PARENT-FSM supplies the managing request's tool policy ceiling."
      (plist-get info :tools))))
 
 (defun gptel-agent-discussion--dispatch-create
-    (callback fsm config title prompt preset directory &optional worktree model)
+    (callback fsm config title prompt preset directory &optional worktree model extra-tools)
   "Create a chat from live owner FSM, then return its identity to CALLBACK.
-CONFIG, TITLE, PROMPT, PRESET, DIRECTORY, WORKTREE and MODEL describe the chat."
+CONFIG, TITLE, PROMPT, PRESET, DIRECTORY, WORKTREE, MODEL and EXTRA-TOOLS
+describe the chat."
   (let ((result
          (condition-case err
              (progn
@@ -1050,7 +1046,7 @@ CONFIG, TITLE, PROMPT, PRESET, DIRECTORY, WORKTREE and MODEL describe the chat."
                      (gptel-agent-discussion--inherited-tools fsm))
                (let ((chat (gptel-agent-discussion--create
                             (plist-get (gptel-fsm-info fsm) :buffer)
-                            config title prompt preset directory worktree model fsm)))
+                            config title prompt preset directory worktree model fsm extra-tools)))
                  (concat (gptel-agent-discussion--status chat)
                          "\nReplies and attention alerts stay in the discussion. Only an explicit DiscussionReport notifies you. Use send to ask for a report, or read to inspect its work and pending interactions. The user can open this buffer or M-x gptel-agent-discussions.")))
            (error (concat "Error: " (error-message-string err))))))
@@ -1358,7 +1354,8 @@ If a draft remains, send it explicitly with `gptel-send' instead."
          (:name "preset" :type string :optional t :description "Honor a preset explicitly requested by the user. Otherwise choose an appropriate name from the available presets yourself; do not wait for the user to name one. For modifications outside your role or tools, select an implementation-capable preset, such as gptel-agent when available, rather than inheriting a read-only planning or explanation role. Omit or leave empty only when your current role and settings suit the child's task, or the user explicitly requests inheritance. Any registered gptel preset is supported, including user-defined presets outside gptel-agent. Its specified settings override inherited values; unspecified settings remain inherited.")
          (:name "directory" :type string :optional t :description "Existing working directory, including a different project. Relative paths resolve against the calling chat's directory. Omit or leave empty to inherit that directory. With worktree=true, selects the source Git repository. The child discovers its own project instructions.")
          (:name "worktree" :type boolean :optional t :description "Set true only when the user explicitly requests a Git worktree or isolated Git workspace. A general coding or delegation request does not authorize this option. Otherwise omit or use false to keep the existing directory. Creates a randomly named Git worktree and new branch from the selected directory's HEAD, then starts the child at the worktree root. Requires a Git working repository with a commit. The worktree is a sibling of the source repository; uncommitted and untracked files are not copied. Returns its path, branch, source repository/directory and starting commit. Closing the discussion retains the worktree and branch.")
-         (:name "model" :type string :optional t :description "Optional model override. Honor the user's requested model by selecting its exact backend:model entry from the available gptel models. This selects both the backend and model after applying the preset, overriding any model/backend it specifies. Omit or leave empty to keep the preset's or inherited model/backend. Applies only to this discussion; sub-agent model configuration is separate."))
+         (:name "model" :type string :optional t :description "Optional model override. Honor the user's requested model by selecting its exact backend:model entry from the available gptel models. This selects both the backend and model after applying the preset, overriding any model/backend it specifies. Omit or leave empty to keep the preset's or inherited model/backend. Applies only to this discussion; sub-agent model configuration is separate.")
+         (:name "extra_tools" :type array :items (:type string) :optional t :description "Optional registered gptel tool names or categories to append after applying the preset and its hooks. Existing tools remain unchanged and duplicate exposed names are not added. Omit, use null, or pass an empty array to keep the usual tools. Added tools retain their normal confirmations and inherited tool policy restrictions; this does not enable tool use when the preset disables it. MainChat remains unavailable in children."))
  :category "gptel-agent" :async t :include t :confirm t)
 
 (gptel-make-tool

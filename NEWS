@@ -2,7 +2,20 @@
 
 * 0.0.5-pre
 
+** Delegation configuration
+
+- Agent accepts a creation-time =model= override using an advertised
+  =Backend:model= choice, applied after shared and per-agent preset hooks.
+- Agent and Discussion accept =extra_tools= containing registered tool names
+  or groups. Additions preserve default tools, confirmations and disabled
+  tool-use settings; follow-ups retain the original configuration.
+- Result-explorer uses the existing tool-policy system to enforce its scoped
+  ResultRead/ResultGrep access even when extra tools are supplied.
+
 ** Compatibility fixes
+
+- Resuming an Agent retains its exact tool-use mode and keeps disabled tools
+  out of active request schemas; enabled tools still return after synthesis.
 
 - File edits reject characters that cannot be saved in the file's fixed
   encoding before writing any part of a batch or recording its history.

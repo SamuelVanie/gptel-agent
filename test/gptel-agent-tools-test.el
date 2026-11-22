@@ -1038,6 +1038,15 @@
     (should (plist-member plist :agents))
     (should-not (plist-get plist :agents))))
 
+(ert-deftest gptel-agent-task-preview-shows-creation-overrides ()
+  (with-temp-buffer
+    (gptel-agent--task-preview-setup
+     '("researcher" "Investigate" "Find evidence" nil nil nil nil nil
+       "Selected:model" ["Read" "mcp-example"]) nil)
+    (should (string-match-p "model: \"Selected:model\"" (buffer-string)))
+    (should (string-match-p "extra_tools: \\[\"Read\" \"mcp-example\"\\]" (buffer-string)))
+    (should (string-match-p "Find evidence" (buffer-string)))))
+
 (ert-deftest gptel-agent-tool-schema-is-request-local ()
   (let* ((global-tool (gptel-get-tool "Agent"))
          (global-args (copy-tree (gptel-tool-args global-tool)))
@@ -1060,7 +1069,8 @@
       (should (equal (mapcar (lambda (arg) (plist-get arg :name))
                              (gptel-tool-args local-tool))
                      '("subagent_type" "description" "prompt"
-                       "result_file" "query" "agent_id" "background" "directory")))
+                       "result_file" "query" "agent_id" "background" "directory"
+                       "model" "extra_tools")))
       (should (equal (gptel-tool-args global-tool) global-args))
       (cl-letf (((symbol-function 'gptel-agent--task)
                  (lambda (&rest args) (setq captured args))))

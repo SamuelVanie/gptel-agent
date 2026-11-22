@@ -967,7 +967,14 @@ CLOSE-FIRST closes monitoring while the editable transcript is still live."
     (dolist (make-backend '(gptel-make-openai gptel-make-openai-responses
                            gptel-make-anthropic gptel-make-gemini))
       (let ((selected-backend (funcall make-backend "Selected" :key "unused"
+                                       :host "example.invalid"
                                        :models (list selected-model))))
+        (should (eq (type-of selected-backend)
+                    (pcase make-backend
+                      ('gptel-make-openai 'gptel-openai)
+                      ('gptel-make-openai-responses 'gptel-openai-responses)
+                      ('gptel-make-anthropic 'gptel-anthropic)
+                      ('gptel-make-gemini 'gptel-gemini))))
         (gptel-agent-discussion-test--with-chat
          (setq hook-ran nil)
          (gptel-agent-workers-test--tool
@@ -1043,6 +1050,164 @@ CLOSE-FIRST closes monitoring while the editable transcript is still live."
            (should-not (buffer-local-value 'gptel-agent-discussion--children parent))
            (should (= counter gptel-agent-discussion--counter))
            (should (equal buffers (buffer-list)))))))))
+
+(ert-deftest gptel-agent-discussion-extra-tools-append-after-preset-hooks ()
+  (let ((gptel--known-tools (copy-tree gptel--known-tools))
+        (gptel--known-presets (copy-tree gptel--known-presets))
+        hook-ran)
+    (gptel-make-preset 'discussion-extra-tools
+      :tools '("Read")
+      :post (lambda ()
+              (setq hook-ran t)
+              ;; A hook may customize existing tools and register additions.
+              (let ((read (gptel-agent--skill-copy-tool (car gptel-tools))))
+                (setf (gptel-tool-confirm read) t)
+                (setq-local gptel-tools (list read)))
+              (gptel-make-tool
+               :name "DiscussionHookTool" :category "discussion-extras"
+               :description "Registered by a preset hook" :args nil
+               :confirm t :function (lambda () "hook-tool"))))
+    (gptel-agent-discussion-test--with-chat
+     (let ((parent-tools (copy-sequence (plist-get (gptel-fsm-info fsm) :tools)))
+           (global-confirm (gptel-tool-confirm (gptel-get-tool "Read"))))
+       (gptel-agent-workers-test--tool
+        fsm "Discussion" '(:title "Extra tools" :prompt "Fresh"
+                           :preset "discussion-extra-tools"
+                           :extra_tools ["Read" "discussion-extras" "DiscussionHookTool"
+                                         "MainChat" "DiscussionReport"]))
+       (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+       (should hook-ran)
+       (let* ((child (gptel-agent-discussion--chat-buffer chat))
+              (child-fsm (gptel-agent-discussion--chat-fsm chat))
+              (tools (plist-get (gptel-fsm-info child-fsm) :tools)))
+         (should (equal (sort (mapcar #'gptel-tool-name tools) #'string<)
+                        '("DiscussionHookTool" "DiscussionReport" "Read")))
+         (should (gptel-tool-confirm
+                  (cl-find "Read" tools :key #'gptel-tool-name :test #'equal)))
+         (should (gptel-tool-confirm
+                  (cl-find "DiscussionHookTool" tools :key #'gptel-tool-name :test #'equal)))
+         (should-not (buffer-local-value 'gptel-agent--skill-tools child))
+         (should (equal parent-tools (plist-get (gptel-fsm-info fsm) :tools)))
+         (should (equal global-confirm (gptel-tool-confirm (gptel-get-tool "Read"))))
+         (gptel-agent-workers-test--tool child-fsm "DiscussionReport" '(:message "ADDED-REPORT"))
+         (should (string-match-p "ADDED-REPORT"
+                                 (gptel-agent-discussion-test--control fsm "wait")))
+         (gptel-agent-workers-test--answer child-fsm "Ready")
+         (with-current-buffer child
+           (goto-char (point-max)) (insert "Continue") (gptel-send))
+         (let ((next-tools (plist-get (gptel-fsm-info (gptel-agent-discussion--chat-fsm chat)) :tools)))
+           (should (equal (sort (mapcar #'gptel-tool-name next-tools) #'string<)
+                          '("DiscussionHookTool" "DiscussionReport" "Read")))))))))
+
+(ert-deftest gptel-agent-discussion-extra-tools-inherit-and-empty-defaults ()
+  (gptel-agent-discussion-test--with-chat
+   (dolist (extra-tools '(nil :null [] ["Read" "Read"]))
+     (gptel-agent-workers-test--tool
+      fsm "Discussion" (append '(:title "Inherited extras" :prompt "Fresh")
+                               (and extra-tools (list :extra_tools extra-tools))))
+     (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+     (let* ((child-fsm (gptel-agent-discussion--chat-fsm chat))
+            (tools (plist-get (gptel-fsm-info child-fsm) :tools)))
+       (should (cl-find "DiscussionMutation" tools :key #'gptel-tool-name :test #'equal))
+       (should (= (cl-count "Read" tools :key #'gptel-tool-name :test #'equal)
+                  (if (equal extra-tools ["Read" "Read"]) 1 0)))
+       (should-not (cl-find "Read" (plist-get (gptel-fsm-info fsm) :tools)
+                            :key #'gptel-tool-name :test #'equal))))))
+
+(ert-deftest gptel-agent-discussion-extra-tools-invalid-shape-before-creation ()
+  (gptel-agent-discussion-test--with-chat
+   (let ((tool (cl-find "Discussion" (plist-get (gptel-fsm-info fsm) :tools)
+                        :key #'gptel-tool-name :test #'equal))
+         (buffers (buffer-list))
+         (counter gptel-agent-discussion--counter)
+         result)
+     (cl-letf (((symbol-function 'gptel-agent-discussion--make-worktree)
+                (lambda (&rest _) (ert-fail "Invalid tools must not create a worktree"))))
+       (dolist (extra-tools '("Read" 42 t [""] [" "] ["Read" 42] [["misc" "Read"]]))
+         (with-temp-buffer
+           (apply (gptel-tool-function tool) (lambda (text) (setq result text))
+                  (gptel--map-tool-args
+                   tool (list :title "Invalid" :prompt "Fresh"
+                              :worktree t :extra_tools extra-tools))))
+         (should (string-prefix-p "Error:" result))
+         (should (string-match-p "extra_tools" result))
+         (should-not (buffer-local-value 'gptel-agent-discussion--children parent))
+         (should (= counter gptel-agent-discussion--counter))
+         (should (equal buffers (buffer-list))))))))
+
+(ert-deftest gptel-agent-discussion-extra-tools-unknown-is-inspectable-startup-failure ()
+  (let ((gptel--known-tools (copy-tree gptel--known-tools)))
+    (gptel-agent-discussion-test--with-chat
+     (let ((parent-tools (copy-sequence (plist-get (gptel-fsm-info fsm) :tools))))
+       (gptel-agent-workers-test--tool
+        fsm "Discussion" '(:title "Unknown extras" :prompt "Fresh"
+                           :extra_tools ["Read" "MissingDiscussionExtraTool"]))
+       (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+       (should (eq (gptel-agent-discussion--chat-state chat) 'failed))
+       (should (string-match-p "MissingDiscussionExtraTool"
+                               (gptel-agent-discussion--read chat 0)))
+       (should-not (gptel-agent-discussion--chat-fsm chat))
+       (should-not (cl-find (gptel-agent-discussion--chat-buffer chat) requests
+                            :key (lambda (request) (plist-get (gptel-fsm-info request) :buffer))))
+       (should-not (cl-find "Read"
+                            (buffer-local-value 'gptel-tools (gptel-agent-discussion--chat-buffer chat))
+                            :key #'gptel-tool-name :test #'equal))
+       (should (equal parent-tools (plist-get (gptel-fsm-info fsm) :tools)))))))
+
+(ert-deftest gptel-agent-discussion-extra-tools-bind-child-despite-custom-transforms ()
+  (let ((gptel--known-presets (copy-tree gptel--known-presets)))
+    (gptel-make-preset 'discussion-extra-custom
+      :tools '("AskUserQuestion") :prompt-transform-functions '(ignore))
+    (gptel-agent-discussion-test--with-chat
+     (gptel-agent-workers-test--tool
+      fsm "Discussion" '(:title "Child manager" :prompt "Fresh"
+                         :preset "discussion-extra-custom"
+                         :extra_tools ["Discussion" "DiscussionControl" "MainChat"]))
+     (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+     (let* ((child (gptel-agent-discussion--chat-buffer chat))
+            (child-fsm (gptel-agent-discussion--chat-fsm chat))
+            nested)
+       (unwind-protect
+           (progn
+             (should-not (cl-find "MainChat" (plist-get (gptel-fsm-info child-fsm) :tools)
+                                  :key #'gptel-tool-name :test #'equal))
+             (gptel-agent-workers-test--tool
+              child-fsm "Discussion" '(:title "Nested child" :prompt "Independent"))
+             (when-let* ((pending (car (gptel-agent-discussion--chat-pending chat))))
+               (gptel--accept-tool-calls (gptel-agent-discussion--interaction-calls pending)))
+             (setq nested (car (buffer-local-value 'gptel-agent-discussion--children child)))
+             (should nested)
+             (should (eq (gptel-agent-discussion--chat-owner nested) child))
+             (should (= 1 (length (buffer-local-value 'gptel-agent-discussion--children parent))))
+             (gptel-agent-workers-test--tool
+              (gptel-agent-discussion--chat-fsm nested) "DiscussionReport" '(:message "NESTED-EXTRA"))
+             (should (string-match-p "NESTED-EXTRA"
+                                     (gptel-agent-discussion-test--control child-fsm "wait"))))
+         (when nested
+           (setf (gptel-agent-discussion--chat-owner nested) nil)
+           (kill-buffer (gptel-agent-discussion--chat-buffer nested))))))))
+
+(ert-deftest gptel-agent-discussion-extra-tools-preserve-disabled-tool-use ()
+  (let ((gptel--known-presets (copy-tree gptel--known-presets)))
+    (gptel-make-preset 'discussion-disabled-tools :tools '("Read") :use-tools nil)
+    (gptel-agent-discussion-test--with-chat
+     (gptel-agent-workers-test--tool
+      fsm "Discussion" '(:title "Disabled tools" :prompt "Fresh"
+                         :preset "discussion-disabled-tools" :extra_tools ["Write"]))
+     (setq chat (car (buffer-local-value 'gptel-agent-discussion--children parent)))
+     (let* ((child (gptel-agent-discussion--chat-buffer chat))
+            (child-fsm (gptel-agent-discussion--chat-fsm chat)))
+       (should-not (buffer-local-value 'gptel-use-tools child))
+       (should (cl-find "Write" (buffer-local-value 'gptel-tools child)
+                        :key #'gptel-tool-name :test #'equal))
+       (should-not (plist-get (gptel-fsm-info child-fsm) :tools))
+       (gptel-agent-workers-test--answer child-fsm "Ready")
+       (with-current-buffer child
+         (goto-char (point-max)) (insert "Continue") (gptel-send))
+       (should-not (buffer-local-value 'gptel-use-tools child))
+       (should (cl-find "Write" (buffer-local-value 'gptel-tools child)
+                        :key #'gptel-tool-name :test #'equal))
+       (should-not (plist-get (gptel-fsm-info (gptel-agent-discussion--chat-fsm chat)) :tools))))))
 
 (ert-deftest gptel-agent-discussion-planner-can-select-implementation-preset ()
   (gptel-agent-test--with-main-presets
