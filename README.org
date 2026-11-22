@@ -12,6 +12,7 @@ builds on [[https://github.com/karthink/gptel-agent][karthink's gptel-agent]] fo
 - Set tool policies that control allowed calls by name and argument.
 - Let the agent start and manage separate chat threads called discussions.
 - Run Bash in the background and manage jobs with the =Process= tool.
+- Session management with autosave, and auto generation of the discussion name.
 
 [[https://github.com/SamuelVanie/gptel-ui][gptel-ui]] is an optional reading view with foldable tool output and shortcuts
 for jumping between turns and pending approvals.
