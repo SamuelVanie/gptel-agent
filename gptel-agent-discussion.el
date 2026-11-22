@@ -202,6 +202,24 @@ and can be inspected with DiscussionControl read without waking the owner."
                  (gptel-agent-discussion--event-text event)))
              events "\n\n"))
 
+(defun gptel-agent-discussion--call-unrestricted (fsm function &rest args)
+  "Call FUNCTION with ARGS without clipping FSM's transcript insertions.
+Preserve point and restriction in the source and insertion buffers.  Keep
+the source current: custom worker callbacks can append there even when
+FSM's position marker belongs to its managing conversation."
+  (let* ((source (current-buffer))
+         (position (plist-get (gptel-fsm-info fsm) :position))
+         (destination (and (markerp position) (marker-buffer position))))
+    (with-current-buffer (or destination source)
+      (save-excursion
+        (save-restriction
+          (widen)
+          (with-current-buffer source
+            (save-excursion
+              (save-restriction
+                (widen)
+                (apply function args)))))))))
+
 (defun gptel-agent-discussion--inject (fsm)
   "Deliver this buffer's inbox before FSM sends its next model request."
   (when gptel-agent-discussion--inbox
@@ -214,22 +232,27 @@ and can be inspected with DiscussionControl read without waking the owner."
       (setq gptel-agent-discussion--inbox nil)
       ;; Keep the editable transcript faithful to the request, including later
       ;; user-initiated gptel-send calls.  RAW avoids marking this as model text.
-      (when (eq (plist-get info :reasoning-block) 'in)
-        (funcall (plist-get info :callback) '(reasoning . t) info))
-      (let ((text (concat "\n\n" text "\n\n")))
-        (funcall (plist-get info :callback) text info 'raw)
-        (when-let* ((end (plist-get info :tracking-marker)))
-          ;; RAW insertion can inherit sticky response properties from the
-          ;; previous model text.  Future sends must parse this as user input.
-          ;; Custom callbacks can render elsewhere: Agent workers keep their
-          ;; confirmation marker in the parent but append reports to the child.
-          ;; Only change properties if this marker actually follows our text.
-          (when (marker-buffer end)
-            (with-current-buffer (marker-buffer end)
-              (let ((start (- end (length text))))
-                (when (and (<= (point-min) start) (<= end (point-max))
-                           (equal (buffer-substring-no-properties start end) text))
-                  (remove-text-properties start end '(gptel nil)))))))))))
+      (gptel-agent-discussion--call-unrestricted
+       fsm
+       (lambda ()
+         (when (eq (plist-get info :reasoning-block) 'in)
+           (funcall (plist-get info :callback) '(reasoning . t) info))
+         (let ((text (concat "\n\n" text "\n\n")))
+           (funcall (plist-get info :callback) text info 'raw)
+           (when-let* ((end (plist-get info :tracking-marker)))
+             ;; RAW insertion can inherit sticky response properties from the
+             ;; previous model text.  Future sends must parse this as user input.
+             ;; Custom callbacks can render elsewhere: Agent workers keep their
+             ;; confirmation marker in the parent but append reports to the child.
+             ;; Only change properties if this marker actually follows our text.
+             (when (marker-buffer end)
+               (with-current-buffer (marker-buffer end)
+                 (save-restriction
+                   (widen)
+                   (let ((start (- end (length text))))
+                     (when (and (<= (point-min) start) (<= end (point-max))
+                                (equal (buffer-substring-no-properties start end) text))
+                       (remove-text-properties start end '(gptel nil))))))))))))))
 
 (defun gptel-agent-discussion--before-wait (fsm)
   "Install attention handling and inject queued messages into FSM."
@@ -270,14 +293,16 @@ and can be inspected with DiscussionControl read without waking the owner."
             ;; The ordinary DONE handler has inserted the next prompt prefix
             ;; immediately after tracking-marker, ahead of any user draft.
             (setq gptel-agent-discussion--draft-start
-                  (copy-marker
-                   (min (point-max)
-                        (+ (or (plist-get info :tracking-marker)
-                               (plist-get info :position) (point-max))
-                           (if (and (eq state 'DONE) gptel-mode
-                                    (not (plist-get info :in-place)))
-                               (+ (length gptel-response-separator)
-                                  (length (gptel-prompt-prefix-string))) 0)))))
+                  (save-restriction
+                    (widen)
+                    (copy-marker
+                     (min (point-max)
+                          (+ (or (plist-get info :tracking-marker)
+                                 (plist-get info :position) (point-max))
+                             (if (and (eq state 'DONE) gptel-mode
+                                      (not (plist-get info :in-place)))
+                                 (+ (length gptel-response-separator)
+                                    (length (gptel-prompt-prefix-string))) 0))))))
             (gptel-agent-discussion--clear-waiters fsm)
             (when-let* ((chat gptel-agent-discussion--self)
                         ((eq fsm (gptel-agent-discussion--chat-fsm chat)))
@@ -301,13 +326,17 @@ and can be inspected with DiscussionControl read without waking the owner."
             (gptel-agent-discussion--schedule buffer)))))))
 
 (defun gptel-agent-discussion--draft-p ()
-  "Whether automatic sending could accidentally submit an unsent user draft."
+  "Whether automatic sending could accidentally submit an unsent user draft.
+Inspect the full buffer, including text hidden by narrowing."
   (or buffer-read-only
       (not (and (markerp gptel-agent-discussion--draft-start)
-                (marker-buffer gptel-agent-discussion--draft-start)))
-      (not (string-empty-p
-            (string-trim (buffer-substring-no-properties
-                          gptel-agent-discussion--draft-start (point-max)))))))
+                (eq (marker-buffer gptel-agent-discussion--draft-start)
+                    (current-buffer))))
+      (save-restriction
+        (widen)
+        (not (string-empty-p
+              (string-trim (buffer-substring-no-properties
+                            gptel-agent-discussion--draft-start (point-max))))))))
 
 (defun gptel-agent-discussion--flush (buffer)
   "Deliver BUFFER's inbox to waiters, a safe boundary, or a new ordinary turn."
@@ -329,6 +358,11 @@ and can be inspected with DiscussionControl read without waking the owner."
          ((gptel-agent-discussion--active-p gptel-agent-discussion--fsm)
           (when (eq (gptel-fsm-state gptel-agent-discussion--fsm) 'AGWT)
             (gptel--fsm-transition gptel-agent-discussion--fsm 'WAIT)))
+         ((buffer-narrowed-p)
+          ;; Even without a draft, gptel-send would use only the accessible
+          ;; history.  Leave the restriction and inbox for the user to resume.
+          (message "Discussion updates queued in %s; widen the buffer, then use M-x gptel-agent-discussion-resume"
+                   (buffer-name)))
          ((or gptel-agent-discussion--paused (gptel-agent-discussion--draft-p))
           (message "Discussion updates queued in %s; send your draft or use M-x gptel-agent-discussion-resume"
                    (buffer-name)))
@@ -546,7 +580,7 @@ Prefix ARG still opens the normal gptel menu."
   (setq gptel-agent-discussion--waiters (delq waiter gptel-agent-discussion--waiters))
   (when (timerp (nth 3 waiter)) (cancel-timer (nth 3 waiter)))
   (when (gptel-agent-discussion--active-p (car waiter))
-    (funcall (nth 2 waiter) text)))
+    (gptel-agent-discussion--call-unrestricted (car waiter) (nth 2 waiter) text)))
 
 (defun gptel-agent-discussion--wait-closed-p (waiter)
   "Whether a closure left WAITER without any active selected discussion."
@@ -1398,8 +1432,11 @@ DELETE-BRANCH optionally deletes the generated branch during cleanup."
 
 (defun gptel-agent-discussion-resume ()
   "Resume automatic discussion delivery after abort/error or a discarded draft.
+Widen the buffer first so automatic turns include the full conversation.
 If a draft remains, send it explicitly with `gptel-send' instead."
   (interactive)
+  (when (buffer-narrowed-p)
+    (user-error "Widen the buffer before resuming automatic discussion delivery"))
   (when (gptel-agent-discussion--draft-p)
     (user-error "An unsent draft remains; send it with gptel-send, or clear it first"))
   (setq gptel-agent-discussion--paused nil)

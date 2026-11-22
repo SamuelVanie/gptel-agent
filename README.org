@@ -1237,8 +1237,11 @@ review behavior and the child's existing review queue.
 
 Automatic sending waits when you have an unsent draft. Send that draft with
 =gptel-send= to include queued events, or discard it and run
-=M-x gptel-agent-discussion-resume=. Aborting or failing a parent request pauses
-automatic delivery without stopping its discussions. A new manual send or
+=M-x gptel-agent-discussion-resume=. Narrowing also defers new automatic turns
+so they cannot send only part of the conversation. Widen the buffer before
+resuming delivery; drafts hidden by narrowing still need to be sent or discarded.
+Aborting or failing a parent request pauses automatic delivery without stopping
+its discussions. A new manual send or
 =gptel-agent-discussion-resume= re-enables delivery. Killing the parent detaches
 its discussions, which remain usable; killing a child marks it closed without
 waking an idle parent. =close= retains the transcript and stops only that discussion's
