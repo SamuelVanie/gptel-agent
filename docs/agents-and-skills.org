@@ -1,0 +1,395 @@
+#+title: Sub-agents and skills
+
+[[file:../README.org][gptel-agent]]
+
+* What is an "agent"?
+
+"Agent" is the (now common) parlance used to refer to a bundle of configuration,
+consisting of
+
+- a system prompt (instructions),
+- tools (functions the LLM can call)
+- and the harness used to run or call the LLM.
+
+gptel uses the term "preset" for such configurations.  A preset can specify the above and any other behavior, such as the model used, API call parameters and so on.
+
+=gptel-agent= is implemented as a preset for gptel and can be modified/extended easily.
+
+* Using sub-agents
+
+gptel-agent can delegate tasks to "sub-agents".  Sub-agents can be specified in
+Markdown or Org files in a directory.  To see how to specify agents, examine the
+"agents" directory in this package (or see below).  You can add your directory
+of agents to =gptel-agent-dirs=, which see.
+You can also define them directly in Elisp with =gptel-agent-register= and
+extend a parent's allowlist with =gptel-agent-add-subagent= (see below).
+
+The following sub-agents are bundled:
+- =researcher= is read-only and can search the web or through local files for
+  information.
+- =introspector= can examine the state of Emacs, and access or search
+  documentation from your live Emacs session.
+- =result-explorer= extracts evidence from oversized saved tool results.
+
+Each parent's definition controls its sub-agents through an =agents= list.
+The default =gptel-agent= and the read-only =gptel-plan= and =ask= definitions
+offer =researcher= and =result-explorer=.  The default agent handles
+implementation and verification directly.
+Worker availability has no package-level exclusion list.
+The interactive =gptel-agent=, =gptel-plan= and
+=ask= presets are main agents, never sub-agents; an agent also cannot delegate
+to itself.  These guards apply even if those names appear in an =agents= list.
+Add custom sub-agent names to the parent's =agents= list to
+make them available there, then run =M-x gptel-agent-update= in the chat to
+refresh it.  Activating or reapplying a main preset also refreshes its
+sub-agent definitions.  Selecting a preset through gptel's menu enforces
+the same =agents= list as starting a dedicated agent session.
+
+Use =M-x gptel-agent-toggle-agent= to narrow the current conversation's
+selection; choosing none disables delegation.  This does not affect other
+chats or expand the parent's allowed list.  Requests already in flight retain
+their original selection.
+
+The LLM should automatically delegate tasks to enabled agents as required, but
+you can also explicitly request delegation: "/Use the researcher to find out
+if.../" or "/Use my-custom-agent to.../".
+
+** Follow-ups and background workers
+
+The =Agent= tool returns an =agent_id= with each completed task.  The main
+agent can pass it to =Agent= again, with the same =subagent_type= and a new
+=description= and =prompt=, to request a related follow-up or correction.
+The sub-agent keeps its original configuration, conversation and full tool
+results, including evidence shortened in the inspection buffer.  Each follow-up
+gets fresh timeout, round, retry and tool budgets.  The =agent_id= argument is
+optional; omitting it or passing a blank string starts a separate conversation.
+IDs belong to the calling chat; a running agent cannot receive another task
+until it finishes, but can receive steering for its current task. Failed or cancelled requests
+remain diagnostic-only and cannot be resumed.
+
+Set =background: true= on =Agent= (including follow-ups) to receive an
+=agent_id=, invocation-specific =run_id= and status immediately. Omitting it,
+or passing false, preserves the blocking call. Configuration, evidence, scope
+restrictions and supervision limits apply in both modes.
+
+=AgentControl= operates on the calling parent's workers:
+
+| action | arguments | behavior |
+|--------+-----------+----------|
+| list   |           | Concise statuses of owned workers |
+| read   | agent_id  | Current status and latest completed invocation; does not consume delivery |
+| wait   | agent_ids (optional) | Wait for a new terminal outcome from any selected worker |
+| send   | agent_id, message | Queue a correction for the active task without resetting its budgets |
+| cancel | agent_id  | Cancel that worker and all its descendants |
+
+Results arrive automatically at the next safe model-request boundary, after
+any outstanding tool results. Explicit waits consume the same completion
+queue, return immediately for queued results, and report =no_eligible_work=
+when there is nothing to await. There is no polling or repeated model request
+while waiting. Use =Agent= with =agent_id= for a completed worker's next task;
+=send= only steers work that is still active.
+
+The harness keeps the parent turn open until every descendant is terminal and
+its outcomes have reached its parent. An early final answer is interim output:
+the chat shows =Waiting for agents=, retains its request history, and inserts
+no next-user prompt or =Ready= status. A completion resumes the same request
+for synthesis, even while other workers are running. The same gate applies to
+nested workers and to accepted steering queued near completion. Workers waiting
+for tools, permissions, retries or descendants remain active; task timeouts
+continue to apply. Aborting or closing a chat cancels its worker subtree and
+pending wakeups. Unrecoverable parent failures also stop descendants.
+
+Worker orchestration is owned by the creating chat; workers can use separate
+working directories through =directory=. It does not
+add peer messaging, shared scheduling, worktree isolation or persistence across
+Emacs restarts. Background shell jobs keep their separate existing lifecycle.
+
+Completed sub-agent buffers stay available for follow-ups until you close them
+or their parent chat.  Closing the parent chat cancels active sub-agent requests
+and closes all its sub-agent buffers, including nested agents and retained
+failure transcripts.  A =result-explorer= follow-up must retain its original
+=result_file= and =query= scope.
+
+** Configuration and request limits
+
+LLMs often run into dead-ends when trying things, and this can both bloat and
+pollute the context window.  Sub-agents don't share any context with the main
+session and return relatively concise reports that gptel-agent can refer to.
+
+Sub-agents can be provided with tools specific to their task, which improves the
+quality of the result.  They can also be restricted accordingly by, for example,
+providing read-only access to resources.
+
+Sub-agents can be configured to use specific models or other API parameters
+(like the level of reasoning) independent of gptel-agent.  They are essentially
+gptel presets.
+
+Each delegation snapshots its backend, model, streaming mode, system prompt,
+tools, tool-use mode and request parameters.  Tasks are unlimited by default.  Add
+=task-timeout= and/or =max-request-rounds= to an agent's frontmatter or Org
+properties to bound that agent; =nil= or =false= explicitly means unlimited.
+The built-in researcher uses a 3600 second timeout and 100 model request rounds;
+the result explorer uses 1800 seconds and 60 rounds.  The introspector is
+unlimited.  The global fallback options are
+=gptel-agent-task-timeout= and =gptel-agent-max-request-rounds=; an omitted
+per-agent value inherits its global fallback, and both fallbacks default to nil.
+Transient transport retries remain bounded by
+=gptel-agent-max-request-retries= and =gptel-agent-retry-delay=.  Authentication
+and malformed-request errors are not retried.
+
+=gptel-agent-preset= may be a named gptel preset or a preset plist and can be
+set globally or buffer-locally on the parent request buffer.  Child request
+configuration is applied in this order: inherited parent settings, harness
+defaults, =gptel-agent-preset=, then per-agent frontmatter.  Thus unspecified
+parent settings are retained, the shared preset configures all sub-agents, and
+explicit per-agent settings override the shared preset. Preset parents,
+composition forms, and =:pre=/=:post= hooks are honored at each layer.
+
+When creating an =Agent=, an optional =model= then overrides both backend and
+model, and =extra_tools= appends tools to that final configuration. The =model=
+must be an exact advertised =Backend:model= choice, as with =Discussion=:
+
+#+begin_src json
+{"subagent_type": "researcher", "description": "Investigate issue", "prompt": "Find the cause and return evidence.", "model": "MyBackend:my-model", "extra_tools": ["Read", "mcp-github"]}
+#+end_src
+
+Omitting =model=, using =null= or an empty string preserves the configured
+choice. These overrides affect only the new child, not its parent or siblings.
+The [[file:discussions.org][discussion guide]] covers how extra tools are resolved and confirmed.
+An =Agent= follow-up with =agent_id= retains its original model, tools and
+tool-use mode; nonempty =model= or =extra_tools= overrides are rejected without
+changing its saved conversation. Disabled tool use stays disabled, including
+on follow-ups; normally enabled tools are restored after a synthesis turn.
+
+The Agent task overlay includes an =[Inspect sub-agent]= action.  Its buffer
+shows the prompt, model rounds, streamed output, tool arguments and results,
+retries, and terminal reason.  Failed, timed-out and cancelled runs keep this
+buffer by default; set
+=gptel-agent-keep-failed-run-buffers= to nil to clean them up immediately.
+Repetition detection compares the tool name and all argument values exactly;
+JSON object field order is ignored.  Changing a depth, line range, query or
+other parameter therefore counts as a different call.  The existing
+=gptel-agent-max-similar-tool-calls= setting now limits identical read/search
+calls in recent history, including non-consecutive repeats.  Repeated calls
+and exact alternating cycles are skipped once so the model can change
+strategy.  At =gptel-agent-max-loop-violations= the same sub-agent enters a
+tool-free finalization turn: it keeps its complete tool transcript and system
+prompt, interprets the evidence it gathered, and returns the final answer
+itself.  Web-heavy sub-agents have a separate
+=gptel-agent-max-web-tool-calls= budget, defaulting to 50 calls; exceeding it
+triggers the same synthesis turn instead of returning raw tool results to the
+parent. Round limits reserve this finalization turn, then return an explicit
+inconclusive report only if the model still produces no usable answer.
+
+** Defining agents
+
+*** Agents from Elisp
+
+Use =gptel-agent-register= to define an agent without a Markdown or Org file,
+then =gptel-agent-add-subagent= to allow a parent to delegate to it:
+
+#+begin_src emacs-lisp
+(with-eval-after-load 'gptel-agent
+  (gptel-agent-register 'code-reviewer
+    :description "Reviews code for correctness and missing tests"
+    :system "Review the requested code and report concrete findings with file references."
+    :tools '("Read" "Grep" "Glob")
+    :agents nil)
+
+  (gptel-agent-add-subagent 'gptel-agent 'code-reviewer)
+  (gptel-agent-add-subagent 'gptel-plan 'code-reviewer))
+#+end_src
+
+Names may be strings or symbols.  Registration accepts the same keyword/value
+pairs as =gptel-make-preset=, plus =:agents=, =:task-timeout= and
+=:max-request-rounds=.  Supply a nonempty =:description= and use =:system= for
+the prompt.  Values are ordinary Elisp values: for example, =:model= takes a
+symbol and =:pre= / =:post= take functions.  An omitted =:agents= permits all
+otherwise available sub-agents; =:agents nil= disables delegation.
+
+Registering the same name again replaces its Elisp definition.  Elisp
+definitions take precedence over same-named files.  Allowlist additions
+preserve the parent's existing entries, ignore duplicates, and work with
+file-defined agents too, for example
+=(gptel-agent-add-subagent 'ask 'introspector)=.  Both names must already be
+defined; main presets and self-delegation cannot be added as sub-agents.
+A parent without an explicit =:agents= list stays unrestricted.
+
+Definitions and allowlist additions survive registry refreshes and last for
+the current Emacs session; put the calls in your init file for future sessions.
+Additions also survive replacing the parent's definition and do not edit
+its source file.  Existing chats pick them up after =M-x gptel-agent-update=
+or reapplying a main preset.  Interactive selections and inherited restrictions
+still apply, and requests already in flight retain their captured definitions.
+
+*** Agents from Markdown files
+
+gptel-agent reads agent specs from files in =gptel-agent-dirs=, which you can
+customize.
+
+You can specify the agent name, description and tools used as YAML front-matter
+in a Markdown file, followed by the system prompt:
+
+#+begin_src markdown
+---
+name: arxiv-explorer
+description: Searches ArXiv and parses results
+tools: [mcp-arxiv, WebSearch]
+task-timeout: 1200
+max-request-rounds: 30
+pre: (lambda () (gptel-mcp-connect '(arxiv) 'sync))
+---
+
+You are a specialized research agent with access to ArXiv.  Your purpose is to
+search for and gather information efficiently.
+
+<core_responsibilites> ...  </core_responsibilities>
+
+...
+#+end_src
+
+=name= defaults to the file name, so only the =description= is mandatory.
+=tools= is a list of tool names or categories.  The optional =task-timeout= and
+=max-request-rounds= keys set this agent's supervision limits; leave them out
+to inherit the global defaults, which are unlimited.
+
+For an agent with the =Agent= tool, =agents= lists the sub-agent names it may
+call, for example =agents: [researcher, result-explorer]=.  An empty list
+(=agents: []=) disables delegation.  Omitting the field allows all discovered
+sub-agents except the caller itself; main presets are always excluded.
+A delegated agent may further restrict its
+selection through its own definition; it cannot expand the inherited list.
+In Org definitions, use a space-separated property such as
+=:agents: researcher result-explorer=, or an empty =:agents:= property for none.
+
+You can specify any other keys that gptel recognizes as preset keys, including a
+specific model, backend and API parameters.  See =gptel-make-preset= for
+details.
+
+In the above example, the =:pre= key is an elisp function that runs before the
+agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by
+the "arxiv" MCP server.
+
+*** Agents from Org files
+
+gptel-agent reads agent specs from files in =gptel-agent-dirs=, which you can customize.
+
+You can specify the agent name, description and tools used in an Org properties
+block at the top of an Org file, followed by the system prompt:
+
+#+begin_src org
+:properties:
+:name: arxiv-explorer
+:description: Searches ArXiv and parses results
+:tools: mcp-arxiv WebSearch
+:task-timeout: 1200
+:max-request-rounds: 30
+:pre: (lambda () (gptel-mcp-connect '(arxiv) 'sync))
+:end:
+
+You are a specialized research agent with access to ArXiv.  Your purpose is to
+search for and gather information efficiently.
+
+<core_responsibilites>
+...
+</core_responsibilities>
+
+...
+#+end_src
+
+=name= defaults to the file name, so only the =description= is mandatory.
+=tools= is a list of tool names or categories.
+
+You can specify any other keys that gptel recognizes as preset keys -- see
+=gptel-make-preset= for details.
+
+In the above example the =:pre= key is an elisp function that runs before the
+agent is called.  I am assuming a tool category named "mcp-arxiv" is provided by
+the "arxiv" MCP server.
+
+* Skills
+
+** Skill tool declarations
+
+The =Skill= description lists the currently enabled skills and tells the model
+to reuse instructions already in the conversation on later tasks. If the model
+calls =Skill= again for unchanged instructions still in its request context,
+the tool returns a short reminder instead of another copy. Changed instructions
+or results no longer in context are loaded normally. Discovery and
+=gptel-agent-toggle-skill= continue to update the advertised list independently
+of this check.
+
+Discovery and interactive skill selection belong to each conversation.
+All automatic skills start enabled. Clearing the selection with
+=gptel-agent-toggle-skill= disables all automatic skills for subsequent
+requests, including after reopening the conversation.
+Changing its working directory or skill-directory configuration refreshes
+discovery for its next request. Requests already running keep their discovery
+snapshots. Workers and discussions inherit the configuration and selection,
+then discover skills in their own working directory.
+
+=allowed-tools= follows the experimental [[https://agentskills.io/specification#allowed-tools-field][Agent Skills specification]]: a
+space-separated string of pre-approved tool names. gptel-agent supports exact,
+uniquely registered names only. Category grants, wildcards and scoped expressions
+such as =Bash(git:*)= are unsupported. If any declaration is invalid, missing or
+ambiguous, =Skill= returns the instructions with a diagnostic and adds none of
+that skill's tools or pre-approvals. Tools must already be registered with gptel;
+skills do not install Lisp implementations.
+
+gptel-agent also exposes those tools to the current request and its provider
+schema. This is host behavior, not a requirement of the standard. Activation
+persists in the conversation across turns, with fresh request-owned dispatchers;
+repeated loading is idempotent. In =gptel-confirm-tool-calls= auto mode the tools
+are pre-approved. Always-confirm mode and per-call confirmation/blocking hooks
+keep their normal precedence. Global settings and registered tools are unchanged.
+
+Discovery exposes only name and description. Skills without =allowed-tools=
+continue to load instructions only. Skill frontmatter is data, not evaluated
+agent configuration: agent-definition =pre= and =post= evaluation and hooks
+remain unchanged. Automatic unloading and persistence across Emacs restarts are
+not supported.
+
+** Manually invoked skills
+
+Add =disable-model-invocation: true= to a skill's =SKILL.md= frontmatter to
+hide it from automatic discovery:
+
+#+begin_src markdown
+---
+name: review-my-change
+description: Review a change using my team's checklist
+disable-model-invocation: true
+allowed-tools: Read Bash
+---
+Read references/checklist.md, then review the current change.
+#+end_src
+
+Place it under one of =gptel-agent-skill-dirs=, like any other skill. While
+composing a message in =gptel-mode=, type =/= and choose a skill with your
+completion frontend, or use =M-TAB= (=completion-at-point=). Descriptions appear
+as annotations. Completion refreshes discovery for the current directory and
+includes skills with =disable-model-invocation: true=, independently of the
+Skill tool's enabled list.
+
+Accepting a completion displays =/review-my-change= in the buffer. Underneath,
+the buffer contains ordinary text:
+
+#+begin_example
+Use the Skill tool to load "review-my-change".
+#+end_example
+
+Add your task details and send normally. The model loads the instructions,
+supporting paths and =allowed-tools= through the existing =Skill= tool. Inserting
+or sending the request itself loads no instructions and grants no tools. This
+uses a font-lock =display= property: gptel sends the underlying instruction, so
+no send-time expansion is needed. Copying or saving also preserves the full
+instruction; reopening a chat restores its slash display. Hover over the
+reference to see the full instruction. Undo restores the text before completion.
+An unaccepted =/skill= stays literal text. You can also type the full request
+yourself. The =Skill= tool must be enabled in the conversation.
+
+These skills are omitted from the advertised skill list and
+=gptel-agent-toggle-skill=, but remain callable by name through =Skill=.
+The flag controls discovery, not access: there is no separate invocation or
+approval mechanism. Omit it or set it to the YAML boolean =false= to advertise
+the skill normally.

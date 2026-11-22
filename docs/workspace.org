@@ -1,0 +1,549 @@
+#+title: Workspace access, policies, and file review
+
+[[file:../README.org][gptel-agent]]
+
+* Working directories
+
+Use =M-x cd= in a chat buffer to change its working directory. Subsequent
+tools and requests use the new directory; project-instruction discovery
+refreshes automatically, including when moving to a different project. The
+conversation history remains available. Other chats and already running
+workers or shell processes keep their own directories.
+
+Both =Agent= and =Discussion= accept an optional =directory= argument, for
+example ="/path/to/project"= or ="../other-project"=. The directory must exist;
+relative paths resolve against the calling chat's directory. Each child
+discovers project instructions in its own directory. Omitting =directory=
+inherits the parent's directory for a new child. An =Agent= follow-up using
+=agent_id= keeps the worker's current directory unless =directory= is supplied.
+
+For a one-time operation outside the current project boundary, agents call the
+file tool directly with an absolute or relative target path. The normal tool
+approval controls (=C-c C-c= to approve, =C-c C-k= to cancel) authorize only
+that call. Outside calls require approval even with ordinary confirmations
+disabled or skill pre-approvals enabled. The chat's working directory stays
+unchanged, and subsequent outside calls ask again. Changed arguments, redirected
+symlinks, cancellation of the request, or a manual directory change invalidate
+pending approvals. File review hooks run only after outside access is approved.
+
+A host running an autonomous workflow can enable outside reads for its
+supervised requests with =gptel-agent-supervision-allow-outside-reads=.
+This covers =Read=, =Glob=, =Grep= and =PathInfo= for local paths during the
+invocation. Mutating file tools still use the outside approval controls.
+
+To allow subsequent outside file operations, choose the
+=Run tools + allow all outside paths= action in the approval panel, or press
+=C-c C-a= there. The minibuffer
+approval prompt offers the same option with =a=. This approves the pending
+calls and grants access to all local paths for the requesting chat, including
+later turns and fresh operations proposed after instruction updates. Ordinary
+tool confirmations and file reviews still apply.
+
+The grant lasts only in that chat buffer, resets when its working directory
+changes, and is not saved across Emacs restarts. New workers and managed
+discussions do not inherit it. When a worker's approval is shown in its parent,
+the grant belongs to the worker named in the action. Run
+=M-x gptel-agent-revoke-outside-access= in the granted chat to require outside
+approval again. =C-c C-c= continues to approve just the pending calls.
+
+A =cd= inside =Bash= affects only that shell invocation. File-tool approval is
+not an operating-system sandbox for arbitrary shell commands or Elisp evaluation.
+
+* Tool argument policies
+
+A trusted Emacs configuration can restrict which tool calls a preset admits.
+For example, an unattended merge-request review can read its workspace and
+a shared specifications directory, fetch from one origin, and run three
+specific forms of a GitLab command.
+
+#+begin_src emacs-lisp
+(require 'gptel-agent)
+
+(gptel-agent-define-tool-policy 'mr-review
+  :allow
+  '((:tool "Read" :args (:file_path (under workspace "~/shared/specifications/")))
+    (:tool "Grep" :args (:path (under workspace "~/shared/specifications/")))
+    (:tool "WebFetch" :args (:url (url-origin "https://gitlab.example.com")))
+    (:tool "Bash"
+     :args (:background (optional false)
+            :command (rx "glab mr "
+                         (or "list"
+                             (seq (or "view" "diff") " "
+                                  (in "1-9") (* (in "0-9"))))
+                         " -R https://gitlab.example.com/team/project")))
+    (:tool "Eval" :args (:expression (rx (or "(buffer-name)" "(point)")))))
+  :deny '((:tool "Read" :args (:file_path (under ".git/")))
+          (:tool "Grep" :args (:path (under ".git/")))))
+
+(gptel-make-preset 'review-merge-request
+  :use-tools t
+  :tools '("Read" "Grep" "WebFetch" "Bash" "Eval")
+  :agent-tool-policy 'mr-review)
+#+end_src
+
+The =:tool= string is the exact name of a tool in the request. Every key
+inside =:args= names a parameter in that tool's schema, including parameters
+actually named =tool= or =args=. Fields in a rule must all match. A policy
+requires one matching allow and rejects any matching deny. Omitting =:args=
+matches every call to that tool. Unmentioned arguments remain unrestricted.
+A missing policy definition or an unknown top-level argument denies the call.
+Nested field names are checked when the tool declares a closed object schema.
+Open objects support dynamic keys, so the author supplies their spelling.
+Rules can be defined before the tools register. If two packages register
+the same name, select the intended tool by category in the preset, for
+example =:tools '(("catalog" "Read"))=. The policy checks that selected
+tool's arguments, and the package's own dispatcher handles the call.
+
+| Value pattern | Matching behavior |
+|---------------+-------------------|
+| A string, number, =true=, =false=, =null=, vector or keyword plist | Typed literal equality. Arrays match in order. Objects match their exact keys and values. A string containing ="false"= differs from JSON false. |
+| =(rx FORM ...)= | Case-sensitive Emacs =rx= over the entire string. Added flags, a newline, or a shell suffix fail the example command rule. |
+| =(one-of PATTERN ...)= | At least one alternative matches. |
+| =(object :KEY PATTERN ...)= | All named fields of a JSON object match. Additional fields are allowed. |
+| =(every PATTERN)= | Every element of a JSON array matches. The empty array satisfies this condition. |
+| =(optional PATTERN)= | The field is absent or its supplied value matches. All other field constraints require presence. |
+| =(under ROOT ...)= | The canonical local path equals or lies inside one of the directories. The symbol =workspace= refers to the selecting conversation's working directory. String roots can be absolute, home-relative, or workspace-relative. |
+| =(url-origin ORIGIN ...)= | An absolute URL has one of the listed schemes, hostnames and effective ports. The path and query may vary. |
+
+The matcher uses gptel's decoded values. Some backend parsers represent
+both JSON null and an empty object as Lisp =nil=. An ambiguous =nil= cannot
+satisfy a null or object allow pattern and can trigger a deny for either
+interpretation. A present false stays distinguishable from an omitted field.
+
+A preset containing only a locally registered or MCP tool uses the same
+grammar. For example, if =CatalogSearch= takes a request object and an array
+of collection names, these rules admit query =MR-12= on the catalog origin
+with collections =["design", "engineering"]=.
+
+#+begin_src emacs-lisp
+(gptel-agent-define-tool-policy 'catalog-review
+  :allow '((:tool "CatalogSearch"
+            :args (:request (object :endpoint (url-origin "https://catalog.example.org")
+                                    :query (rx "MR-" (+ (in "0-9"))))
+                   :collections (every (one-of "design" "engineering"))))))
+
+(gptel-make-preset 'catalog-only :use-tools t :tools '("CatalogSearch")
+                   :agent-tool-policy 'catalog-review)
+#+end_src
+
+In an agent definition file, use =agent-tool-policy: mr-review= in Markdown
+YAML frontmatter or =:AGENT-TOOL-POLICY: mr-review= in an Org property drawer.
+An ordinary conversation with no selected policy uses its usual confirmations.
+Applying a later preset that omits the key preserves the current setting.
+An explicit nil selection clears the top-level choice for later requests.
+A protected request retains its ceiling through prompt presets,
+skill activation and retries. Workers and managed discussions inherit each
+parent policy with its original workspace. A child policy can narrow those
+permissions further. Agent session records retain the names and roots for
+restoration, so load the corresponding trusted definitions in the restoring
+Emacs. A confirmation, outside-access grant, or runner's
+=:allow-unconfirmed-tools t= can never approve a policy denial.
+
+The built-in =result-explorer= always receives an inherited policy permitting
+only the package's =ResultRead= and =ResultGrep= tools. Extra tools can be added
+to its configuration, but policy enforcement denies their calls, including
+attempts to use =Agent=, =Discussion=, =Skill=, =Bash= or =Eval=. The reserved
+policy cannot be redefined through =gptel-agent-define-tool-policy=, cleared by
+presets, or bypassed by trusted-tool grants. Other inherited or selected
+policies can further restrict it. The permitted tools still enforce the exact
+saved-result file and query contract. This uses the existing request policy
+checks; it is not a sandbox for arbitrary trusted Emacs Lisp.
+
+A matching path constraint can authorize an individual built-in outside read.
+Use =under= for directory trees. Guarded recursive searches also check the
+canonical targets they encounter. Guarded =WebFetch= checks each redirect
+before contacting its destination and reads a YouTube URL as an ordinary
+web page. The automatic project-instruction loader is separately controlled
+by =:agent-use-project-instructions=.
+
+The policy inspects the call submitted to the tool. The tool implementation
+still determines its subprocesses, network requests and filesystem effects.
+For =Bash= and =Eval=, admit only strings whose behavior you intend to allow.
+=Eval= runs in the requesting conversation's Emacs, including the batch
+worker for scheduled jobs. Trusted workflow Lisp executes as configured.
+
+* Scoped project instructions
+
+All gptel conversations automatically discover plain-text =AGENTS.md= files
+while =gptel-agent-use-project-instructions= is non-nil, regardless of preset
+or agent identity. The first outgoing request includes these instructions even
+with =Read= or all tools disabled. Discovery starts at the conversation's
+project root and follows the directory chain to its working directory. Without
+an Emacs project, the working directory is the boundary. File context and
+=Read=, =Glob=, =Grep=, =PathInfo=, =Edit=, =Insert=, =Write=, =Mkdir= and =Rmdir= targets discover deeper
+chains as needed; the project is never scanned recursively.
+
+For example, work on =frontend/view.ts= receives the root =AGENTS.md= followed
+by =frontend/AGENTS.md=. Work on =backend/server.ts= receives the root and
+backend instructions instead. A request targeting both receives both scoped
+chains, with common ancestors included once. More specific instructions take
+precedence over conflicting parent rules; explicit user instructions take
+precedence over project rules.
+
+Each conversation owns its discovered contents and request snapshots. New
+workers and managed discussions independently discover their own instructions;
+they do not inherit the parent's loaded contents. Continuing a worker retains
+its private registry. Instruction blocks are rebuilt before every outgoing
+call, including retries and tool continuations, without changing the configured
+system prompt, preset or conversation text. Compaction keeps the private registry
+and subsequent requests rebuild from it. Closing the conversation discards its
+registry; reopened conversations rediscover their instructions.
+
+** Refreshing instructions
+
+Managed =Read= calls for =AGENTS.md= return a short acknowledgement, even when
+a line range was requested. The contents travel through the replaceable
+instruction block instead of accumulating in tool-result history. Use
+=M-x gptel-agent-describe-project-instructions= to inspect the full local
+contents, discovery boundary, discovered sources and latest delivered block.
+Explicit quotations, attached task data and arbitrary command output remain
+ordinary conversation data.
+
+Before a file mutation, the harness checks all applicable saved instruction
+versions against the ones supplied to the model. A missing or changed scope
+defers the operation before staging or writing. The next call receives updated
+instructions and asks the model to reconsider and propose a fresh operation.
+Old arguments are never replayed automatically. Batches discover every target
+before any edit is staged, including multi-file patches. Saved changes,
+additions and deletions are refreshed at new turns and checked before mutations.
+Delayed tool approvals are checked again when executed.
+
+Use =M-x gptel-agent-toggle-project-instructions= to toggle just the current
+conversation. A positive prefix enables it; zero or a negative prefix disables
+it. Changes take effect at the next outgoing call. Other conversations and
+already submitted snapshots are unaffected. The global variable supplies the
+default for every conversation; buffer-local values override that default.
+
+#+begin_src emacs-lisp
+;; Disable globally for conversations without a local override.
+(setq-default gptel-agent-use-project-instructions nil)
+
+;; Enable only this conversation, overriding the global default.
+(setq-local gptel-agent-use-project-instructions t)
+
+;; Disable only this conversation.
+(setq-local gptel-agent-use-project-instructions nil)
+#+end_src
+
+Internal workers restricted to a single result file do not perform project
+instruction discovery, even when their parent enables it.
+New workers and discussions inherit the effective boolean preference only.
+
+Managed file operations support local files. Targets outside the conversation's
+current discovery boundary, including escaping symlinks, require approval for
+each operation unless the user grants outside access for that chat as described
+above. Remote targets remain unsupported. Approved targets discover
+their own scoped instructions without moving the chat or widening its boundary.
+If an outside mutation needs new or updated instructions, it defers before
+staging; the next model call receives those instructions and must propose a
+fresh operation, which asks for its own approval unless outside access was
+granted for the chat.
+
+=AGENTS.md= may be a symlink to a readable regular local file, including a
+shared file outside the project. Absolute and relative links are supported.
+The source and scope remain the project's =AGENTS.md= path and its containing
+directory, so a link at the project root applies to that project and a nested
+link applies only to its subtree. The shared target's directory does not become
+an instruction scope or expand access for ordinary file operations. Managed
+=Read= calls and attached context using the project's =AGENTS.md= path retain
+this local scope.
+
+For example, to share one rules file between two projects that do not already
+have an =AGENTS.md=:
+
+#+begin_src sh
+ln -s "$HOME/shared-rules/AGENTS.md" /path/to/project-a/AGENTS.md
+ln -s "$HOME/shared-rules/AGENTS.md" /path/to/project-b/AGENTS.md
+#+end_src
+
+Saved changes to the shared file and changes to the symlink target are refreshed
+by the normal instruction checks. Broken or cyclic links, unreadable or non-file
+targets, remote targets, and files exceeding
+=gptel-agent-project-instructions-max-bytes= (128 KiB by default) produce visible
+diagnostics and block mutations in their scopes; stale or truncated contents are
+not silently used.
+
+The per-call payload adapter covers OpenAI Chat Completions and compatible
+=:messages= backends, OpenAI Responses, Anthropic, Gemini, and Ollama. It preserves
+ordinary messages and tool-call/result pairs. Provider-side conversation handles
+or =previous_response_id=, and Gemini =cachedContent=, are rejected when adding
+or removing managed instructions:
+requests must carry their full context so old blocks cannot remain implicitly
+active. Models without system-message support are also rejected when a managed
+block is needed.
+
+This feature controls the instruction text supplied to the model, not semantic
+compliance with that text. It cannot infer every effect of arbitrary =Bash= or
+=Eval= code, erase previous reasoning, or enforce natural-language rules.
+Prefer the file tools for work requiring deterministic scope checks.
+
+* Reviewing file edits with Ediff
+
+Loading =gptel-agent= (or =gptel-agent-tools=) automatically enables Ediff
+review for =Edit=, =Insert= and =Write= when =gptel-confirm-tool-calls= is
+non-nil.  No separate prehook configuration is needed.  After updating an
+existing installation, rebuild the package and restart Emacs so the new
+libraries and hook are loaded.  Remove any explicit load of an older custom
+prehook to avoid overriding the bundled implementation.
+
+File proposals now collect in a separate =*File review: …*= buffer. The tool
+returns immediately, so the agent can continue proposing modifications while
+you review. Open the queue again with =M-x gptel-agent-review= from the
+conversation buffer. Each file has one cumulative diff: its original content
+on the left, its latest proposed content on the right. Later proposals for that
+file, including writes, insertions and deletions, update the same entry and
+open Ediff in place. The list shows each file's revision and decision.
+Sub-agent changes join their parent conversation's queue. Different
+conversations have separate queues; a file under review cannot be claimed by
+another conversation until its review is finished.
+
+** Review controls
+
+In the review queue:
+
+| Key | Action |
+|-----+--------|
+| =RET= | Inspect the selected file's cumulative diff in Ediff |
+| =H= | Send a comment on this file immediately |
+| =A= | Ask about this file in an independent aside chat |
+| =r= | Restore this file's original contents and send optional feedback |
+| =a= | Explicitly accept all current file revisions |
+| =D= | Finish review quietly once every file has a decision |
+| =C= | Restore all original contents and notify the agent immediately |
+| =g= | Refresh the list |
+| =q= | Hide the queue; changes remain pending |
+
+In the Ediff control buffer:
+
+| Key | Action |
+|-----+--------|
+| =n= / =p= | Next / previous change in this file |
+| =N= / =P= | Next / previous file, keeping the current change position |
+| =f= | Choose a file by path |
+| =q= | Accept this file's displayed revision and return to the list |
+| =Q= | Hide Ediff without making a decision |
+| =R= | Restore this file's original contents and send feedback immediately |
+| =C= | Cancel the entire queue and finish review |
+| =H= | Send a comment; in A/B include the selected region or current line |
+| =A= | Ask in an aside; in A/B include the selected region or current line |
+| =C-]= | Refuse this file and close its Ediff |
+
+The Ediff headers show your position in the queue, such as =File 2 of 5=.
+When =N= wraps from the last file to the first, a highlighted
+=Wrapped to first file= notice stays until you open another file. =P= similarly
+announces wrapping to the last file. The file count updates as proposals arrive;
+moving between files does not accept them.
+
+** Asking about an edit
+
+=A= opens a =*Review aside: …*= chat below Ediff. Asking leaves the proposal's
+decision unchanged, so you can still accept it immediately. The aside starts
+with a snapshot of the conversation's history, model, system prompt and request
+settings, plus the original/proposed file contents and the displayed revision.
+It includes the usual attached context and scoped project instructions. Its
+tools are disabled: questions request explanations, not edits. Questions and
+answers stay in the aside and are never added to the original conversation.
+
+Each file has its own aside. Ask further questions with =A=, or type directly
+in the aside and send with =C-c RET=. To discuss a specific passage, mark it
+in either diff pane and press =A= there, just like =H= for a comment. The
+aside keeps the exact selection, its line range and the displayed revision.
+With no region, it uses the current line. Review keys take precedence over
+modal editing bindings (such as Meow's =A=) in these temporary review buffers.
+An empty answer to the =A= prompt reopens the aside without sending.
+=C-c C-r= returns to the file's Ediff, =C-c C-q= hides the aside, and =C-c C-k=
+cancels only its current answer. Closing Ediff or finishing review keeps the
+aside available as a normal buffer. Killing the aside cancels its request
+without affecting the original agent. The inherited
+conversation history is a snapshot; asking again with =A= includes the file
+revision you are then viewing.
+
+** Applied and staged changes
+
+By default, proposals are applied to working files immediately, with before/after
+copies saved before writing. Bash commands, tests, builds, =Read=, =Grep= and
+=Glob= can therefore use the proposed changes while you review. The agent is
+instructed to run relevant checks, fix failures and report the results before
+finishing. Bash keeps its normal tool confirmation behavior.
+
+If a formatter, Bash command, or another program changes a file already under
+review, its saved contents become the next revision of that same cumulative
+diff. Further agent edits build on those contents, preserving the command's
+effects. The pre-review original stays fixed, and the external before/after
+transition is saved in history. Files that include external changes are marked
+in the review list and Ediff header.
+
+Synchronization runs after =Bash=/=Process= tool results, on =Read= and further
+file edits, and when opening, refreshing (=g=), or deciding a review. Unmodified
+visiting Emacs buffers refresh too. Unsaved buffer edits are never discarded;
+save or reconcile them before continuing. Changes made outside the agent are
+picked up at the next such operation; this is not a filesystem watcher.
+
+=D= requires a decision on every current file revision; use =RET= to inspect
+pending files, or explicitly accept them all with =a=. A new change to an
+accepted file makes it pending again. Open comparisons refresh without
+rebuilding their windows or taking focus. Accepting everything closes review
+without appending a summary prompt or starting another agent response.
+If an accept, refuse, or finish command discovers external changes, it refreshes
+the diff and leaves the decision pending. Inspect the updated revision and
+repeat the command.
+
+Comments and refusals are submitted immediately, without waiting for =D=.
+An active agent receives feedback at the next completed tool boundary, before
+its next model request. If its response ends without another tool call, the
+feedback starts a follow-up response. Aborting or failing a request cancels
+feedback already waiting on it; a new comment/refusal afterward still sends
+automatically. Active sub-agent authors also receive feedback
+in their next tool result. Comments retain the displayed revision, filename,
+line range and selected text, even if changes arrive while you type.
+
+A comment leaves the proposed content available for the agent to revise. =q=
+waits for a revision on a file with feedback; =Q= lets you leave its Ediff.
+Refusing a file restores its pre-review contents, including removing newly
+created files or recreating deleted ones. This also undoes formatter or other
+external changes included in that file's diff. Other files keep their changes.
+An adjusted proposal for the refused file starts from disk in the same list
+entry. Feedback is sent automatically; there is no draft to edit and submit.
+Restoration checks the whole batch before writing and refuses to overwrite
+unsaved buffers or changes arriving during preparation. The restored version
+is also saved in history, so a refusal can itself be undone.
+
+Preview buffers are read-only. If manually altered, they cannot be accepted;
+close with =Q= and reopen the file to restore the staged comparison.
+
+To retain the previous staging workflow, set
+=(setq gptel-agent-review-apply-immediately nil)= before starting a new review.
+In that mode only file tools and =Read= see proposals until =D= applies them;
+Bash, tests, =Grep= and =Glob= see the old disk contents. Tool results state
+whether changes are applied or only staged. Changing this setting or turning
+confirmation off during a review does not change that queue's behavior.
+With confirmation nil and no pending queue, file tools apply directly and
+still save history snapshots.
+
+** Reviewing and restoring history
+
+Use =M-x gptel-agent-history= to browse saved batches, =RET= to inspect a file's
+diff, and =r= to undo the selected batch's visible files. =M-x gptel-agent-history-restore=
+also lets you choose a snapshot directly. Finish any active review for those
+files first. Restores require files to match that snapshot's after-state;
+restore newer changes first to step back through history. Each restore is
+itself saved, so it can be undone. Originals, proposed versions, encoding and
+file permissions are recorded, including creation and deletion of empty files.
+Edits that cannot be represented in a file's existing fixed encoding are
+rejected before any file in the batch is written. Use compatible text or
+explicitly change the file's encoding before retrying. New files and files
+whose encoding is still undecided can select an encoding for Unicode text.
+
+Cancelled changes and the entries that cancelled them are hidden by default.
+Press =c= to show or hide them. The Status column marks =[-] Cancelled=,
+=[x] Cancellation=, and =[+] Recovery=; batch IDs and the Related batches column
+link each cancellation to its original changes. Review refusals include all
+revisions of the refused file, including observed external edits. A partially
+cancelled batch stays visible as =[~] Partly cancelled=, showing only its remaining
+files by default; =RET= and =r= act on the files shown by the current filter.
+To recover cancelled changes, press =c= and undo their cancellation entry.
+The original changes then reappear in the default view. Recovery entries are
+also kept in the expanded view. Older snapshots without cancellation links
+remain visible because their review decisions cannot be determined reliably.
+
+Press =d= to permanently delete the selected batch from history, or use
+=M-x gptel-agent-history-delete= to choose one directly. After confirmation,
+the saved snapshots are removed without changing working files. Cancellation
+and recovery links are followed in both directions: all connected batches
+are deleted together, including revisions or files sharing a cancellation.
+Deletion covers whole batches, including files hidden by the current filter;
+the confirmation reports the total number of batches to remove.
+
+Snapshots live under =gptel-agent-history-directory=, by default a private
+=gptel-agent-history-UID/= directory in the system temporary folder. They
+survive closing conversations and restarting Emacs, but the operating system
+may clean temporary files. Set this variable to a permanent directory for
+long-term retention. Closing a conversation leaves applied changes on disk;
+use history to restore them later. History covers changes through file tools
+and external changes observed in files already under review. It does not track
+other files changed by Bash commands or external programs, or intermediate
+versions overwritten between synchronization points.
+
+* File tool path contracts
+
+File tools use filesystem types, never filename extensions. A directory can be
+named =Poulet.java=; a file can have no extension. Use =PathInfo(path)= to inspect
+an exact on-disk target, or =Glob(pattern, root_directory, depth, type)= with
+=type=all= to list typed entries. Glob includes hidden entries, omits =.git=
+directories, and does not traverse directory symlinks.
+
+- =Write(file_path, content)= creates or overwrites a complete file, automatically
+  creating missing parent directories. File paths must not end in =/=.
+- =Insert(file_path, line_number, new_str)= adds text to an existing file.
+- =Edit= requires an explicit mode of =replace=, =patch=, or =batch=. Replacement uses
+  =file_path= and a nonempty =old_str=. A patch explicitly selects either
+  =file_path= for one existing file or =root_directory= for relative diff headers.
+  A batch uses =root_directory= and ordered =operations= with relative
+  =file_path= targets (or =root_directory= for a directory patch).
+- =Mkdir(directory_path)= creates a directory and all missing ancestors. It is
+  unnecessary before file creation with Write or Edit.
+- =Rmdir(directory_path)= removes exactly one empty directory, refusing symlinks,
+  nonempty directories, and the working directory or its ancestors.
+
+Create a Java file with =Write=.
+
+#+begin_src json
+{"file_path":"/project/src/Poulet.java","content":"class Poulet {}"}
+#+end_src
+If that target already exists as an accidental directory, inspect it with
+PathInfo and Glob, use Rmdir only if it is empty, then Write the file.
+
+These contracts replace the former =path=/=filename= Write arguments,
+=parent=/=name= Mkdir arguments and inferred Edit modes. Reapply agent presets
+after loading the updated tools so sessions receive the new schemas.
+
+** Edit modes and review behavior
+
+- In =replace= mode, pass a nonempty =old_str= copied from the file and the
+  literal =new_str=. An empty =new_str= deletes the matched text.
+- In =patch= mode, pass the unified diff as =new_str=. A directory-root patch
+  can also create or delete files using =/dev/null=.
+- In =batch= mode, pass a nonempty =operations= array. Each entry names an
+  =operation= (=replace=, =patch=, =insert=, =write=, or =delete=) and supplies
+  the fields that operation needs. Operations run in order and the review
+  shows one comparison per file.
+
+Replace text in an existing file.
+
+#+begin_src json
+{"mode":"replace","file_path":"/project/a.txt","old_str":"old","new_str":"new"}
+#+end_src
+
+Replace text and create a second file in one batch.
+
+#+begin_src json
+{
+  "mode": "batch",
+  "root_directory": "/project",
+  "operations": [
+    {"operation":"replace","file_path":"a.txt","old_str":"old","new_str":"new"},
+    {"operation":"write","file_path":"b.txt","content":"created\n"}
+  ]
+}
+#+end_src
+
+File edits follow symlinks. Deleting through a symlink removes the target and
+preserves the link. History restores the target. The structured file tools
+review text changes and do not support renames, binary files, or mode changes.
+Shell and Elisp side effects are outside that review.
+
+Preparation and execution share =gptel-agent-edit.el=. Failed patches,
+ambiguous replacements and no-op edits report an error without altering the
+queue or target files. Replacements try exact matching first, then a unique
+match of complete lines ignoring indentation and trailing whitespace, aligning
+the new block's indentation with the source. Case, words, punctuation and
+internal whitespace still must match. Patches try exact context, normal fuzz
+(up to two surrounding context lines), then flexible whitespace. Failed
+attempts are discarded before retrying.
+
+Review completion validates every original before writing anything, then
+applies the accepted snapshots together and rolls back on write failure.
+Files changed on disk or with unsaved visiting buffers block completion and
+leave the queue available for cancellation or retry. Unmodified visiting
+buffers refresh after acceptance. Killing the conversation discards its queue;
+hiding or killing only the review list does not discard proposals.

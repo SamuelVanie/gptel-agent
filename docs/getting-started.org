@@ -1,0 +1,127 @@
+#+title: Getting started with gptel-agent
+
+[[file:../README.org][gptel-agent]]
+
+* How to install
+
+Install from the fork's repository. With the built-in
+=use-package= in Emacs 30 or newer, add this to your init file.
+
+#+begin_src emacs-lisp
+(use-package gptel-agent
+  :vc (:url "https://github.com/SamuelVanie/gptel-agent" :rev :newest)
+  :config (gptel-agent-update))
+#+end_src
+
+** Manual
+
+Clone or download this repository and run =M-x package-install-file= on the
+repository directory.
+
+** Straight or Elpaca
+
+Include the bundled =agents/= and =skills/= directories in the recipe.
+
+#+begin_src emacs-lisp
+(straight-use-package
+ '(gptel-agent :type git :host github :repo "SamuelVanie/gptel-agent"
+               :files (:defaults "agents" "skills")))
+(gptel-agent-update)
+#+end_src
+
+For Elpaca, use the following recipe.
+
+#+begin_src emacs-lisp
+(elpaca (gptel-agent :host github :repo "SamuelVanie/gptel-agent"
+                     :files (:defaults "agents" "skills"))
+  (gptel-agent-update))
+#+end_src
+
+* Using gptel-agent
+
+- Requires gptel 0.9.9.6 or newer. Keep gptel up to date when using development
+  versions of gptel-agent.
+
+- Set =gptel-model= and =gptel-backend= to use your preferred LLM.  See [[https://github.com/karthink/gptel][gptel's
+  README]] for details.
+
+There are two ways to use gptel-agent:
+
+** In a dedicated session
+
+- Run M-x =gptel-agent=.  This will open a gptel buffer in the current project
+  with the agent preset loaded.  Run with a prefix arg for more options.
+
+- Use gptel as usual, calling =gptel-send= etc.
+
+- If you change the system prompt, tools or other settings in this buffer, you
+  can reset the agent configuration by (re)applying the "gptel-agent" preset
+  from gptel's menu.
+
+- You can switch between an agent preset (gptel-agent) and a planning preset
+  (gptel-plan) by applying them from gptel's menu, or clicking on the backend
+  name in the header line.
+
+  The planning preset has read-only access to the filesystem and works with you
+  to settle a concrete implementation design. The implementation preset makes
+  and verifies the changes using that design and the project's conventions.
+
+*** Planning before implementation
+
+=gptel-plan= first inspects project instructions, nearby implementations,
+callers, and tests to establish the existing conventions. It then proposes exact
+folder and file names, module responsibilities, function names and contracts,
+and the flow of data and calls between them. It compares meaningful alternatives
+and recommends an approach with evidence and trade-offs.
+
+Related design choices are presented together for you to decide through
+=AskUserQuestion=. Choices you already supplied or accepted are retained. You
+can explicitly delegate choices to the planner, for example, "Choose the file
+names using the existing conventions, but discuss module boundaries with me."
+The planner records those decisions and their rationale without asking again.
+
+The final plan is a standalone implementation handoff with exact paths and
+interfaces, interactions and state ownership, ordered changes, and concrete
+acceptance checks. It includes pseudocode for each part with new or changed
+logic, tied to exact files and functions, covering branches, collaborator calls,
+state changes, and relevant errors and cleanup. Planned tests include setup,
+action, and assertions; declarative changes specify structures or values.
+You can review this logic before agreeing to the design. The implementer uses
+idiomatic project code and checks it against the agreed pseudocode, reporting
+any agreed material deviations and their reasons.
+
+A design with unanswered questions or missing evidence is labeled a draft.
+The implementation agent is instructed to follow settled decisions and resolve
+new conflicts or missing contracts with you before making dependent edits.
+These are prompt instructions, not a runtime enforcement of plan completeness
+or conformance.
+
+** Anywhere in Emacs
+
+Place =(gptel-agent-update)= in your config. Selecting an agent preset resolves
+relative entries in =gptel-agent-dirs= from the chat's working directory.
+A restored chat also discovers its workers there on first use.
+
+As with gptel, you can use gptel-agent in any buffer, including read-only
+buffers and the minibuffer.
+
+- Apply the "gptel-agent" preset in the buffer from gptel's menu.
+
+- OR include =@gptel-agent= in a prompt to send only that prompt with the agent
+  capabilities.
+
+Please note: gptel-agent uses significantly more tokens than the average
+gptel LLM interaction.
+
+* Reading view and navigation
+
+The optional [[https://github.com/SamuelVanie/gptel-ui][gptel-ui]] package adds a reading view with speaker labels and
+foldable tool output. Use =C-c C-n= and =C-c C-p= to move between turns, or
+=C-c ]= and =C-c [= to jump to pending approvals across chat buffers.
+
+* Delegation demo
+
+The demo shows two sub-agents researching in parallel and reporting their
+findings to the main chat.
+
+https://github.com/user-attachments/assets/03585600-3bb9-4bf7-b5c8-7e02a28c7a37

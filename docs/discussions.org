@@ -1,0 +1,497 @@
+#+title: Discussions and chat sessions
+
+[[file:../README.org][gptel-agent]]
+
+* Managed discussions
+
+The default =gptel-agent= preset discovers discussion management through the
+bundled =skills/managed-discussions/SKILL.md= skill. The package's =skills/=
+directory is a discovery fallback even when =gptel-agent-skill-dirs= is
+customized; user and project skills retain precedence. Calling =Skill= loads
+the workflow instructions and adds =Discussion= and =DiscussionControl=
+to the current tools in the same turn. Existing tools remain available on later
+turns. Custom presets can still list both tools explicitly.
+
+The [[file:agents-and-skills.org][sub-agents and skills guide]] covers configuring skill discovery.
+
+=Discussion= creates a separate, ordinary gptel buffer with a title and opening
+prompt. It inherits the creating request's model, backend, system prompt, active
+tools (including tools activated by skills) and confirmation settings; an
+optional existing =preset= can override them. An optional =model= choice then
+overrides both backend and model, including values specified by the preset.
+It starts without the parent's transcript or attached context. An optional
+=directory= selects its working directory, including another project; relative
+paths resolve against the creating chat's directory. Skill instructions and pre-approvals
+belong to each conversation separately; inherited tools use their original
+confirmation settings. A child loads skills for their instructions and its own
+pre-approvals. Approving discussion management does not approve child tool calls.
+
+Omitting =preset= (or passing an empty string) copies the current request's
+settings, including local changes; it does not reapply the parent's saved
+preset. An explicit preset is applied on top: settings it specifies override
+inherited values, while unspecified settings remain inherited. A preset's tool
+list replaces the inherited tools, and the child also receives =DiscussionReport=
+to communicate with its parent. Preset parents, composition forms, and
+=:pre=/=:post= hooks are honored.
+
+The =Discussion= tool advertises the names and descriptions of all presets
+registered with =gptel-make-preset=, including user-defined presets outside
+gptel-agent. This selection is independent of the =Agent= tool's sub-agent
+allowlist. The discussion instructions tell the model to choose a preset suited
+to the child's task even when the user has not named one. When a read-only
+=gptel-plan= or =ask= conversation is asked to start an implementation discussion,
+it loads =managed-discussions= and directly selects an implementation-capable
+preset, using =gptel-agent= when available unless another preset fits better.
+An explicit user choice takes precedence. Inheritance is appropriate when the
+parent's role already suits the task or the user explicitly requests it.
+For example, a planning conversation can hand off implementation with:
+
+#+begin_src json
+{"title": "Implement the feature", "prompt": "Implement this self-contained plan: ...", "preset": "gptel-agent"}
+#+end_src
+
+The child uses =gptel-agent='s system prompt and tools; the parent remains a
+planning conversation. Pass your own registered preset name in the same way.
+Unknown names return an error without creating a discussion.
+
+To select a model as well, pass =model= using the exact =Backend:model= entry
+advertised by =Discussion=, matching gptel's model menu. For example, with a
+backend named =MyBackend= offering =my-model=:
+
+#+begin_src json
+{"title": "Implement the feature", "prompt": "Implement this self-contained plan: ...", "preset": "gptel-agent", "model": "MyBackend:my-model"}
+#+end_src
+
+All registered backends and their configured models are available. The backend
+qualifier distinguishes models with the same name on different backends. The
+preset, including its parents and hooks, is applied first; =model= then selects
+both the backend and model for this discussion and its subsequent turns.
+Omitting =model= (or passing an empty string) keeps the preset's or inherited
+pair. Unknown choices fail before creating a buffer or worktree. Creation and
+=DiscussionControl list/read= results include the child's current backend and
+model. This option does not change the parent or the shared =gptel-agent-preset=;
+sub-agents apply their own configuration layers and any explicit =Agent.model=.
+
+** Additional tools
+
+Both =Discussion= and =Agent= accept =extra_tools=, an optional array of
+registered tool names and/or category (group) names. For example, if
+=mcp-github= is registered:
+
+#+begin_src json
+{"title": "Investigate the issue", "prompt": "Investigate and report your findings.", "preset": "ask", "extra_tools": ["Read", "mcp-github"]}
+#+end_src
+
+Additions are resolved after all preset hooks and appended to the resulting
+tool list. They never replace existing tools or their settings; overlapping
+names are added only once, with existing tools taking precedence. Lookup uses
+gptel's usual rules: a category name expands its tools, otherwise the first
+registered tool with that name is selected. Omission, =null= and =[]= mean no
+additions. Unknown names fail startup without sending a child model request;
+tools registered by preset hooks are supported. Added tools retain their
+normal confirmations and policy restrictions. They do not activate tool use
+when the preset sets =:use-tools nil=. =MainChat= remains unavailable in children,
+and discussions still receive their own =DiscussionReport=. These are creation
+options; later discussion turns retain the selected configuration.
+
+** Git worktrees
+
+Pass =worktree: true= to start the discussion in a new Git worktree. The tool
+instructs models to use this option only when the user explicitly requests a Git
+worktree or isolated Git workspace; ordinary coding or delegation requests
+keep the existing directory by default.
+
+#+begin_src json
+{"title": "Implement in isolation", "prompt": "Implement the feature and report the changes.", "worktree": true}
+#+end_src
+
+The source is =directory= when supplied, or the calling chat's current
+directory otherwise. Relative paths resolve against the caller. A repository
+subdirectory or an existing worktree is accepted. The source must belong to a
+Git working repository with at least one commit; invalid sources return an
+error without starting a discussion.
+
+The new checkout is a randomly named sibling of the source repository root,
+such as =/projects/app-discussion-aB12cD/=, on a new branch such as
+=gptel-discussion/aB12cD=. It starts at the source's current =HEAD= commit;
+uncommitted and untracked files are not copied. The child starts at the new
+worktree root and discovers project instructions there. Omitting =worktree=
+or passing =false= keeps the ordinary directory behavior.
+
+The creation result and =DiscussionControl list/read= include the working
+directory, worktree path, branch at creation, source repository and directory,
+and starting commit. These details are also included in the child's opening
+context. Closing either conversation retains the worktree and branch for
+review, merging and later cleanup. If child startup fails after checkout,
+the failed discussion retains these details so the workspace stays inspectable.
+
+When the work is finished and integrated, the managing agent can remove the
+generated worktree with =DiscussionControl cleanup=. The branch is kept by
+default; add =delete_branch: true= to attempt its deletion too:
+
+#+begin_src json
+{"action": "cleanup", "discussion_id": "discussion-1", "delete_branch": true}
+#+end_src
+
+Cleanup accepts an idle, failed, cancelled or closed discussion owned by the
+calling conversation. It closes monitoring, retains the editable transcript,
+and resets that buffer's directory to the source repository. Active or queued
+work, other discussions sharing the directory, managed background processes,
+unsaved file buffers and pending file reviews must be resolved first. Git
+refuses dirty or locked worktrees; a switched branch or detached HEAD also
+requires inspection. Cleanup never forces removal or branch deletion.
+
+Branch deletion uses =git branch -d= and applies only to the branch created for
+this discussion. If Git refuses deletion (for example, because the branch is
+unmerged), the worktree remains removed and the branch is retained. The result
+reports both states, also visible in =list/read=; retry =cleanup= after
+integration to delete the branch. Repeated successful cleanup calls are safe.
+
+** Discussion lifecycle
+
+Discussions run independently and survive the parent's completed turn. Ordinary
+answers stay in the child, including replies to direct user messages. Questions,
+approvals, failures and file-review notices also stay there. Finishing a child
+turn or raising an alert does not start another request in the parent.
+
+Each managed child receives =DiscussionReport=, including with a custom preset
+or when its parent enabled management through a skill. The child chooses when
+to send a requested answer, substantive finding or blocker the parent can act on.
+Reporting instructions exclude notices that the child is asking or waiting for
+user input, clarification, permission, tool approval or file review, including
+before the interaction becomes pending. Local controls and echo-area notices
+already alert the user. The child should not routinely forward direct user
+exchanges or acknowledgements. The parent can use =send= to request a report,
+or =read= to inspect the child's work without a child model request.
+
+Only explicit reports reach the parent at its next safe request boundary, or
+start a new ordinary gptel turn when it is idle. They are recorded in the parent's
+visible transcript. These turns use the parent's configured model and incur
+normal API usage. Reports go only to the child's immediate managing conversation.
+
+| Tool / action | Purpose |
+|---------------+---------|
+| =Discussion= | Start a fresh chat; return its stable =discussion_id= immediately |
+| =DiscussionReport= (child only) | Explicitly send a chosen message to the managing conversation |
+| =DiscussionControl list= | List discussions owned by this conversation |
+| =read= | Read status, pending interactions and a page of the editable transcript |
+| =send= | Steer running work, or start a follow-up in the same chat |
+| =wait= | Receive an explicit report for selected =discussion_ids=, up to 60 seconds; also shows already pending interactions |
+| =answer= | Answer a pending =AskUserQuestion= using its exact =request_id= |
+| =close= | Abort current work and end monitoring; keep the editable transcript |
+| =cleanup= | Remove a finished discussion's generated worktree; optionally delete its branch with =delete_branch: true= |
+
+=read= does not consume report delivery. Its =offset= is a zero-based character
+offset; =next_offset= identifies the next page. Reports and transcript
+pages are bounded by =gptel-agent-discussion-report-limit= (16000 characters by
+default). Ownership lasts across turns, but a different conversation cannot
+manage these IDs.
+Completing a turn without reporting does not satisfy =wait=; it can time out.
+Closing or killing a selected discussion ends a pending =wait= with
+=no_eligible_work= when none of the selected discussions is still active.
+Reports already queued are delivered first.
+
+Run =M-x gptel-agent-discussions= in the parent or a managed discussion to open
+the list. =RET= opens a chat, =s= sends a message, =c= closes monitoring, and =g=
+refreshes. In a child buffer, use =gptel-send= normally for a new turn. During an
+active turn, use =M-x gptel-agent-discussion-send= to queue steering; it is
+delivered after pending tools finish, or as a follow-up if the response finishes
+first. Concurrent requests in the same monitored buffer are prevented.
+To stop a stuck request in the original chat, run =M-x gptel-abort= there, then
+send again. Errors or cancellation while preparing a new request release its
+send guard automatically, preserving your draft for retry.
+
+The parent can answer structured questions itself. Tool approvals stay in the
+child discussion buffer, where the user can approve or reject them with gptel's
+confirmation controls. An echo-area notice identifies the buffer waiting for
+approval; no approval panel is copied into the managing conversation, and it
+cannot reject the child's tool calls. Stale callbacks cannot execute the same
+tool or answer twice. Tool approvals and questions raised by a discussion's
+sub-agents remain accessible in that discussion's buffer; =Cancel request=
+stops the particular request awaiting approval.
+=read= exposes pending interactions, failures and outstanding file reviews when
+the parent asks for them. File reviews retain the configured applied/staged
+review behavior and the child's existing review queue.
+
+Automatic sending waits when you have an unsent draft. Send that draft with
+=gptel-send= to include queued events, or discard it and run
+=M-x gptel-agent-discussion-resume=. Narrowing also defers new automatic turns
+so they cannot send only part of the conversation. Widen the buffer before
+resuming delivery; drafts hidden by narrowing still need to be sent or discarded.
+Aborting or failing a parent request pauses automatic delivery without stopping
+its discussions. A new manual send or
+=gptel-agent-discussion-resume= re-enables delivery. Killing the parent detaches
+its discussions, which remain usable; killing a child marks it closed without
+waking an idle parent. =close= retains the transcript and stops only that discussion's
+current request (including its ordinary Agent workers).
+
+Enable the session system below to retain management IDs, ownership and event
+queues across Emacs restarts. Saving a transcript with ordinary =save-buffer=
+alone does not preserve these relationships.
+After updating, reload/rebuild the package and run =gptel-agent-update=, then
+reapply the =gptel-agent= preset. For custom presets, include both =Discussion=
+and =DiscussionControl= in their tool lists.
+
+* Persistent discussion sessions
+
+Add this after loading =gptel-agent= in your init file:
+
+#+begin_src emacs-lisp
+(gptel-agent-session-mode 1)
+#+end_src
+
+The mode saves ordinary main chats and the discussions they create, including
+nested discussions. A host such as =gptel-runner= owns the sessions for
+its workflow node chats and their descendants. Open a saved pipeline
+with =M-x gptel-runner-open-session=. Temporary =Agent= worker buffers and file-review asides
+are excluded. Each chat has its own immutable snapshot and a persistent parent ID, so a
+restored main chat can list, read and message its existing discussions and
+create new ones. The child buffers remain ordinary editable gptel chats.
+
+Indirect clones of a chat share its transcript and open as read-only views.
+Requests, background work and saved-session ownership stay with the base chat;
+send new prompts from that buffer. Closing a view leaves that work running.
+If you explicitly unlock and edit a view, its shared text is saved with the
+base session. Use =clone-buffer= for an independent conversation instead.
+
+Each family also has a small checkpoint manifest naming every member's saved
+version. Changed chats are written in small batches, and the manifest is
+replaced atomically only after every required version is ready. Until then,
+restore and the session browser use the previous complete family. A family's
+first save stays hidden until it is complete. Unchanged members reuse their
+existing versions; four chats per batch does not mean restoring only four
+members of a larger family.
+
+** Restoring chats
+
+Run =M-x gptel-agent-session-restore= and choose a saved main chat to reopen its
+discussion family. Only that family is loaded; existing live buffers are
+reused without replacing their edits. Tool blocks start folded in newly
+restored chats; press =TAB= on a block's opening line to expand it.
+Use =M-x gptel-agent-discussions= and
+=RET= to visit the children as usual. Restoring never starts model requests.
+Send a new message normally, or use =gptel-agent-discussion-resume= in a chat
+without an unsent draft to resume delivery of queued discussion messages.
+=M-x gptel-agent-session-save= saves changed chats immediately.
+
+** Generated titles
+
+The first save of a chat with at least one sent message automatically requests
+a short conversation title. By default, the title model sees the first and last
+nonempty user or assistant messages, shortened to 4000 characters each. If
+there is only one sent message, that message alone is used, even while its
+response is pending. Unsent drafts, tool output and reasoning are excluded.
+Saving a draft before sending anything never generates a title. The title
+appears in the session browser and restore picker and renames the current
+buffer to =*gptel:TITLE*=, matching spawned
+discussions. The title and buffer name survive restarting Emacs. Until a title
+is available, the session uses its existing buffer name.
+
+Title generation runs as a separate, non-streaming request using the chat's
+backend and model by default. Configure =gptel-agent-session-title-preset= just
+like =gptel-agent-preset= to use a smaller model: either a preset name created
+with =gptel-make-preset=, or a preset plist. For example, if you already have a
+preset named =lite=:
+
+#+begin_src emacs-lisp
+(setq gptel-agent-session-title-preset 'lite)
+;; A plist also works; substitute your registered backend and model:
+;; (setq gptel-agent-session-title-preset
+;;       '(:backend "My backend" :model small-model))
+#+end_src
+
+Once generated, the title stays unchanged through later messages, saves and
+restores. Set =gptel-agent-session-auto-title= to =nil= to disable automatic
+generation. =M-x gptel-agent-session-generate-title= explicitly generates or
+refreshes the current chat's title, including for an older restored session.
+It also works when automatic generation is disabled. Title failures preserve
+the previous name; an untitled chat can retry on a later save. Browsing and
+restoring do not themselves trigger title requests. Title generation runs in
+the background; its result is queued for autosaving like other metadata.
+
+To change which messages inform the title, customize
+=gptel-agent-session-title-context-function=. It takes no arguments and returns
+a string from the current chat narrowed to sent history, or =nil= to skip
+generation. It is not called for a draft-only chat, including on explicit
+title generation. Saved sessions retain the sent-message boundary across
+restarts.
+Title requests always use a dedicated system prompt with tools, attached
+context and prompt transforms disabled.
+
+** Browsing and deleting saved chats
+
+Use =M-x gptel-agent-sessions= to browse saved families, their chat counts,
+open buffers and last-save times. =RET= restores the selected family, =d=
+deletes it after confirmation, and =g= refreshes the list. Browsing reads only
+small snapshot headers and does not open chats or enable autosaving. You can
+also delete a family directly with =M-x gptel-agent-session-delete=.
+
+Deletion includes the main chat and all its nested discussions. It removes
+their session snapshots; open chat buffers, running requests, worktrees and
+separately saved transcript files remain intact. Open chats in the deleted
+family, including new discussions they spawn, stop saving so autosave cannot
+recreate the deleted session. To save that family again, run
+=C-u M-x gptel-agent-session-save= from one of its open chat buffers.
+
+** Checkpoints and autosave
+
+Snapshots retain the transcript and gptel's response, tool and reasoning
+boundaries, unsent drafts, queued discussion and main-chat messages, chat IDs,
+ownership, turn counts, working directories and worktree metadata. They also
+retain supported data settings, including the selected preset name, system
+prompt, model, registered backend and tool names, temperature and enabled
+agent/skill selections. Restoring the preset name does not reapply its definition
+or run its hooks, so saved settings keep any changes made after selecting the
+preset. Preset definitions remain part of your normal Emacs configuration.
+Older snapshots without a preset name cannot recover that selection; select
+the preset again and save the session. Closed discussions keep their transcripts
+and remain closed after restoration.
+
+Active requests and temporary workers are not resumed. Pending question or
+approval callbacks, file-review queues, access grants, attached context,
+custom hooks and captured runtime configuration are not restored. Backends
+and tools must be registered in the new Emacs session; backend credentials
+are obtained from your normal configuration. A snapshot preserves worktree
+metadata, not a copy of the worktree's files.
+
+A checkpoint guarantees complete family membership and atomic publication,
+not a simultaneous snapshot of all running chats: buffers are captured across
+batches, and later edits remain queued for the next checkpoint. New children
+join an in-progress checkpoint before publication. This does not guarantee
+exactly-once message delivery or roll back external tool effects. Missing
+children are never silently respawned, since a new conversation cannot recover
+their history or safely infer which work was already done. A missing or corrupt
+member of a committed checkpoint makes restoration fail before opening a
+partial family.
+
+Saving is incremental: edits and metadata changes queue a chat once, without
+scanning its transcript on every keystroke. While changes are queued, one timer
+checks each second and processes a small batch while Emacs is idle. When the
+queue becomes empty, the timer stops until another change arrives. Defaults are:
+
+| Option | Default | Purpose |
+|--------+---------+---------|
+| =gptel-agent-session-idle-delay= | 5 seconds | Wait for user inactivity before autosaving |
+| =gptel-agent-session-save-interval= | 30 seconds | Minimum interval between automatic saves of one chat |
+| =gptel-agent-session-batch-size= | 4 | Maximum chat snapshots staged per batch |
+| =gptel-agent-session-time-budget= | 0.02 seconds | Soft time budget for a batch |
+
+Continuous streaming does not reset the save interval. Unchanged chats are
+not rewritten, and the saver does not rewrite a global transcript collection.
+Child status notifications and empty inbox checks do not trigger parent saves.
+Failed writes wait the save interval before retrying automatically.
+The time budget is soft because a single large transcript must finish its
+atomic write; publication also processes the family's small manifest. Manual
+saving and normal Emacs shutdown flush pending families without the autosave
+interval. Killing a chat stages its final contents and keeps its place in the
+family, even if other members still await saving. Changes after the last
+complete checkpoint can be lost after a crash or forced shutdown; incomplete
+staging never replaces that checkpoint.
+
+=gptel-agent-session-directory= defaults to =gptel-agent/sessions/= beneath
+=user-emacs-directory=. Storage is local, with private directory/file
+permissions and a single writer lock; use separate directories for concurrent
+Emacs instances. Committed families remain until deleted; superseded versions
+are cleaned after publication and abandoned staging is cleaned on startup.
+They are session data files, separate from any transcript files saved with
+=save-buffer=. Disable session mode before changing the storage directory.
+Older flat snapshot files remain readable and migrate on the next family save.
+Migration preserves their known members; it cannot reconstruct children that
+were never saved by the older format.
+
+* Messages between main chats
+
+When the user explicitly asks to find or message another main agent/chat,
+load =Skill(main-chat-messages)=. This enables the separate =MainChat= tool
+in the current turn; custom presets can also include it directly.
+
+| Action | Behavior |
+|--------+----------|
+| =list= | List other live main gptel buffers: stable =chat_id=, buffer name, directory and pending-message count |
+| =send= | Queue =message= for an exact =chat_id= from the list |
+
+Discovery returns at most 20 entries per page; pass =next_offset= as =offset=
+to continue. It never reads transcripts. Generated discussions, workers and
+review asides cannot use this tool or appear as recipients, including closed
+or detached discussions. =DiscussionControl= still sees only the calling
+conversation's own discussions. Main-chat IDs survive buffer renames, are
+not reused for new chats, and are retained when a chat is restored with
+=gptel-agent-session-mode=.
+
+A recipient receives messages at its next model-request boundary, after any
+pending tool results. Sending never starts a new model request, submits an
+unsent draft, or automatically replies. Idle, aborted and failed chats keep
+messages until their next user-started turn. Read-only recipients keep messages
+queued until a request boundary with a writable buffer. Messages are labeled as peer
+context, not user instructions or authorization; ordinary replies stay local.
+The recipient need not enable =MainChat= to receive messages, but its request
+must run =gptel-agent-chat--localize= (installed in the default prompt transforms).
+
+The tool and skill instruct the model to list/send only on explicit user
+requests, never for routine collaboration or automatic acknowledgements.
+This is a model instruction, not a natural-language authorization detector.
+Normal gptel confirmation settings apply: skill activation pre-approves the
+tool in =auto= mode; always-confirm mode and per-call hooks still take precedence.
+Enabling the tool on one turn does not authorize unsolicited later sends.
+
+Messages have no character limit and are delivered without truncation.
+=gptel-agent-chat-inbox-limit= defaults to 16 pending messages per recipient.
+Full inboxes reject new messages without discarding earlier messages.
+Inboxes live only in their buffers and disappear when those buffers
+are killed. There are no polling timers, background jobs, global transcript
+copies or automatic wakeups; buffer discovery runs only on explicit tool calls.
+
+* Asking questions while working
+
+=AskUserQuestion= accumulates questions across tool calls. Its default
+=action: "add"= returns immediately with the numbers assigned to the new
+questions. Each queue numbers questions in the order they were added, starting
+at 1. The agent can continue independent work and add further questions.
+
+Before waiting, the agent can revise one or more questions with
+=action: "update"=. Each entry in =questions= supplies the original
+=question_number=, the complete replacement =question= text, and any
+=choices=. Omitting =choices= makes the replacement a free-text question.
+Changing a question or its choices clears its saved answer and marks it
+unanswered. Questions keep their numbers. Answers to unchanged questions are
+preserved, including when the agent repeats an identical update.
+
+When the list is ready, the agent calls =action: "wait"= with =questions=
+omitted or empty. That call pauses the turn and returns the complete answers
+(or a cancellation). If the model tries to finish with an uncollected question
+batch, the runtime automatically waits for it instead. The turn stays open,
+submission becomes available, and the same request resumes with the answers or
+cancellation before it can finish.
+
+Questions appear in a separate =*Questions: …*= buffer that refreshes in
+place as the agent adds or revises questions. By default, it opens below
+the conversation window without taking focus. It only splits that window,
+leaving other windows alone. If the window is too short to split, questions
+temporarily replace the conversation there.
+Set =gptel-agent-questions-display= to =same-window= to always use that behavior;
+submitting or cancelling restores the conversation. Its default value is
+=below=.
+
+If the conversation is hidden, questions stay queued without changing the
+layout. Use =M-x gptel-agent-questions= from the conversation to show them,
+including questions from its workers. Each request has its own queue.
+
+| Key | Action |
+|-----+--------|
+| =1-9=, =n/p=, =TAB= | Select a choice |
+| =RET= | Save the answer and move to the next question |
+| =M-p/M-n= or =←/→= | Revisit questions and revise answers |
+| =C-c C-c= | Submit all answers once the agent is waiting |
+| =C-c C-k= | Cancel the question batch |
+| =q= | Hide the buffer |
+
+You can save answers while the agent is working; submission becomes available
+when it calls =wait= or the runtime catches an early completion. Every question
+also has a free-text Custom option.
+Cancelling or killing the questions buffer records a cancellation for =wait=;
+it never supplies default answers. An early completion also delivers any
+uncollected cancellation to the model. Aborting, failing or closing the owning
+request removes its queue and invalidates late answers. A subsequent batch
+starts fresh after its result is collected. In managed discussions, the
+completed list becomes a pending interaction for =DiscussionControl answer=
+when an explicit or automatic wait starts.

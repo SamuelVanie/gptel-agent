@@ -1,0 +1,407 @@
+#+title: Shell, web, and search tools
+
+[[file:../README.org][gptel-agent]]
+
+* Background commands
+
+=Bash= normally waits for a command to finish. Prefer this foreground mode
+for tests, builds and commands whose result is needed before proceeding.
+Foreground execution has a 120-second deadline by default. Customize
+=gptel-agent-bash-timeout= to a positive finite number of seconds (fractions
+are allowed); each command captures the setting when it starts. On timeout,
+the process group is stopped and the tool returns a timeout result with partial
+stdout/stderr. Oversized output keeps a bounded saved prefix and a
+result-explorer handoff when storage is available; the result identifies
+incomplete capture.
+The agent can continue working after this result. Check for partial effects
+before retrying, and use =background=true= with =Process= for intentional longer
+runs. Explicit background jobs are unaffected by this setting. The deadline
+uses an Emacs timer, so expiry can be delayed while Emacs is busy.
+
+Foreground commands receive stdin from =/dev/null=, so an implicit input read
+cannot leave the agent waiting indefinitely. Pipes, file redirection and
+heredocs inside the command still work. Use a background job and =Process=
+=send= for commands that need interactive input. Invalid Bash arguments and
+process launch failures return tool errors so the agent can correct its call.
+
+Approving =Bash= or =Process= from another buffer, including Inspect, uses the
+requesting conversation's execution context. The Bash approval preview shows
+that conversation's directory. If the directory or its symlink target changes
+after the preview, execution returns a tool error; submit a fresh Bash call
+to use the new directory.
+
+** Starting and inspecting a background job
+
+Set =background= to =true= for servers, watchers or jobs the agent can work
+alongside. It immediately returns a =process_id=,
+leaving the agent free to run other commands and inspect output later:
+
+#+begin_src json
+{"command":"npm run start","query":"Report the server URL or startup errors","background":true}
+#+end_src
+
+The =Process= tool manages these jobs using the returned ID:
+
+#+begin_src json
+{"action":"list"}
+{"action":"read","process_id":"bash-1"}
+{"action":"read","process_id":"bash-1","view":"tail","max_chars":8000}
+{"action":"wait","process_id":"bash-1","until":"exit","timeout_ms":30000}
+{"action":"send","process_id":"bash-1","input":"yes\n"}
+{"action":"eof","process_id":"bash-1"}
+{"action":"interrupt","process_id":"bash-1"}
+{"action":"kill","process_id":"bash-1"}
+{"action":"remove","process_id":"bash-1"}
+#+end_src
+
+=list= shows running and completed background jobs, their commands, working
+directories and status. =read= returns available stdout and stderr immediately,
+consuming unread output by default. Optional =offset= replays from an absolute
+character position without changing the unread cursor; =max_chars= limits a
+read to 1–20000 characters (default 12000). Results include =next_offset= and
+=output_end=. The unread cursor is shared by the chat and its sub-agents.
+Set =view= to =tail= to read the latest characters directly without changing
+that cursor. Omit =offset= entirely for tail, including =offset=0=. Results
+also include =retained_start= and =output_start= and distinguish discarded output from
+earlier retained output omitted by the tail view. Use an explicit =offset=
+to inspect that earlier output if needed.
+
+=wait= with =until=exit= (the default and only supported condition) waits
+asynchronously for termination or a deadline, keeping Emacs responsive.
+Progress output does not end the wait. =timeout_ms= defaults to 30000 and
+accepts 0–60000; zero returns an immediate snapshot. Results include
+=wait_reason= (=exit= or =timeout=), process status, exit code or signal when
+finished, and output. Timeout does not stop the job. Wait defaults to
+=view=tail=, or =unread= when =offset= is supplied; =max_chars= and explicit
+=view= work as for read. Use wait instead of repeated reads when completion
+is needed. Servers and watchers may never exit, so use read to inspect them.
+Removing a completed job resolves any pending waits with =wait_reason=removed=.
+Cancelling a request or killing its calling buffer cancels its waits without
+stopping jobs owned by a surviving conversation.
+Invalid arguments return a tool error so the agent can correct the call
+without aborting the request or stopping the job.
+
+** Sending input and closing stdin
+
+=send= queues UTF-8 input without adding or changing newlines. It returns
+asynchronously, so other tools can run while input is pending. Each job allows
+one pending send, capped by =gptel-agent-process-input-limit= (default 1048576
+bytes); overlapping or oversized sends are rejected before writing. The
+=timeout_ms= total deadline defaults to 5000 (maximum 60000); zero writes
+nothing. A blocked write services timers and subprocess output until that
+deadline or cancellation. Pipe writes are serialized across jobs to prevent
+one write's cancellation from unwinding another; time waiting for that turn
+counts toward the total deadline. A queued send's callback can arrive after
+its deadline if another write is still active, but it will not write after
+its deadline. Other tools can still progress. Sending input and closing stdin
+require local POSIX pipes; remote and Windows jobs still support read/control.
+
+Results report =send_reason= (=sent=, =timeout=, =exit= or
+=error=), =input_bytes=, =written_bytes_min= and =written_bytes_max=.
+Successful sends have equal counts: all bytes were accepted by the pipe,
+which does not prove the program consumed or executed them. If a write is
+interrupted, the counts bound its possibly delivered prefix. The unattempted
+remainder is discarded, but Emacs can retain an opaque suffix of that one
+chunk. It does not flush that suffix automatically. Further sends and EOF are
+permanently disabled for that job to prevent accidental delivery of retained
+bytes. Start a new job for further input; inspect effects before repeating a
+partially delivered command. Read, interrupt and kill remain available.
+
+Request cancellation or destruction of the calling buffer drops pending
+input and suppresses its obsolete callback. It cannot retract accepted bytes;
+an active write is unwound by its watchdog, with the same uncertainty and
+input-disable rule. The job survives if its owning conversation survives.
+Its latest send outcome (including cancellation) is available through
+=Process list/read=. Cancelling a send before any write leaves input usable.
+
+=eof= closes the job's stdin pipe without sending a byte. Use it after streamed
+input for EOF-driven commands such as =wc -c=, =sort= or =python -=; sending
+Ctrl-D to a pipe sends a literal byte and does not close input. For example,
+start =wc -c= with =Bash background=true=, =send= the string =abc\n=, call
+=eof=, then =wait= for a successful exit and a count of 4. Closing stdin can
+trigger execution, so =eof= follows the same tool confirmation as =send=.
+It accepts only =process_id= and optional =timeout_ms= besides =action=.
+
+EOF waits asynchronously for an already pending send to succeed before closing
+input. While EOF is pending, further sends and duplicate EOF requests are
+rejected. If that send fails or is cancelled, EOF returns =eof_reason=input_failed=
+and does not close stdin. The EOF deadline defaults to 5000 ms (0–60000);
+zero closes nothing. Timeout or cancellation of EOF leaves stdin open and does
+not cancel the preceding send. Once closed, further sends fail and repeated
+EOF returns =eof_reason=already_closed=, including after the job exits. EOF on
+a completed job whose stdin was never closed returns an error. Results report
+=eof_reason= (=closed=, =already_closed=, =timeout=, =input_failed=, =exit=,
+=removed= or =error=); job summaries show =input_status=eof_pending= or =closed=.
+The latest EOF outcome, including cancellation, remains visible in =list/read=.
+An active write in another job can delay the EOF callback past its deadline;
+EOF will not close stdin after that deadline.
+
+** Job limits and ownership
+
+Each job retains the most recent =gptel-agent-process-output-limit= characters
+(default 200000). Older output is discarded and a read reports any missing
+range. These additional limits are shared by every conversation in the current
+Emacs instance:
+
+| Setting | Default | Behavior |
+|---------+---------+----------|
+| =gptel-agent-process-job-limit= | 64 | Maximum running and completed jobs together; refuse a launch if protected jobs occupy every slot |
+| =gptel-agent-process-completed-limit= | 32 | Keep at most this many completed jobs, removing the oldest first |
+| =gptel-agent-process-total-output-limit= | 2000000 characters | Maximum aggregate retained output; discard completed jobs' output first, then the least recently updated tails |
+| =gptel-agent-process-retention-seconds= | 3600 | Expire completed jobs one hour after completion, without refreshing their age on reads |
+
+These settings require positive finite values; job and character limits must
+be integers. New launches reclaim completed jobs before testing capacity.
+Completion and a timer also prune old jobs; the timer runs about once a
+minute while jobs exist, when Emacs services timers. Running jobs and completed
+jobs with pending
+=wait=/=send=/=eof= actions are protected from automatic removal. They still
+count toward the total job limit, and their output remains subject to both
+character limits. Aggregate output is trimmed before new text is inserted,
+even while commands run. A busy job can therefore discard another job's
+unread output. Reads retain absolute offsets and report the discarded range;
+an expired or evicted process ID returns an explicit error.
+
+Foreground Bash keeps a bounded prefix in memory and spools oversized output
+to a size-limited temporary file. Its result-explorer handoff describes any
+discarded suffix. Saved logs can expire or be evicted when they reach the
+storage limits under *Saved tool results*. If you need a complete durable log, redirect output
+to a file in the command and manage that file's size and lifetime yourself;
+shell redirection is outside these capture budgets.
+
+Foreground commands belong to their calling buffer and request. Cancelling the
+request or killing that buffer stops their process groups and removes unfinished
+logs.
+
+Jobs belong to the originating conversation buffer, including jobs started by
+its sub-agents. They survive later turns, request cancellation and sub-agent
+completion. Another chat cannot look up or control them through =Process=.
+Killing the conversation buffer kills its running jobs and releases their
+output; jobs are not restored after an Emacs restart. This ownership is a tool
+management boundary, not an OS sandbox: Bash still has normal shell access.
+
+Use =interrupt= for SIGINT, then =kill= for SIGKILL if needed; both target the
+job's process group, including ordinary child processes. Keep commands in the
+foreground of the managed shell: do not append =&=, use =nohup= or daemonize.
+Detached descendants are outside this lifecycle. Input uses pipes, so terminal
+UI programs and shell job control are not supported. Some programs buffer
+output when connected to a pipe. Remote process support depends on the Emacs
+file handler. Sending input or closing stdin follows normal tool confirmation;
+reading, listing and stopping owned jobs need no tool-specific confirmation.
+
+The default agent includes =Process=. Custom agents using
+background Bash should add =Process= to their tools as well.
+
+* Web search and page fetching
+
+Web searches default to =gptel-agent-web-search-default-count= results
+and are capped by =gptel-agent-web-search-max-count=.
+
+=WebSearch= and =WebFetch= download asynchronously with =curl= and extract
+text in clean batch Emacs workers. HTML parsing never runs on the interactive
+Emacs thread, and extraction does not use browser layout or load images.
+Both tools share a FIFO queue with up to
+=gptel-agent-web-max-concurrent-requests= active calls (default 4), so agents
+can still issue multiple Web calls concurrently. Cancelling the owning request
+or killing its buffer stops active calls and removes queued calls.
+
+=gptel-agent-web-max-response-bytes= bounds each decompressed response
+(default 2 MiB); oversized responses fail explicitly. Queueing, downloading,
+and extraction share the =gptel-agent-web-request-timeout= deadline (default
+30 seconds). =WebSearch= keeps using =eww-search-prefix=, but downloads use
+curl's environment and do not inherit EWW's authenticated browser session.
+Ordinary Web downloads require =curl=; HTML extraction requires an Emacs
+build with libxml support.
+
+=WebFetch= handles HTML and common textual content types directly. HTML
+extraction favors main/article content, skips scripts, styles, and hidden
+content, and never falls back to dumping raw HTML. Empty pages, JavaScript
+app shells, and access challenges advise the agent to use =agent-browser= or
+another available real-browser tool. When possible, browser work should be
+delegated to a sub-agent with browser access, returning only relevant content
+and the source URL to keep browser snapshots out of the parent's context.
+No browser is launched automatically. Binary resources require a specialized
+tool.
+
+Responses default to =gptel-agent-web-fetch-max-chars= characters. The optional
+=max_chars= argument can raise the output size, up to 200,000 characters.
+YouTube URLs still return the description and timestamped transcript, now
+from an isolated worker under the same queue, deadline, and size limits;
+there is no separate YouTube tool.
+
+* Saved tool results
+
+=Bash= calls include a =query= stating what should be extracted from their
+output. Results larger than =gptel-agent-tool-result-max-chars= are saved up to
+the storage limits below and replaced by a bounded preview. The
+notice supplies an exact =result_file=/=query= contract for the built-in
+=result-explorer= sub-agent.  Its pathless read/search tools are locked by the
+harness to that registered file within its owning conversation, and its report
+cites file line evidence that the parent agent can verify with =Read=.
+Preview size is controlled by
+=gptel-agent-tool-result-preview-chars= and
+=gptel-agent-tool-result-preview-lines=.
+
+Saved results use a fresh private local directory, even for remote commands.
+On POSIX systems its permissions are 0700 and result files are 0600. Ownership,
+permissions and filesystem identities are checked before writes; unsafe or
+replaced paths cause a tool error and are left untouched. Shared temporary
+directories must prevent other users from replacing entries (as with sticky
+=/tmp=), and their ancestors must belong to your account or root. Existing
+=gptel-agent-temp= directories are neither reused nor removed.
+
+Saved files, including active foreground Bash spools, share these finite
+limits across all conversations in the current Emacs instance:
+
+| Setting | Default | Behavior |
+|---------+---------+----------|
+| =gptel-agent-result-file-limit= | 8 MiB | Maximum UTF-8 bytes in one saved result; captured at Bash launch or other result creation |
+| =gptel-agent-result-total-limit= | 64 MiB | Maximum aggregate UTF-8 bytes in active and completed saved results |
+| =gptel-agent-result-count-limit= | 128 | Maximum active and completed saved files and their metadata entries |
+| =gptel-agent-result-retention-seconds= | 3600 | Expire completed results after one hour without use |
+
+Byte and count limits accept nonnegative integers; zero bytes retains no
+saved output, and a zero count disables saving. Retention requires a positive
+finite number of seconds. Access and a timer (about once a minute) prune idle
+results. When more room is needed, completed results that were used least
+recently are evicted first. Active spools and files used by active explorer
+runs or searches are protected from eviction and still count against the
+budgets. If protected files exhaust a byte budget, capture preserves only a
+prefix and permanently discards the remaining suffix while the command
+continues under its normal execution timeout. A file-count refusal or storage
+failure stops a foreground command and returns a capture error with a bounded
+partial preview. Reaching a byte limit does not stop it.
+
+Every preview and explorer read/search reports incomplete capture when a
+suffix was discarded. A search can cover the entire retained file and still
+leave the omitted output unknown; no match in that prefix does not establish
+absence from the original output. Larger limits preserve more evidence at the
+cost of more disk space; narrower commands and timely extraction reduce both
+capture loss and retention pressure.
+
+Completed files belong to the source conversation. Its sub-agents, discussions
+and review asides share that owner, so legitimate descendants can use the
+exact file/query contract; an unrelated conversation cannot reuse it. Closing
+the owner deletes completed files and their metadata, deferring deletion while
+an active explorer is using a file. Cancelling or finishing an explorer releases
+that protection. Idle explorer buffers, old request metadata and follow-up
+contracts do not pin results indefinitely. A follow-up after expiration or
+eviction returns an explicit error and must rerun the producing tool.
+
+Cleanup deletes only tracked files whose private filesystem identity still
+matches. Orderly Emacs shutdown removes those tracked files; it does not scan
+other instances' directories or sweep files left by a crash. These budgets do
+not cover files written by shell redirection, filesystem overhead, subprocess
+memory or other OS resources. The ownership contract controls managed result
+tools; ordinary shell and Emacs file access retain their normal capabilities.
+
+* File and result search
+
+=Glob= and =Grep= run asynchronously. Directory enumeration and metadata reads
+use an isolated Python 3 subprocess when available, otherwise a clean batch
+Emacs subprocess. =Grep= prefers =rg=, then =grep -E=, then a separate batch
+Emacs process. Its request-local description and =regex= schema advertise the
+selected native dialect, like =ResultGrep=; an in-flight query never switches
+dialects. Backend changes are advertised before the next model request.
+
+Glob retains its case-insensitive Emacs basename wildcard syntax, typed
+symlinks, depth handling, and newest-first ordering. Both directory tools
+include hidden, ignored, dependency and build entries, exclude only =.git=
+directories, and do not traverse directory symlinks. Grep's =glob= uses the
+same basename matching as Glob. Grep is case-sensitive and returns quoted
+absolute filenames with line numbers. Searches currently require local paths;
+remote paths fail explicitly instead of running blocking TRAMP operations.
+
+Each call has a =gptel-agent-search-timeout= deadline (30 seconds), including
+traversal, and stops when its request is aborted or its owning buffer is killed.
+=gptel-agent-search-max-entries= bounds examined directory entries (20,000),
+=gptel-agent-search-traversal-max-bytes= bounds candidate metadata (4 MiB), and
+=gptel-agent-search-max-results= caps Glob entries or Grep matching lines
+globally (1,000). Both tools accept =max_entries= and =max_results= to lower
+these ceilings, plus =depth= to restrict traversal. Their request-local schemas
+include the configured upper bounds. Invalid arguments return tool errors so
+the agent can correct the call and continue. Grep accepts 0–15 context
+lines; a limit can cut trailing context short. Output stops at
+=gptel-agent-tool-result-max-chars=; individual subprocess records are bounded
+to 64 KiB and error diagnostics to 2,048 characters. The Emacs grep fallback
+skips lines over 64 KiB and reports incomplete coverage.
+
+Limits and failures return explicit =incomplete= coverage with any collected
+results. Partial Glob results are sorted only within the collected subset,
+not necessarily the newest entries in the whole tree. No unbounded full result
+is saved. Narrow the directory, pattern or depth, or explicitly increase the
+configured ceiling before retrying. A zero-match response is conclusive only
+when coverage is =complete=.
+
+** Searching saved results
+
+=ResultGrep= selects =rg= first, otherwise =grep -E=, otherwise a built-in
+Emacs reader. Its request-local description *and* =regex= argument schema name
+the selected backend and its native regexp dialect before the model writes a
+query. Ripgrep uses its default Rust regex engine with Unicode enabled (no
+PCRE2); =grep -E= uses extended regular expressions in the C locale; the
+fallback uses Emacs regular expressions and its standard case table. There is
+no regex translation. For example, alternation is =ERROR|WARN= with the two
+external backends and =ERROR\|WARN= with Emacs. Case-insensitive matching follows
+the advertised engine, including Unicode folding for ripgrep/Emacs and ASCII
+folding for grep. All backends search individual lines and report nonempty,
+non-overlapping matches. Patterns are limited to 4096 UTF-8 bytes and cannot
+contain literal newline or NUL characters.
+
+The selected executable is captured with that request's schema. If it becomes
+unavailable, the tool reports that failure without trying another dialect.
+Backend selection and both the schema and dispatcher refresh before the next
+model request, including subsequent tool rounds. Other in-flight requests keep
+their own contracts.
+
+Search runs asynchronously, retains at most 100 numeric match records, an
+8 KiB external output record and 2 KiB of diagnostics, and caps rendered evidence
+at =gptel-agent-tool-result-preview-chars= (plus a short coverage notice).
+Subprocess chunks are discarded as they arrive; oversized match records stop
+collection with an incomplete result. Narrow a regexp such as =.*= if it emits
+an enormous match. External engines manage their own internal memory; these
+limits bound Emacs's retained data, not the executable's allocations.
+
+The Emacs fallback reads 64 KiB per timer slice and joins chunk boundaries
+within a line. It retains at most 64 KiB of line bytes and skips larger lines,
+including their entire remainder, without allocating them. Such results always
+report incomplete coverage and identify the first skipped line/byte offset;
+use =ResultRead= to inspect it. Search has a 30-second deadline, including
+evidence extraction. Match limits, output limits, failures, file changes and
+timeouts are reported separately from completion; a partial scan never claims
+a complete absence of matches. Cancelling the owning request or killing its
+buffer disposes processes/timers without delivering obsolete results.
+
+Evidence uses exact one-based line and *UTF-8 byte* columns (tabs occupy one
+byte), with a zero-based match byte offset and the excerpt's starting column.
+Pass =next_start_byte= back as =start_byte= to continue a limited search.
+Skipped oversized fallback lines remain uncovered even if later matches are
+reported; the continuation does not silently advance past that gap.
+
+** Reading file excerpts
+
+=Read= and =ResultRead= also read UTF-8 in bounded 64 KiB chunks. The
+=gptel-agent-read-file-size-threshold= limit (400 KiB by default) now bounds
+ranged =Read= output as well as whole-file reads, including open-ended ranges
+and single enormous lines. =ResultRead= retains at most the preview budget in
+input bytes and returns at most that many excerpt characters, plus its notice;
+its existing maximum of 200 lines still applies. A limited read reports
+=start_line= and =start_column= for continuation; columns are one-based UTF-8
+bytes, and generated continuations never split a character. Staged-file reads
+obey the same output limit without copying the entire staged text into a new
+buffer. Selecting late lines still requires scanning preceding bytes, in
+bounded chunks. These readers do not auto-detect other text encodings.
+
+* Foreground Bash output capture
+
+Foreground Bash enforces its memory and storage limits while output arrives,
+rather than waiting for the command to exit. It retains at most the larger of
+the result and preview character limits (20000 characters with the defaults),
+plus the current incoming chunk, with undo disabled. Oversized output is
+appended to disk and is never read back in full to construct the response.
+Small commands need no log file.
+Saved Bash logs contain the decoded stdout and stderr up to the saved result
+byte limits. A failed command's exit status appears in the tool response. The saved
+prefix remains available only while its owner and retention policy permit.
+Capture and execution failures are reported separately from read/search
+coverage, so inspecting all saved bytes never claims omitted output was read.
