@@ -38,6 +38,10 @@
 Keep this value when reloading the module, just like the counter.")
 (defvar gptel-agent-discussion--approval-guards (make-hash-table :test #'eq :weakness 'key)
   "Approval callback to tool guard, including tools replaced in the inspector.")
+(defvar gptel-agent-discussion--requests (make-hash-table :test #'eq :weakness 'key)
+  "Request FSMs mapped to (OWNER . DIRECTORY) captured at launch.
+Track requests without Discussion tools too, including asynchronous prompt
+transforms and tool waits that have no entry in `gptel--request-alist'.")
 (defvar-local gptel-agent-discussion--self nil)
 (defvar-local gptel-agent-discussion--children nil)
 (defvar-local gptel-agent-discussion--fsm nil)
@@ -499,6 +503,37 @@ survive a rejected concurrent send."
                      (gptel--fsm-transition fsm (if (eq (car err) 'quit) 'ABRT 'ERRS)))))))))
        (signal (car err) (cdr err))))))
 
+(defun gptel-agent-discussion--track-request (original &rest args)
+  "Capture each request's owner and launch directory before calling ORIGINAL.
+ARGS are the arguments to `gptel-request'.  Supply its default FSM early so
+even asynchronous prompt preparation owns the workspace until completion."
+  (let* ((options (cdr args))
+         (buffer (get-buffer (or (plist-get options :buffer) (current-buffer))))
+         (fsm (if (plist-member options :fsm) (plist-get options :fsm)
+                (gptel-make-fsm))))
+    (if (or (plist-get options :dry-run)
+            (not (buffer-live-p buffer)) (not (gptel-fsm-p fsm)))
+        (apply original args)
+      (let ((previous (gethash fsm gptel-agent-discussion--requests))
+            started)
+        (puthash fsm (cons buffer (buffer-local-value 'default-directory buffer))
+                 gptel-agent-discussion--requests)
+        (unwind-protect
+            (prog1 (apply original (car args)
+                          (if (plist-member options :fsm) options
+                            (cons :fsm (cons fsm options))))
+              (setq started t))
+          ;; A post-request hook can fail after transport has started.  Keep
+          ;; that owner, or a request already waiting on a tool, until terminal.
+          ;; An early construction/transport failure has nothing left to own.
+          (unless (or started
+                      (and (gptel-agent-discussion--active-p fsm)
+                           (or (cl-find fsm gptel--request-alist :key #'cadr :test #'eq)
+                               (not (memq (gptel-fsm-state fsm) '(INIT WAIT))))))
+            (if previous
+                (puthash fsm previous gptel-agent-discussion--requests)
+              (remhash fsm gptel-agent-discussion--requests))))))))
+
 (defun gptel-agent-discussion--guard-send (original &optional arg)
   "Protect monitored buffers from concurrent `gptel-send' through ORIGINAL.
 Prefix ARG still opens the normal gptel menu."
@@ -836,8 +871,16 @@ are not copied.  Use `process-file' and host-local arguments for TRAMP."
 
 (defun gptel-agent-discussion--in-worktree-p (file path)
   "Whether FILE is in PATH, without connecting to unrelated remote hosts."
-  (and (equal (file-remote-p file) (file-remote-p path))
+  (and (stringp file)
+       (equal (file-remote-p file) (file-remote-p path))
        (file-in-directory-p file path)))
+
+(defun gptel-agent-discussion--owner-in-worktree-p (directory buffer path)
+  "Whether an owner launched in DIRECTORY or currently in BUFFER uses PATH."
+  (or (gptel-agent-discussion--in-worktree-p directory path)
+      (and (buffer-live-p buffer)
+           (gptel-agent-discussion--in-worktree-p
+            (buffer-local-value 'default-directory buffer) path))))
 
 (defun gptel-agent-discussion--check-worktree-idle (chat path)
   "Refuse cleanup of CHAT's PATH while Emacs still has unfinished work there."
@@ -850,6 +893,11 @@ are not copied.  Use `process-file' and host-local arguments for TRAMP."
       (when (and buffer-file-name (buffer-modified-p)
                  (gptel-agent-discussion--in-worktree-p buffer-file-name path))
         (user-error "Save or discard unsaved edits in %s before cleanup" (buffer-name)))
+      (dolist (job gptel-agent--bash-jobs)
+        (when (and (not (gptel-agent--bash-done job))
+                   (gptel-agent-discussion--in-worktree-p
+                    (gptel-agent--bash-directory job) path))
+          (user-error "Stop foreground Bash in %s before cleanup" (buffer-name))))
       (when (and (or gptel-agent-discussion--self
                      gptel-agent-discussion--inbox
                      (gptel-agent-discussion--active-p gptel-agent-discussion--fsm))
@@ -860,6 +908,22 @@ are not copied.  Use `process-file' and host-local arguments for TRAMP."
         (when (and gptel-agent-discussion--self
                    (not (eq gptel-agent-discussion--self chat)))
           (user-error "Close the other discussion in %s before cleanup" (buffer-name))))))
+  ;; A run can be retrying with a terminal request FSM, or resume a saved
+  ;; conversation without calling `gptel-request' at all.
+  (maphash
+   (lambda (_id run)
+     (when (and (gptel-agent--run-active-p run)
+                (gptel-agent-discussion--owner-in-worktree-p
+                 (gptel-agent--run-directory run) (gptel-agent--run-child-buffer run) path))
+       (user-error "Active Agent worker %s prevents cleanup" (gptel-agent--run-id run))))
+   gptel-agent--runs)
+  (maphash
+   (lambda (fsm owner)
+     (when (and (gptel-agent-discussion--active-p fsm)
+                (gptel-agent-discussion--owner-in-worktree-p (cdr owner) (car owner) path))
+       (user-error "Active gptel request in %s prevents cleanup"
+                   (or (buffer-name (car owner)) "a killed buffer"))))
+   gptel-agent-discussion--requests)
   (dolist (process (process-list))
     (when-let* ((job (process-get process 'gptel-agent-job)))
       (when (and (process-live-p process)
@@ -1381,6 +1445,7 @@ If a draft remains, send it explicitly with `gptel-send' instead."
 (add-hook 'gptel-prompt-transform-functions #'gptel-agent-discussion--localize t)
 (add-hook 'gptel-agent-question-functions #'gptel-agent-discussion--question)
 (advice-add 'gptel-request :around #'gptel-agent-discussion--guard-request)
+(advice-add 'gptel-request :around #'gptel-agent-discussion--track-request)
 (advice-add 'gptel-send :around #'gptel-agent-discussion--guard-send)
 (advice-add 'gptel--accept-tool-calls :around #'gptel-agent-discussion--guard-approval)
 (advice-add 'gptel--reject-tool-calls :around #'gptel-agent-discussion--cancel-approval)

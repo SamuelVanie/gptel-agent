@@ -383,6 +383,195 @@
       (gptel-agent-discussion-test--control fsm "close" other)
       (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat t))))))
 
+(ert-deftest gptel-agent-worktree-cleanup-refuses-workers-after-directory-change ()
+  (dolist (phase '(requesting retry resumed))
+    (gptel-agent-worktree-test--with-finished-chat
+      (let ((snapshot '(("researcher" :system "Read only" :tools ("Read")
+                         :task-timeout nil :max-request-rounds nil)))
+            (gptel-agent-retry-delay 60))
+        (with-current-buffer parent
+          (gptel-agent--task #'ignore "researcher" "Inspect tree" "Read this workspace"
+                             fsm snapshot nil nil nil t (expand-file-name "nested/" path)))
+        (let* ((run (car (hash-table-values gptel-agent--runs)))
+               (worker (gptel-agent--run-child-buffer run)))
+          (when (eq phase 'resumed)
+            (gptel-agent-workers-test--answer (gptel-agent--run-fsm run) "First pass")
+            (should-not (gptel-agent--run-active-p run))
+            (with-current-buffer parent
+              (gptel-agent--task #'ignore "researcher" "Continue" "Read more"
+                                 fsm snapshot nil nil
+                                 (gptel-agent--session-id (gptel-agent--run-session run)) t))
+            (setq run (gptel-agent--session-run (gptel-agent--run-session run))))
+          (should (gptel-agent--run-active-p run))
+          (should-not (buffer-local-value 'gptel-agent-discussion--fsm worker))
+          (with-current-buffer worker (setq default-directory repo))
+          (when (eq phase 'retry)
+            (setf (plist-get (gptel-fsm-info (gptel-agent--run-fsm run)) :http-status) 503)
+            (gptel--fsm-transition (gptel-agent--run-fsm run) 'ERRS)
+            (should (eq (gptel-agent--run-state run) 'retry-wait)))
+          (should (string-match-p "Active Agent worker"
+                                  (gptel-agent-worktree-test--cleanup fsm chat)))
+          (should (file-directory-p path))
+          (if (eq phase 'retry)
+              (gptel-abort worker)
+            (gptel-agent-workers-test--answer (gptel-agent--run-fsm run) "Done"))
+          (should-not (gptel-agent--run-active-p run))
+          (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat)))
+          (should-not (file-exists-p path)))))))
+
+(defun gptel-agent-worktree-test--request-buffer (parent path)
+  "Create an ordinary request buffer in PATH with PARENT's test backend."
+  (let ((buffer (generate-new-buffer " *worktree-request*")))
+    (with-current-buffer buffer
+      (setq default-directory path)
+      (setq-local gptel-backend (buffer-local-value 'gptel-backend parent)
+                  gptel-model 'test gptel-use-curl t gptel-stream nil
+                  gptel-prompt-transform-functions nil gptel-tools nil))
+    buffer))
+
+(ert-deftest gptel-agent-worktree-cleanup-refuses-ordinary-request-phases ()
+  (dolist (phase '(requesting preparing tool approval))
+    (gptel-agent-worktree-test--with-finished-chat
+      (let ((owner (gptel-agent-worktree-test--request-buffer
+                    parent (expand-file-name "nested/" path)))
+            request continue)
+        (unwind-protect
+            (progn
+              (with-current-buffer owner
+                (setq-local
+                 gptel-use-tools t gptel-confirm-tool-calls (eq phase 'approval)
+                 gptel-tools
+                 (list (gptel-make-tool
+                        :name "WorktreeDeferred" :async t :include t :confirm t
+                        :description "Wait for the test" :args nil
+                        :function (lambda (callback) (setq continue callback))))))
+              ;; The explicit request owner, not the dispatching buffer, owns PATH.
+              (with-current-buffer parent
+                (setq request
+                      (if (eq phase 'approval)
+                          (gptel-request "Inspect workspace" :buffer owner :callback #'ignore
+                            :fsm (gptel-make-fsm :table gptel-send--transitions
+                                                :handlers gptel-send--handlers))
+                        (gptel-request "Inspect workspace" :buffer owner :callback #'ignore
+                          :transforms (when (eq phase 'preparing)
+                                        (list (lambda (callback _fsm) (setq continue callback))))))))
+              (should-not (buffer-local-value 'gptel-agent-discussion--fsm owner))
+              (when (memq phase '(tool approval))
+                (cl-letf (((symbol-function 'gptel--display-tool-calls) #'ignore))
+                  (gptel-agent-workers-test--tool request "WorktreeDeferred" nil)))
+              (should (eq (gptel-fsm-state request)
+                          (pcase phase ('preparing 'INIT) ((or 'tool 'approval) 'TOOL)
+                                 (_ 'WAIT))))
+              (when (eq phase 'approval) (should-not continue))
+              (with-current-buffer owner (setq default-directory repo))
+              (should (string-match-p "Active gptel request"
+                                      (gptel-agent-worktree-test--cleanup fsm chat)))
+              (should (file-directory-p path))
+              (pcase phase
+                ('preparing (funcall continue))
+                ('tool (funcall continue "Finished tool")))
+              (if (eq phase 'approval)
+                  (gptel--fsm-transition request 'ABRT)
+                (gptel-agent-workers-test--answer request "Finished request"))
+              (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat)))
+              (should-not (file-exists-p path)))
+          (when (buffer-live-p owner) (kill-buffer owner)))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-refuses-request-waiting-for-workers ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (let ((owner (gptel-agent-worktree-test--request-buffer parent path)))
+      (unwind-protect
+          (let ((request (with-current-buffer owner
+                           (gptel-request "Wait for work" :callback #'ignore))))
+            (with-current-buffer owner
+              ;; The worker itself uses a different checkout.  Its waiting
+              ;; request still owns PATH after the chat changes directory.
+              (gptel-agent--task #'ignore "researcher" "Inspect source" "Read"
+                                 request '(("researcher" :system "Read" :tools ("Read")
+                                            :task-timeout nil :max-request-rounds nil))
+                                 nil nil nil t repo))
+            (gptel-agent-workers-test--answer request "Awaiting worker")
+            (should (eq (gptel-fsm-state request) 'AGWT))
+            (with-current-buffer owner (setq default-directory repo))
+            (should (string-match-p "Active gptel request"
+                                    (gptel-agent-worktree-test--cleanup fsm chat)))
+            (should (file-directory-p path))
+            (gptel-abort owner)
+            (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat)))
+            (should-not (file-exists-p path)))
+        (when (buffer-live-p owner) (kill-buffer owner))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-checks-every-request-and-ignores-nonowners ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (let ((owner (gptel-agent-worktree-test--request-buffer parent path)))
+      (unwind-protect
+          (with-current-buffer owner
+            (let ((first (gptel-request "First" :callback #'ignore))
+                  (second (gptel-request "Second" :callback #'ignore)))
+              (gptel-agent-workers-test--answer second "Done")
+              (setq default-directory repo)
+              (should (string-match-p "Active gptel request"
+                                      (gptel-agent-worktree-test--cleanup fsm chat)))
+              (gptel--fsm-transition first 'ABRT))
+            (setq default-directory path)
+            ;; Preview-only and failed startup requests must not hold the tree.
+            (gptel-request "Preview" :dry-run t :callback #'ignore)
+            (should-error
+             (gptel-request "Failed" :callback #'ignore
+               :transforms (list (lambda (_fsm) (error "Preparation failed")))))
+            (setq default-directory repo)
+            (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat)))
+            (should-not (file-exists-p path)))
+        (when (buffer-live-p owner) (kill-buffer owner))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-refuses-foreground-bash-after-directory-change ()
+  (gptel-agent-worktree-test--with-finished-chat
+    (with-temp-buffer
+      (setq default-directory (expand-file-name "nested/" path))
+      (let ((process (gptel-agent--start-foreground-bash #'ignore "sleep 30" "Wait" nil)))
+        (unwind-protect
+            (progn
+              (should (process-live-p process))
+              (setq default-directory repo)
+              (should (string-match-p "Stop foreground Bash"
+                                      (gptel-agent-worktree-test--cleanup fsm chat)))
+              (should (file-directory-p path))
+              (gptel-agent--bash-cleanup)
+              (should-not (process-live-p process))
+              (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat)))
+              (should-not (file-exists-p path)))
+          (gptel-agent--bash-cleanup))))))
+
+(ert-deftest gptel-agent-worktree-cleanup-retains-requests-after-post-launch-errors ()
+  (dolist (failure '(transport hook))
+    (gptel-agent-worktree-test--with-finished-chat
+      (let ((owner (gptel-agent-worktree-test--request-buffer parent path))
+            (request (gptel-make-fsm))
+            (gptel--request-alist nil))
+        (unwind-protect
+            (progn
+              (with-current-buffer owner
+                (setq-local gptel-post-request-hook
+                            (list (lambda () (error "Post-request hook failed"))))
+                (cl-letf (((symbol-function 'gptel-curl-get-response)
+                           (lambda (fsm)
+                             (if (eq failure 'transport)
+                                 (error "Transport failed before launch")
+                               ;; Model transport ownership without any network.
+                               (push (cons owner (cons fsm #'ignore)) gptel--request-alist)))))
+                  (should-error (gptel-request "Inspect workspace" :fsm request :callback #'ignore)))
+                (setq default-directory repo))
+              (when (eq failure 'hook)
+                (should (eq (gptel-fsm-state request) 'WAIT))
+                (should (string-match-p "Active gptel request"
+                                        (gptel-agent-worktree-test--cleanup fsm chat)))
+                (should (file-directory-p path))
+                (gptel-abort owner)
+                (should (eq (gptel-fsm-state request) 'ABRT)))
+              (should-not (string-prefix-p "Error:" (gptel-agent-worktree-test--cleanup fsm chat)))
+              (should-not (file-exists-p path)))
+          (when (buffer-live-p owner) (kill-buffer owner)))))))
+
 (ert-deftest gptel-agent-worktree-cleanup-supports-closed-killed-and-failed-discussions ()
   (dolist (state '(closed killed failed cancelled))
     (gptel-agent-worktree-test--with-finished-chat
