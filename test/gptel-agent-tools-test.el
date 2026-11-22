@@ -1,0 +1,1285 @@
+;;; gptel-agent-tools-test.el --- Agent supervisor tests -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'cl-lib)
+(require 'gptel-agent)
+(require 'gptel-agent-web-worker)
+
+(ert-deftest gptel-agent-todos-clear-header-when-completed ()
+  (with-temp-buffer
+    (insert "User task\n")
+    (setq-local gptel-mode t gptel-use-header-line t
+                header-line-format (list nil nil gptel--header-line-info)
+                gptel--fsm-last (gptel-make-fsm :info (list :position (point-marker))))
+    (gptel-agent--write-todo
+     [(:content "Verify" :activeForm "Verifying" :status "in_progress")])
+    (should (string-match-p "Task: Verifying" (nth 2 header-line-format)))
+    (gptel-agent--write-todo
+     [(:content "Verify" :activeForm "Verifying" :status "completed")])
+    (should (equal (nth 2 header-line-format) gptel--header-line-info))))
+
+(defun gptel-agent-test--agent-prompt (name)
+  "Return the built-in agent prompt named NAME."
+  (with-temp-buffer
+    (insert-file-contents
+     (expand-file-name (format "agents/%s.md" name)
+                       (file-name-directory (locate-library "gptel-agent"))))
+    (buffer-string)))
+
+(defun gptel-agent-test--saved-result-path (result)
+  "Return the quoted result_file path embedded in oversized RESULT."
+  (when (string-match "result_file: \\(\"[^\n]+\"\\)" result)
+    (car (read-from-string (match-string 1 result)))))
+
+(cl-defmacro gptel-agent-test--with-run ((run fsm received) &body body)
+  "Create an owned RUN and FSM, bind callback results to RECEIVED, then run BODY."
+  (declare (indent 1))
+  `(let* ((parent (generate-new-buffer " *gptel-agent-test-parent*"))
+          (child (generate-new-buffer " *gptel-agent-test-child*"))
+          (,received nil)
+          (,run (gptel-agent--make-run
+                 :id "test-run" :state 'created :agent "researcher"
+                 :description "test task" :parent-buffer parent
+                 :child-buffer child :response "" :response-checkpoint 0
+                 :rounds 0 :retries 0 :max-request-rounds nil
+                 :callback (lambda (value) (push value ,received))))
+          (,fsm (gptel-make-fsm :info (list :context ,run))))
+     (setf (gptel-agent--run-fsm ,run) ,fsm)
+     (unwind-protect
+         (progn ,@body)
+       (when (timerp (gptel-agent--run-retry-timer ,run))
+         (cancel-timer (gptel-agent--run-retry-timer ,run)))
+       (when (buffer-live-p parent) (kill-buffer parent))
+       (when (buffer-live-p child) (kill-buffer child)))))
+
+(ert-deftest gptel-agent-transient-errors-are-classified-conservatively ()
+  (should (gptel-agent--transient-request-error-p
+           '(:status "Curl failure" :error "Curl failed with exit code 56")))
+  (should (gptel-agent--transient-request-error-p
+           '(:http-status "429" :status "Too many requests")))
+  (should (gptel-agent--transient-request-error-p
+           '(:http-status "503" :status "Unavailable")))
+  (should-not (gptel-agent--transient-request-error-p
+               '(:http-status "401" :error "Unauthorized")))
+  (should-not (gptel-agent--transient-request-error-p
+               '(:http-status "400" :error "Stream must be set to true"))))
+
+(ert-deftest gptel-agent-repetition-search-loop-escalates-to-finalization ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((run (gptel-agent--make-run :tool-calls 0 :web-tool-calls 0))
+          (gptel-agent-max-tool-repetitions 20)
+          (gptel-agent-max-similar-tool-calls 4)
+          (gptel-agent-max-loop-violations 2)
+          results)
+      (setq-local gptel-agent--supervised-run run)
+      (dotimes (_ 5)
+        (push (gptel-agent--detect-repetition
+               '(:name "WebSearch" :args (:query "alpha beta gamma")))
+              results))
+      (setq results (nreverse results))
+      (should (plist-get (nth 3 results) :result))
+      (should (string-match-p "strategy warning"
+                              (plist-get (nth 3 results) :result)))
+      (should (plist-get (nth 4 results) :result))
+      (should (string-match-p "return the requested final answer"
+                              (plist-get (nth 4 results) :result)))
+      (should (gptel-agent--run-finalization-reason run))
+      (should-not (cl-find-if (lambda (result) (plist-get result :stop))
+                              results)))))
+
+(ert-deftest gptel-agent-repetition-compares-every-search-parameter ()
+  (dolist (case
+           '(("Glob" (:pattern "*.el" :root_directory "." :depth 1)
+              (:pattern "*.EL") (:root_directory "./") (:depth 5))
+             ("Grep" (:regex "alpha.*beta" :path "." :glob "*.el" :context_lines 0)
+              (:regex "alpha.+beta") (:path "./") (:glob "*.EL") (:context_lines 5))
+             ("Read" (:file_path "file.el" :start_line 1 :end_line 100)
+              (:file_path "./file.el") (:start_line 2) (:end_line 101))
+             ("WebSearch" (:query "alpha beta gamma one" :count 10)
+              (:query "alpha beta gamma two") (:count 20) (:new_parameter t))
+             ("WebFetch" (:url "https://example.com/Path" :max_chars 1000)
+              (:url "https://example.com/path") (:max_chars 2000))))
+    (pcase-let ((`(,name ,args . ,changes) case))
+      (dolist (change changes)
+        (ert-info ((format "%s changing %S" name change))
+          (with-temp-buffer
+            (gptel-agent--reset-tool-call-counts)
+            (let ((gptel-agent-max-tool-repetitions 2)
+                  (gptel-agent-max-similar-tool-calls 2))
+              (should-not (gptel-agent--detect-repetition
+                           (list :name name :args args)))
+              (should-not (gptel-agent--detect-repetition
+                           (list :name name
+                                 :args (plist-put (copy-tree args)
+                                                  (car change) (cadr change))))))))))))
+
+(ert-deftest gptel-agent-repetition-allows-progressively-deeper-globs ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 3)
+          (gptel-agent-max-similar-tool-calls 4)
+          (gptel-agent-tool-cycle-length 4))
+      (dolist (depth '(1 2 3 4 5 6 nil))
+        (should-not
+         (gptel-agent--detect-repetition
+          (list :name "Glob" :args (append '(:pattern "*.el" :root_directory ".")
+                                          (and depth (list :depth depth)))))))
+      (should (zerop gptel-agent--tool-loop-violations)))))
+
+(ert-deftest gptel-agent-repetition-ignores-argument-field-order ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 2)
+          (gptel-agent-max-similar-tool-calls nil))
+      (should-not (gptel-agent--detect-repetition
+                   '(:name "Glob" :args (:pattern "*.el" :root_directory "." :depth 5))))
+      (should (gptel-agent--detect-repetition
+               '(:name "Glob" :args (:depth 5 :root_directory "." :pattern "*.el")))))))
+
+(ert-deftest gptel-agent-repetition-counts-exact-searches-across-history ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions nil)
+          (gptel-agent-max-similar-tool-calls 3)
+          (gptel-agent-tool-cycle-length nil))
+      (dolist (call '((:name "Glob" :args (:pattern "*.el" :depth 1))
+                      (:name "Read" :args (:file_path "first.el"))
+                      (:name "Glob" :args (:depth 1 :pattern "*.el"))
+                      (:name "Glob" :args (:depth 5 :pattern "*.el"))
+                      (:name "Read" :args (:file_path "second.el"))))
+        (should-not (gptel-agent--detect-repetition call)))
+      (let ((result (gptel-agent--detect-repetition
+                     '(:name "Glob" :args (:pattern "*.el" :depth 1)))))
+        (should (string-match-p "3 Glob calls with identical arguments"
+                                (plist-get result :result)))))))
+
+(ert-deftest gptel-agent-repetition-cycles-use-exact-arguments ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions nil)
+          (gptel-agent-max-similar-tool-calls nil)
+          (gptel-agent-tool-cycle-length 4))
+      (dolist (call '((:name "Glob" :args (:pattern "*.el" :depth 1))
+                      (:name "Glob" :args (:pattern "*.el" :depth 5))
+                      (:name "Glob" :args (:depth 1 :pattern "*.el"))))
+        (should-not (gptel-agent--detect-repetition call)))
+      (let ((result (gptel-agent--detect-repetition
+                     '(:name "Glob" :args (:depth 5 :pattern "*.el")))))
+        (should (string-match-p "A-B-A-B" (plist-get result :result)))))))
+
+(ert-deftest gptel-agent-repetition-preserves-nested-values-and-array-order ()
+  (let ((args '(:options (:pattern "A.*B" :limit 5) :paths ["a" "b"])))
+    (dolist (case `(("Custom" (:paths ["a" "b"] :options (:limit 5 :pattern "A.*B")) t)
+                    ("Custom" (:options (:pattern "A.*B" :limit 6) :paths ["a" "b"]) nil)
+                    ("Custom" (:options (:pattern "A.*B" :limit 5) :paths ["b" "a"]) nil)
+                    ("Other" ,args nil)))
+      (pcase-let ((`(,name ,other-args ,repeated) case))
+        (with-temp-buffer
+          (gptel-agent--reset-tool-call-counts)
+          (let ((gptel-agent-max-tool-repetitions 2)
+                (gptel-agent-max-similar-tool-calls nil))
+            (should-not (gptel-agent--detect-repetition
+                         (list :name "Custom" :args args)))
+            (let ((result (gptel-agent--detect-repetition
+                           (list :name name :args other-args))))
+              (if repeated (should result) (should-not result)))))))))
+
+(ert-deftest gptel-agent-repetition-distinguishes-omitted-and-explicit-arguments ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((gptel-agent-max-tool-repetitions 2)
+          (gptel-agent-max-similar-tool-calls 2))
+      (dolist (args '((:pattern "*.el")
+                      (:pattern "*.el" :depth nil)
+                      (:pattern "*.el" :depth 5)))
+        (should-not (gptel-agent--detect-repetition
+                     (list :name "Glob" :args args)))))))
+
+(ert-deftest gptel-agent-exact-repetition-forces-finalization ()
+  (with-temp-buffer
+    (gptel-agent--reset-tool-call-counts)
+    (let ((run (gptel-agent--make-run :tool-calls 0 :web-tool-calls 0))
+          (gptel-agent-max-tool-repetitions 3)
+          (gptel-agent-max-similar-tool-calls nil)
+          results)
+      (setq-local gptel-agent--supervised-run run)
+      (dotimes (_ 5)
+        (push (gptel-agent--detect-repetition
+               '(:name "WebFetch" :args (:url "https://example.com")))
+              results))
+      (setq results (nreverse results))
+      (should (plist-get (nth 2 results) :result))
+      (should (plist-get (nth 4 results) :result))
+      (should (string-match-p
+               "identical arguments"
+               (gptel-agent--run-finalization-reason run)))
+      (should-not (cl-find-if (lambda (result) (plist-get result :stop))
+                              results)))))
+
+(ert-deftest gptel-agent-web-search-count-is-bounded-and-configurable ()
+  (let ((gptel-agent-web-search-default-count 10)
+        (gptel-agent-web-search-max-count 30))
+    (should (= (gptel-agent--web-search-count nil) 10))
+    (should (= (gptel-agent--web-search-count 20) 20))
+    (should (= (gptel-agent--web-search-count 100) 30))
+    (should (= (gptel-agent--web-search-count 0) 10))))
+
+(ert-deftest gptel-agent-web-search-result-reports-coverage ()
+  (let ((result (read (gptel-agent-web-worker-search
+                       "<html><body>No result links</body></html>"
+                       "SamuelVanie/gptel-agent" 10 "https://example.test/search"))))
+    (should (equal (plist-get result :query) "SamuelVanie/gptel-agent"))
+    (should (= (plist-get result :requested-count) 10))
+    (should (= (plist-get result :returned-count) 0))
+    (should (string-match-p "absence is not proof"
+                            (plist-get result :coverage-note)))))
+
+(ert-deftest gptel-agent-ask-multiple-allows-revising-saved-answers ()
+  (with-temp-buffer
+    (let (result)
+      (gptel-agent--ask-multiple
+       (lambda (answers) (setq result answers))
+       [(:question "Pick a color"
+         :choices [(:value "Red") (:value "Blue")])
+        (:question "Enable notifications?"
+         :choices [(:value "Yes") (:value "No")])])
+      (let ((ask-ov
+             (seq-find (lambda (ov) (overlay-get ov 'gptel-ask))
+                       (overlays-in (point-min) (point-max)))))
+        (should (overlayp ask-ov))
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 0))
+        (should (eq (lookup-key (overlay-get ask-ov 'keymap) (kbd "M-p"))
+                    'gptel-agent--ask-previous-question))
+        ;; Save both initial answers.  The interaction remains open.
+        (goto-char (overlay-start ask-ov))
+        (gptel-agent--ask-confirm-choice)
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 1))
+        (gptel-agent--ask-select-choice 1)
+        (gptel-agent--ask-confirm-choice)
+        (should-not result)
+        (should (equal (append (overlay-get ask-ov 'gptel-ask--answers) nil)
+                       '("Red" "No")))
+        ;; Return to the first question and replace its saved answer.
+        (gptel-agent--ask-previous-question)
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 0))
+        (gptel-agent--ask-select-choice 1)
+        (should-not (aref (overlay-get ask-ov 'gptel-ask--answers) 0))
+        (gptel-agent--ask-confirm-choice)
+        (should (= (overlay-get ask-ov 'gptel-ask--index) 1))
+        (should (equal (append (overlay-get ask-ov 'gptel-ask--answers) nil)
+                       '("Blue" "No")))
+        ;; Only the explicit final action resolves the tool call.
+        (gptel-agent--ask-submit)
+        (should (equal result
+                       (concat "Q1: Pick a color\nR1: Blue\n\n"
+                               "Q2: Enable notifications?\nR2: No")))
+        (should-not (overlay-buffer ask-ov))))))
+
+(ert-deftest gptel-agent-task-prompt-allows-inconclusive-results ()
+  (let ((prompt (gptel-agent--prepare-task-prompt "Find the repository")))
+    (should (string-prefix-p "Find the repository" prompt))
+    (should (string-match-p "negative or inconclusive finding is a valid result"
+                            prompt))
+    (should (string-match-p "high, medium, or low confidence" prompt))))
+
+(ert-deftest gptel-agent-built-in-prompts-report-impossible-outcomes ()
+  (let ((case-fold-search t))
+    (dolist (name '("gptel-agent" "gptel-plan" "ask"
+                    "researcher" "introspector"))
+      (let ((prompt (gptel-agent-test--agent-prompt name)))
+        (should (string-match-p
+                 (rx (or "cannot be" "could not be" "not possible"
+                         "valid completion"))
+                 prompt))
+        (should (string-match-p "confidence" prompt))))))
+
+(ert-deftest gptel-agent-built-in-prompts-have-balanced-policy-tags ()
+  (dolist (name '("gptel-agent" "gptel-plan" "ask"
+                  "researcher" "introspector" "result-explorer"))
+    (with-temp-buffer
+      (insert (gptel-agent-test--agent-prompt name))
+      (goto-char (point-min))
+      (let (stack)
+        (while (re-search-forward
+                "<\\(/?\\)\\([[:alnum:]_-]+\\)\\(?: [^>]*\\)?>" nil t)
+          (let ((closing (equal (match-string 1) "/"))
+                (tag (match-string 2)))
+            (if closing
+                (should (equal (pop stack) tag))
+              (push tag stack))))
+        (should-not stack)))))
+
+(ert-deftest gptel-agent-plan-prompt-requires-a-self-contained-handoff ()
+  (let ((prompt (gptel-agent-test--agent-prompt "gptel-plan")))
+    (dolist (requirement '("standalone handoff"
+                           "user-provided detail"
+                           "current behavior"
+                           "desired behavior"
+                           "success criteria"
+                           "decision log"
+                           "resulting behavior"))
+      (should (string-match-p requirement prompt)))))
+
+(ert-deftest gptel-agent-all-delegating-prompts-accept-inconclusive-reports ()
+  (dolist (name '("gptel-agent" "gptel-plan" "ask"))
+    (should (string-match-p
+             "completed delegation outcome"
+             (gptel-agent-test--agent-prompt name)))))
+
+(ert-deftest gptel-agent-web-budget-counts-calls-not-callbacks ()
+  (with-temp-buffer
+    (let ((run (gptel-agent--make-run :tool-calls 0 :web-tool-calls 0))
+          (gptel-agent-max-web-tool-calls 2)
+          (gptel-agent-max-similar-tool-calls nil)
+          (gptel-agent-max-tool-repetitions nil))
+      (setq-local gptel-agent--supervised-run run)
+      (gptel-agent--reset-tool-call-counts)
+      (should-not
+       (gptel-agent--detect-repetition
+        '(:name "WebSearch" :args (:query "first topic"))))
+      (should-not
+       (gptel-agent--detect-repetition
+        '(:name "WebFetch" :args (:url "https://example.com"))))
+      (let ((result
+             (gptel-agent--detect-repetition
+              '(:name "WebSearch" :args (:query "second topic")))))
+        (should (plist-get result :result))
+        (should (string-match-p "Tool exploration is now closed"
+                                (plist-get result :result)))
+        (should (string-match-p "web tool budget"
+                                (gptel-agent--run-finalization-reason run))))
+      (should (= (gptel-agent--run-web-tool-calls run) 3)))))
+
+(ert-deftest gptel-agent-web-fetch-dispatches-youtube-urls ()
+  (let (kind options result)
+    (cl-letf (((symbol-function 'gptel-agent--web-enqueue)
+               (lambda (callback selected-kind _url selected-options &optional _fsm)
+                 (setq kind selected-kind options selected-options)
+                 (funcall callback "video transcript"))))
+      (gptel-agent--read-url
+       (lambda (value) (setq result value))
+       "https://www.youtube.com/watch?v=H2qJRnV8ZGA" 1200))
+    (should (eq kind 'youtube))
+    (should (equal (plist-get options :video-id) "H2qJRnV8ZGA"))
+    (should (= (plist-get options :max-chars) 1200))
+    (should (equal result "video transcript"))
+    (should (string-match-p
+             "YouTube URLs return the video description and transcript"
+             (gptel-tool-description (gptel-get-tool "WebFetch"))))))
+
+(ert-deftest gptel-agent-web-tools-describe-conditional-browser-delegation ()
+  (dolist (name '("WebSearch" "WebFetch"))
+    (let ((description (gptel-tool-description (gptel-get-tool name))))
+      (should (string-match-p "agent-browser" description))
+      (should (string-match-p "available.*subagent" description))
+      (should (string-match-p "source URL" description)))))
+
+(ert-deftest gptel-agent-bash-schema-requires-an-extraction-query ()
+  (let* ((tool (gptel-get-tool "Bash"))
+         (args (gptel-tool-args tool))
+         (query (cadr args)))
+    (should (equal (mapcar (lambda (arg) (plist-get arg :name)) args)
+                   '("command" "query" "background")))
+    (should (plist-get (nth 2 args) :optional))
+    (should-not (plist-get query :optional))
+    (should (string-match-p "exact question"
+                            (plist-get query :description)))))
+
+(ert-deftest gptel-agent-oversized-result-is-persisted-with-explorer-contract ()
+  (let ((gptel-agent-tool-result-max-chars 40)
+        (gptel-agent-tool-result-preview-chars 20)
+        (query "Extract every failing test and its reason")
+        result-file)
+    (unwind-protect
+        (with-temp-buffer
+          (insert "first line\nsecond line\nthird line containing full evidence\n")
+          (let ((full-result (buffer-string)))
+            (gptel-agent--truncate-buffer "bash" nil query)
+            (let ((result (buffer-string)))
+              (setq result-file
+                    (gptel-agent-test--saved-result-path result))
+              (should result-file)
+              (should (string-match-p "subagent_type: \"result-explorer\""
+                                      result))
+              (should (string-match-p (regexp-quote (format "query: %S" query))
+                                      result))
+              (should (equal (plist-get
+                              (gethash result-file
+                                       gptel-agent--saved-tool-results)
+                              :query)
+                             query))
+              (should (equal (with-temp-buffer
+                               (insert-file-contents result-file)
+                               (buffer-string))
+                             full-result)))))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-bash-bounds-async-output-and-saves-the-full-result ()
+  (let ((gptel-agent-tool-result-max-chars 100)
+        (gptel-agent-tool-result-preview-chars 40)
+        result result-file)
+    (unwind-protect
+        (let ((process
+               (gptel-agent--execute-bash
+                (lambda (value) (setq result value))
+                "for ((i=1; i<=80; i++)); do printf 'record-%03d\\n' \"$i\"; done"
+                "Find record 080")))
+          (while (and (not result) (process-live-p process))
+            (accept-process-output process 0.1))
+          (unless result
+            (accept-process-output process 0.1))
+          (should (string-match-p "Preview" result))
+          (setq result-file (gptel-agent-test--saved-result-path result))
+          (should result-file)
+          (should (string-match-p "record-080"
+                                  (with-temp-buffer
+                                    (insert-file-contents result-file)
+                                    (buffer-string)))))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-result-explorer-tools-are-locked-and-cite-the-file ()
+  (let ((query "Find the error") (owner (current-buffer)) result-file)
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (insert "startup ok\nERROR database unavailable\nshutdown\n")
+            (setq result-file (gptel-agent--save-tool-result "bash" query owner)))
+          (let ((gptel-agent--current-agent "result-explorer")
+                (gptel-agent--result-file-scope result-file))
+            (should (string-match-p
+                     (regexp-quote
+                      (format "%s:2:ERROR database unavailable" result-file))
+                     (gptel-agent--read-scoped-result 2 2)))
+            (let (result)
+              (gptel-agent--grep-scoped-result (lambda (value) (setq result value))
+                                             "ERROR" t 10)
+              (let ((deadline (+ (float-time) 5)))
+                (while (and (not result) (< (float-time) deadline))
+                  (accept-process-output nil 0.01)))
+              (should (string-match-p
+                       (regexp-quote (format "%s:2:" result-file)) result))))
+          (let ((gptel-agent--current-agent "researcher")
+                (gptel-agent--result-file-scope result-file))
+            (should-error (gptel-agent--read-scoped-result 1 1)
+                          :type 'error)))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-result-explorer-rejects-a-changed-scope-query ()
+  (let ((query "Find failures") (owner (current-buffer)) result-file)
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (insert "failure evidence")
+            (setq result-file (gptel-agent--save-tool-result "bash" query owner)))
+          (should-not (gptel-agent--result-explorer-contract-error
+                       result-file query))
+          (should (string-match-p
+                   "does not exactly match"
+                   (gptel-agent--result-explorer-contract-error
+                    result-file "Explore the repository instead"))))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-result-explorer-dispatch-enforces-the-contract ()
+  (let ((query "Find failures") result-file response
+        (parent (generate-new-buffer " *gptel-agent-result-parent*")))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (insert "failure evidence")
+            (setq result-file (gptel-agent--save-tool-result "bash" query parent)))
+          (let ((fsm (gptel-make-fsm :info (list :buffer parent))))
+            (gptel-agent--task
+             (lambda (value) (setq response value))
+             "result-explorer" "Explore result" "ignored prompt"
+             fsm '(("result-explorer" :description "Scoped explorer"))
+             result-file "Inspect unrelated files"))
+          (should (string-match-p "Invalid result-explorer scope contract"
+                                  response)))
+      (when (buffer-live-p parent)
+        (kill-buffer parent))
+      (when result-file
+        (remhash result-file gptel-agent--saved-tool-results)
+        (when (file-exists-p result-file)
+          (delete-file result-file))))))
+
+(ert-deftest gptel-agent-inspect-link-is-clickable ()
+  (let* ((run (gptel-agent--make-run))
+         (link (gptel-agent--run-inspect-button run)))
+    (should (string-match-p "Inspect sub-agent" link))
+    (should (text-property-not-all 0 (length link) 'keymap nil link))))
+
+(ert-deftest gptel-agent-active-child-buffer-kill-requires-confirmation ()
+  (let* ((child (generate-new-buffer " *gptel-agent-kill-guard*"))
+         (run (gptel-agent--make-run
+               :id "kill-guard" :state 'requesting :agent "researcher"
+               :child-buffer child)))
+    (unwind-protect
+        (with-current-buffer child
+          (setq-local gptel-agent--supervised-run run)
+          (add-hook 'kill-buffer-query-functions
+                    #'gptel-agent--confirm-child-buffer-kill nil t)
+          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
+            (should-not (kill-buffer child)))
+          (should (buffer-live-p child)))
+      (when (buffer-live-p child)
+        (with-current-buffer child
+          (setq-local kill-buffer-query-functions nil))
+        (kill-buffer child)))))
+
+(ert-deftest gptel-agent-killing-active-child-cancels-owned-request ()
+  (let* ((parent (generate-new-buffer " *gptel-agent-kill-parent*"))
+         (child (generate-new-buffer " *gptel-agent-kill-child*"))
+         delivered aborted-buffer
+         (run (gptel-agent--make-run
+               :id "kill-child" :state 'requesting :agent "researcher"
+               :parent-buffer parent :child-buffer child
+               :callback (lambda (result) (setq delivered result)))))
+    (unwind-protect
+        (progn
+          (with-current-buffer child
+            (setq-local gptel-agent--supervised-run run)
+            (add-hook 'kill-buffer-query-functions
+                      #'gptel-agent--confirm-child-buffer-kill nil t)
+            (add-hook 'kill-buffer-hook
+                      #'gptel-agent--handle-child-buffer-kill nil t))
+          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                    ((symbol-function 'gptel-agent--run-abort-transport)
+                     (lambda (owned-run)
+                       (setq aborted-buffer
+                             (gptel-agent--run-child-buffer owned-run)))))
+            (should (kill-buffer child)))
+          (should (eq (gptel-agent--run-state run) 'cancelled))
+          (should (eq aborted-buffer child))
+          (should (string-match-p "task was cancelled" delivered)))
+      (when (buffer-live-p child)
+        (with-current-buffer child
+          (setq-local kill-buffer-query-functions nil))
+        (kill-buffer child))
+      (when (buffer-live-p parent) (kill-buffer parent)))))
+
+(ert-deftest gptel-agent-run-finishes-exactly-once ()
+  (gptel-agent-test--with-run (run _fsm received)
+    (should (gptel-agent--run-finish run 'completed "first" 'done))
+    (should-not (gptel-agent--run-finish run 'failed "second" 'late-error))
+    (should (eq (gptel-agent--run-state run) 'completed))
+    (should (equal received '("first")))
+    (should-not (buffer-live-p (gptel-agent--run-child-buffer run)))))
+
+(ert-deftest gptel-agent-timeout-aborts-the-owned-child-request ()
+  (gptel-agent-test--with-run (run _fsm received)
+    (let (aborted-buffer)
+      (cl-letf (((symbol-function 'gptel-abort)
+                 (lambda (buffer) (setq aborted-buffer buffer))))
+        (gptel-agent--run-finish run 'timed-out "timeout" 'timeout))
+      (should (eq aborted-buffer (gptel-agent--run-child-buffer run)))
+      (should-not (eq aborted-buffer (gptel-agent--run-parent-buffer run)))
+      (should (equal received '("timeout"))))))
+
+(ert-deftest gptel-agent-parent-abort-cancels-child-and-parent-fsm ()
+  (gptel-agent-test--with-run (run _child-fsm received)
+    (let ((parent-fsm (gptel-make-fsm :state 'TOOL :handlers nil)))
+      (setf (gptel-agent--run-parent-fsm run) parent-fsm)
+      (puthash (gptel-agent--run-id run) run gptel-agent--runs)
+      (cl-letf (((symbol-function 'gptel-agent--run-abort-transport) #'ignore))
+        (should (= (gptel-agent--cancel-runs-for-buffer
+                    (gptel-agent--run-parent-buffer run))
+                   1)))
+      (should (eq (gptel-agent--run-state run) 'cancelled))
+      (should (eq (gptel-fsm-state parent-fsm) 'ABRT))
+      (should-not received))))
+
+(ert-deftest gptel-agent-done-state-owns-completion ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-agent--run-response run) "final evidence")
+    (gptel-agent--handle-task-done fsm)
+    (should (eq (gptel-agent--run-state run) 'completed))
+    (should (= (length received) 1))
+    (should (string-match-p "Researcher result for task: test task"
+                            (car received)))
+    (should (string-match-p "final evidence" (car received)))))
+
+(ert-deftest gptel-agent-transient-error-schedules-bounded-retry ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-fsm-info fsm)
+          (list :context run :status "Curl failure"
+                :error "Curl failed with exit code 56"))
+    (setf (gptel-agent--run-response run) "kept partial-duplicate"
+          (gptel-agent--run-response-checkpoint run) 4)
+    (let ((gptel-agent-max-request-retries 1)
+          (gptel-agent-retry-delay 60))
+      (gptel-agent--handle-task-error fsm))
+    (should (eq (gptel-agent--run-state run) 'retry-wait))
+    (should (= (gptel-agent--run-retries run) 1))
+    (should (equal (gptel-agent--run-response run) "kept"))
+    (should (timerp (gptel-agent--run-retry-timer run)))
+    (should-not received)))
+
+(ert-deftest gptel-agent-auth-error-is-terminal-without-retry ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-fsm-info fsm)
+          (list :context run :status "Unauthorized" :http-status "401"
+                :error "Invalid API key"))
+    (gptel-agent--handle-task-error fsm)
+    (should (eq (gptel-agent--run-state run) 'failed))
+    (should (= (gptel-agent--run-retries run) 0))
+    (should (= (length received) 1))))
+
+(ert-deftest gptel-agent-round-budget-is-terminal ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-agent--run-rounds run) 1
+          (gptel-agent--run-max-request-rounds run) 1)
+    (gptel-agent--handle-task-wait fsm)
+    (should (eq (gptel-agent--run-state run) 'inconclusive))
+    (should (= (length received) 1))
+    (should (string-match-p "limit of 1 model/tool rounds" (car received)))
+    (should (string-match-p "Confidence: low" (car received)))))
+
+(ert-deftest gptel-agent-finalization-disables-tools-and-injects-synthesis-turn ()
+  (gptel-agent-test--with-run (run fsm received)
+    (let* ((data '(:input [existing-transcript]
+                  :tools [tool-schema] :tool_choice "required"
+                  :toolConfig (:mode "AUTO")))
+           (info (list :context run :backend 'fake-backend
+                       :data data :tools '(tool-spec)))
+           injected)
+      (setf (gptel-agent--run-description run) "summarize repository"
+            (gptel-agent--run-finalization-reason run)
+            "the same WebFetch call kept repeating.")
+      (cl-letf (((symbol-function 'gptel--parse-list)
+                 (lambda (_backend prompts) (list :parsed prompts)))
+                ((symbol-function 'gptel--inject-prompt)
+                 (lambda (_backend request-data prompt &optional _position)
+                   (setq injected (list request-data prompt)))))
+        (should (gptel-agent--begin-finalization run info)))
+      (should (gptel-agent--run-finalization-requested run))
+      (should-not (plist-get info :tools))
+      (should-not (plist-member (plist-get info :data) :tools))
+      (should-not (plist-member (plist-get info :data) :tool_choice))
+      (should-not (plist-member (plist-get info :data) :toolConfig))
+      (should injected)
+      (should (string-match-p
+               "return your final answer"
+               (prin1-to-string injected)))
+      (with-current-buffer (gptel-agent--run-child-buffer run)
+        (should-not gptel-use-tools)
+        (should-not gptel-tools))
+      ;; Only the model's interpreted response is delivered to the parent.
+      (setf (gptel-fsm-info fsm) (list :context run)
+            (gptel-agent--run-response run) "interpreted final answer")
+      (gptel-agent--handle-task-done fsm)
+      (should (eq (gptel-agent--run-state run) 'completed))
+      (should (= (length received) 1))
+      (should (string-match-p "interpreted final answer" (car received)))
+      (should-not (string-match-p "existing-transcript" (car received))))))
+
+(ert-deftest gptel-agent-finalization-gets-a-turn-at-the-round-limit ()
+  (gptel-agent-test--with-run (run fsm received)
+    (setf (gptel-agent--run-rounds run) 1
+         (gptel-agent--run-finalization-requested run) t
+          (gptel-agent--run-max-request-rounds run) 1)
+    (let (handled)
+      (cl-letf (((symbol-function 'gptel--handle-wait)
+                 (lambda (_fsm) (setq handled t))))
+        (gptel-agent--handle-task-wait fsm))
+      (should handled)
+      (should (gptel-agent--run-finalization-started run))
+      (should (= (gptel-agent--run-rounds run) 2))
+      (should-not received))))
+
+(ert-deftest gptel-agent-researcher-prompt-is-local-first-and-metadata-aware ()
+  (let ((prompt (gptel-agent-test--agent-prompt "researcher")))
+    (should (string-match-p "current workspace is the primary source" prompt))
+    (should (string-match-p "default_branch" prompt))
+    (should (string-match-p "successful result.*stop signal" prompt))))
+
+(ert-deftest gptel-agent-built-in-supervision-policy-is-role-specific ()
+  (let ((researcher (gptel-agent-test--agent-prompt "researcher"))
+        (introspector (gptel-agent-test--agent-prompt "introspector")))
+    (should-not gptel-agent-task-timeout)
+    (should-not gptel-agent-max-request-rounds)
+    (should (string-match-p "task-timeout: 3600" researcher))
+    (should (string-match-p "max-request-rounds: 100" researcher))
+    (should-not (string-match-p "task-timeout:" introspector))
+    (should-not (string-match-p "max-request-rounds:" introspector))))
+
+(ert-deftest gptel-agent-result-explorer-prompt-is-strict-and-evidence-based ()
+  (let ((prompt (gptel-agent-test--agent-prompt "result-explorer")))
+    (should (string-match-p "- ResultGrep\n  - ResultRead" prompt))
+    (dolist (tool '("Read" "Grep" "Bash" "Agent"))
+      (should-not (string-match-p
+                   (format "^  - %s$" (regexp-quote tool)) prompt)))
+    (should (string-match-p "untrusted data" prompt))
+    (should (string-match-p "absolute file path and exact line number"
+                            prompt))
+    (should (string-match-p "cannot be established" prompt))))
+
+(ert-deftest gptel-agent-main-agents-use-their-file-declarations ()
+  (let* ((gptel-agent--enabled-agents nil)
+         (directory (file-name-directory (locate-library "gptel-agent")))
+         (registry (mapcar
+                    (lambda (name)
+                      (gptel-agent-read-file
+                       (expand-file-name (format "agents/%s.md" name) directory)))
+                    '("gptel-agent" "gptel-plan" "ask" "introspector"
+                      "researcher" "result-explorer"))))
+    (dolist (name '("gptel-agent" "gptel-plan" "ask"))
+      (with-temp-buffer
+        (setq-local gptel-agent--current-agent name
+                    gptel-agent--registry-snapshot registry)
+        (let* ((expected '("researcher" "result-explorer"))
+               (fsm (gptel-make-fsm :info (list :buffer (current-buffer))))
+               (snapshot (gptel-agent--snapshot-agent-definitions)))
+          (should (equal (mapcar #'car snapshot) expected))
+          ;; The request transform runs in a different buffer.
+          (with-temp-buffer
+            (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+            (gptel-agent--localize-agent-tool fsm)
+            (let ((tool (car gptel-tools)))
+              (should (equal (append (plist-get (car (gptel-tool-args tool)) :enum) nil)
+                             expected))
+              (dolist (enabled expected)
+                (should (string-match-p enabled (gptel-tool-description tool)))))))))))
+
+(defmacro gptel-agent-test--with-main-presets (&rest body)
+  "Register the main agent presets in an isolated registry, then run BODY."
+  (declare (indent 0) (debug t))
+  `(let ((gptel-agent-dirs
+          (list (expand-file-name "agents/"
+                                  (file-name-directory (locate-library "gptel-agent")))))
+         (gptel-agent-skill-dirs nil)
+         (gptel--known-presets (copy-tree gptel--known-presets))
+         gptel-agent--agents gptel-agent--agent-files gptel-agent--file-cache
+         gptel-agent--registered-agents gptel-agent--additional-subagents
+         gptel-agent--skills)
+     (with-temp-buffer
+       (gptel-agent-update)
+       ,@body)))
+
+(ert-deftest gptel-agent-main-presets-match-after-activation ()
+  (require 'gptel-transient)
+  (gptel-agent-test--with-main-presets
+    (dolist (preset '(gptel-agent ask gptel-plan))
+      (with-temp-buffer
+        (gptel--apply-preset
+         preset (lambda (symbol value) (set (make-local-variable symbol) value)))
+        (let ((spec (copy-tree (gptel-get-preset preset))))
+          ;; Comparing the name must neither refresh runtime definitions nor
+          ;; mutate the registered preset, including when called repeatedly.
+          (cl-letf (((symbol-function 'gptel-agent--refresh-registry)
+                     (lambda () (ert-fail "Display refreshed the registry"))))
+            (dotimes (_ 2)
+              (should-not (gptel--preset-mismatch-p preset))
+              (should-not (gptel--preset-mismatch-p (symbol-name preset)))))
+          (should (equal spec (gptel-get-preset preset))))
+        ;; Actual user changes must still mark the preset as modified.
+        (dolist (symbol '(gptel-system-prompt gptel-tools gptel-agent--current-agent))
+          (let ((saved (symbol-value symbol)))
+            (set symbol (if (eq symbol 'gptel-tools) nil "Changed"))
+            (should (gptel--preset-mismatch-p preset))
+            (set symbol saved)))))))
+
+(ert-deftest gptel-agent-preset-mismatch-preserves-other-presets ()
+  (require 'gptel-transient)
+  (let ((gptel--known-presets '((ordinary :model test :temperature 0.2))))
+    (with-temp-buffer
+      (gptel--apply-preset
+       'ordinary (lambda (symbol value) (set (make-local-variable symbol) value)))
+      (should-not (gptel--preset-mismatch-p 'ordinary))
+      (setq gptel-model 'different)
+      (should (gptel--preset-mismatch-p 'ordinary)))))
+
+(ert-deftest gptel-agent-main-preset-activation-restricts-selector ()
+  (gptel-agent-test--with-main-presets
+    ;; Exercise the same named-preset path as gptel's menu, including
+    ;; switching an existing chat whose old parent was gptel-agent.
+    (with-temp-buffer
+      (dolist (preset '(gptel-agent ask gptel-plan gptel-agent))
+        (gptel--apply-preset
+         preset (lambda (sym val) (set (make-local-variable sym) val)))
+        (should (equal gptel-agent--current-agent (symbol-name preset)))
+        (let ((expected '("researcher" "result-explorer")))
+          (cl-letf (((symbol-function 'completing-read-multiple)
+                     (lambda (_prompt candidates _predicate _require-match initial
+                                      &rest _)
+                       (should (equal (sort (copy-sequence candidates) #'string<)
+                                      expected))
+                       (should (equal initial (mapconcat #'identity candidates ",")))
+                       candidates)))
+            (gptel-agent-toggle-agent))
+          ;; Start the next preset with its default conversation selection.
+          (setq-local gptel-agent--enabled-agents nil))))))
+
+(ert-deftest gptel-agent-preset-reactivation-refreshes-definitions ()
+  (gptel-agent-test--with-main-presets
+    (let ((directory (make-temp-file "gptel-agent-presets-" t)))
+      (unwind-protect
+          (let* ((gptel-agent-dirs (list directory))
+                 (file (expand-file-name "ask.md" directory))
+                 (setter (lambda (sym val) (set (make-local-variable sym) val))))
+            (with-temp-file file
+              (insert "---\nname: ask\nagents: [researcher, introspector]\n---\nAsk."))
+            (dolist (name '("researcher" "introspector"))
+              (with-temp-file (expand-file-name (concat name ".md") directory)
+                (insert (format "---\nname: %s\ndescription: Worker\n---\nWork." name))))
+            (gptel-agent-update)
+            (with-temp-buffer
+              (gptel--apply-preset 'ask setter)
+              (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+              (gptel-agent--localize-agent-tool (gptel-make-fsm))
+              (let* ((old-tool (car gptel-tools))
+                     (old-names (copy-sequence
+                                 (plist-get (car (gptel-tool-args old-tool)) :enum))))
+                (should (member "introspector" (append old-names nil)))
+                (with-temp-file file
+                  (insert "---\nname: ask\nagents: [researcher]\n---\nAsk."))
+                (set-file-times file (time-add (current-time) 2))
+                (gptel--apply-preset 'ask setter)
+                (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                               '("researcher")))
+                (gptel-agent--localize-agent-tool (gptel-make-fsm))
+                (should (equal (plist-get (car (gptel-tool-args (car gptel-tools))) :enum)
+                               ["researcher"]))
+                ;; A tool already prepared for a request keeps its registry.
+                (should (equal (plist-get (car (gptel-tool-args old-tool)) :enum)
+                               old-names)))))
+        (delete-directory directory t)))))
+
+(ert-deftest gptel-agent-inline-preset-restricts-request-without-changing-chat ()
+  (gptel-agent-test--with-main-presets
+    (gptel--apply-preset
+     'gptel-agent (lambda (sym val) (set (make-local-variable sym) val)))
+    ;; Give this chat a wider parent declaration than the inline preset.
+    (setf (plist-get (cdr (assoc "gptel-agent" gptel-agent--registry-snapshot)) :agents)
+          '("introspector" "researcher" "result-explorer"))
+    (setq-local gptel-agent--enabled-agents '("introspector" "researcher"))
+    (should (equal (sort (mapcar #'car (gptel-agent--snapshot-agent-definitions)) #'string<)
+                   '("introspector" "researcher")))
+    (let ((fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
+      (with-temp-buffer
+        (insert "@ask Explain this code")
+        (goto-char (point-min))
+        (gptel--transform-apply-preset fsm)
+        (gptel-agent--localize-agent-tool fsm)
+        (let ((tool (cl-find "Agent" gptel-tools :key #'gptel-tool-name :test #'equal)))
+          ;; @ask excludes introspector, and the chat's selection excludes
+          ;; result-explorer.  Only researcher satisfies both restrictions.
+          (should (equal (plist-get (car (gptel-tool-args tool)) :enum)
+                         ["researcher"])))))
+    (should (equal gptel-agent--current-agent "gptel-agent"))))
+
+(ert-deftest gptel-agent-shared-main-preset-preserves-worker-identity ()
+  (gptel-agent-test--with-main-presets
+    (with-temp-buffer
+      (setq-local gptel-agent--current-agent "test-worker"
+                  gptel-agent--agent-snapshot
+                  '(("test-worker" :agents ("researcher"))
+                    ("researcher" :description "Researches")))
+      (gptel-agent--apply-subagent-configuration
+       (gptel-agent--resolve-subagent-preset 'gptel-agent)
+       '(:system "Execute the task"))
+      (should (equal gptel-agent--current-agent "test-worker"))
+      (should-not gptel-agent--registry-snapshot)
+      (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                     '("researcher"))))))
+
+(ert-deftest gptel-agent-parent-declarations-restrict-dispatch-and-children ()
+  (with-temp-buffer
+    (setq-local
+     gptel-agent--current-agent "custom-parent"
+     gptel-agent--registry-snapshot
+     '(("custom-parent" :agents ("test-worker" "researcher"))
+       ("test-worker" :agents ("researcher" "introspector") :description "Executes")
+       ("researcher" :description "Researches")
+       ("introspector" :description "Inspects")))
+    (let* ((snapshot (gptel-agent--snapshot-agent-definitions))
+           (fsm (gptel-make-fsm :info (list :buffer (current-buffer))))
+           (message (gptel-agent--agents-tool-message gptel-agent--registry-snapshot)))
+      (should (equal (mapcar #'car snapshot) '("test-worker" "researcher")))
+      (should-not (string-match-p "introspector" message))
+      (with-temp-buffer
+        (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+        (gptel-agent--localize-agent-tool fsm)
+        (let (result)
+          (funcall (gptel-tool-function (car gptel-tools))
+                   (lambda (value) (setq result value))
+                   "introspector" "Inspect" "Details")
+          (should (string-match-p "not available for this request" result))))
+      ;; The child can narrow its parent's list, but cannot add introspector.
+      (with-temp-buffer
+        (setq-local gptel-agent--current-agent "test-worker"
+                    gptel-agent--agent-snapshot snapshot)
+        (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                       '("researcher")))))))
+
+(ert-deftest gptel-agent-parent-selection-distinguishes-empty-and-absent ()
+  (with-temp-buffer
+    (setq-local gptel-agent--current-agent "parent"
+                gptel-agent--registry-snapshot
+                '(("parent" :description "Parent")
+                  ("test-worker" :description "Executes")
+                  ("ask" :description "Explains")))
+    ;; No declaration: allow workers, but never main presets or self-calls.
+    (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                   '("test-worker")))
+    (setcdr (car gptel-agent--registry-snapshot) '(:agents nil))
+    (should-not (gptel-agent--snapshot-agent-definitions))
+    (setq-local gptel-tools (list (gptel-get-tool "Agent") (gptel-get-tool "Read")))
+    (gptel-agent--localize-agent-tool
+     (gptel-make-fsm :info (list :buffer (current-buffer))))
+    (should (equal (mapcar #'gptel-tool-name gptel-tools) '("Read")))))
+
+(ert-deftest gptel-agent-subagent-lists-exclude-main-presets-and-self ()
+  (dolist (declared '(nil t))
+    (dolist (inherited '(nil t))
+      (with-temp-buffer
+        (let* ((names '("gptel-agent" "gptel-plan" "ask" "test-worker"
+                        "researcher" "custom-worker"))
+               (registry (mapcar (lambda (name) (list name :description name)) names)))
+          (when declared
+            (setcdr (assoc "test-worker" registry) (list :agents names)))
+          (setq-local gptel-agent--current-agent "test-worker"
+                      gptel-agent--enabled-agents names
+                      gptel-agent--registry-snapshot registry
+                      gptel-agent--agent-snapshot (and inherited registry))
+          (dolist (ignore-selection '(nil t))
+            (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions
+                                         ignore-selection))
+                           '("researcher" "custom-worker"))))
+          (let ((fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
+            (with-temp-buffer
+              (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+              (gptel-agent--localize-agent-tool fsm)
+              (should (equal (append (plist-get (car (gptel-tool-args
+                                                     (car gptel-tools))) :enum) nil)
+                             '("researcher" "custom-worker")))))
+          (let ((gptel-agent--agents registry))
+            (cl-letf (((symbol-function 'completing-read-multiple)
+                       (lambda (_prompt candidates _predicate _require-match initial
+                                        &rest _)
+                         (should (equal candidates '("researcher" "custom-worker")))
+                         (should (equal initial "researcher,custom-worker"))
+                         candidates)))
+              (gptel-agent-toggle-agent))))))))
+
+(ert-deftest gptel-agent-dispatch-rejects-main-presets-and-self ()
+  (with-temp-buffer
+    (setq-local gptel-agent--current-agent "test-worker")
+    (let* ((names '("gptel-agent" "gptel-plan" "ask" "test-worker" "TEST-WORKER"))
+           ;; Simulate a stale or externally supplied snapshot containing
+           ;; invalid targets.  Dispatch must guard these independently.
+           (snapshot (mapcar (lambda (name) (list name :description name)) names))
+           (fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
+      (cl-letf (((symbol-function 'gptel-request)
+                 (lambda (&rest _) (ert-fail "Invalid sub-agent was started"))))
+        (dolist (name names)
+          (let (results)
+            (gptel-agent--task (lambda (result) (push result results))
+                               name "Invalid delegation" "Details" fsm snapshot)
+            (should (= (length results) 1))
+            (should (string-match-p "not available for this request" (car results))))))
+      (should-not gptel-agent--sessions))))
+
+(ert-deftest gptel-agent-selector-is-local-and-limited-by-parent ()
+  (let ((gptel-agent--agents
+         '(("parent" :agents ("test-worker" "researcher"))
+           ("test-worker" :description "Executes")
+           ("researcher" :description "Researches")
+           ("introspector" :description "Inspects"))))
+    (with-temp-buffer
+      (setq-local gptel-agent--current-agent "parent"
+                  gptel-agent--registry-snapshot gptel-agent--agents)
+      (cl-letf (((symbol-function 'completing-read-multiple)
+                 (lambda (_prompt candidates _predicate _require-match initial
+                                  &rest _args)
+                   (should (equal candidates '("test-worker" "researcher")))
+                   (should (equal initial "test-worker,researcher"))
+                   '("test-worker"))))
+        (gptel-agent-toggle-agent))
+      (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                     '("test-worker")))
+      ;; Another conversation still follows its parent file.
+      (with-temp-buffer
+        (setq-local gptel-agent--current-agent "parent"
+                    gptel-agent--registry-snapshot gptel-agent--agents)
+        (should (equal (mapcar #'car (gptel-agent--snapshot-agent-definitions))
+                       '("test-worker" "researcher"))))
+      (cl-letf (((symbol-function 'completing-read-multiple) (lambda (&rest _) nil)))
+        (gptel-agent-toggle-agent))
+      (should-not (gptel-agent--snapshot-agent-definitions)))))
+
+(ert-deftest gptel-agent-agent-lists-parse-from-markdown-and-org ()
+  (require 'yaml)
+  (dolist (text '("agents: [test-worker, researcher]"
+                  "agents: test-worker researcher"
+                  "agents:\n  - test-worker\n  - researcher"))
+    (should (equal (plist-get (gptel-agent--parse-yaml-frontmatter text #'always)
+                             :agents)
+                   '("test-worker" "researcher"))))
+  (should (equal (plist-get (gptel-agent--org-properties-alist-to-plist
+                            '(("AGENTS" . "test-worker researcher")) #'always)
+                           :agents)
+                 '("test-worker" "researcher")))
+  (dolist (plist (list (gptel-agent--parse-yaml-frontmatter "agents: []" #'always)
+                       (gptel-agent--org-properties-alist-to-plist
+                        '(("AGENTS" . "")) #'always)))
+    (should (plist-member plist :agents))
+    (should-not (plist-get plist :agents))))
+
+(ert-deftest gptel-agent-task-preview-shows-creation-overrides ()
+  (with-temp-buffer
+    (gptel-agent--task-preview-setup
+     '("researcher" "Investigate" "Find evidence" nil nil nil nil nil
+       "Selected:model" ["Read" "mcp-example"]) nil)
+    (should (string-match-p "model: \"Selected:model\"" (buffer-string)))
+    (should (string-match-p "extra_tools: \\[\"Read\" \"mcp-example\"\\]" (buffer-string)))
+    (should (string-match-p "Find evidence" (buffer-string)))))
+
+(ert-deftest gptel-agent-tool-schema-is-request-local ()
+  (let* ((global-tool (gptel-get-tool "Agent"))
+         (global-args (copy-tree (gptel-tool-args global-tool)))
+         (fsm (gptel-make-fsm))
+         captured local-tool)
+    (with-temp-buffer
+      (setq-local
+       gptel-tools (list global-tool)
+       gptel-agent--current-agent nil
+       gptel-agent--agent-snapshot
+       '(("test-worker" :description "Executes work" :system "execute")
+         ("researcher" :description "Finds evidence" :system "research")))
+      (gptel-agent--localize-agent-tool fsm)
+      (setq local-tool (car gptel-tools)))
+    (let ((local-tool local-tool))
+      (should-not (eq local-tool global-tool))
+      (should (equal (append (plist-get (car (gptel-tool-args local-tool)) :enum)
+                             nil)
+                     '("test-worker" "researcher")))
+      (should (equal (mapcar (lambda (arg) (plist-get arg :name))
+                             (gptel-tool-args local-tool))
+                     '("subagent_type" "description" "prompt"
+                       "result_file" "query" "agent_id" "background" "directory"
+                       "model" "extra_tools")))
+      (should (equal (gptel-tool-args global-tool) global-args))
+      (cl-letf (((symbol-function 'gptel-agent--task)
+                 (lambda (&rest args) (setq captured args))))
+        (funcall (gptel-tool-function local-tool)
+                 #'ignore "test-worker" "do work" "details" nil nil "agent-42" nil "../other"))
+      (should (equal (nth 8 captured) "agent-42"))
+      (should (equal (nth 10 captured) "../other"))
+      (should (eq (nth 4 captured) fsm))
+      (should (equal (mapcar #'car (nth 5 captured))
+                     '("test-worker" "researcher"))))))
+
+(ert-deftest gptel-agent-session-records-its-initial-preset ()
+  (let ((session-buffer (generate-new-buffer " *gptel-agent-session-test*"))
+        (gptel-use-header-line nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gptel)
+                   (lambda (&rest _args) session-buffer))
+                  ((symbol-function 'gptel-agent-update) #'ignore)
+                  ((symbol-function 'gptel--apply-preset) #'ignore))
+          (gptel-agent default-directory 'ask)
+          (with-current-buffer session-buffer
+            (should (equal gptel-agent--current-agent "ask"))))
+      (when (buffer-live-p session-buffer)
+        (kill-buffer session-buffer)))))
+
+(ert-deftest gptel-agent-skill-discovery-uses-cached-exact-metadata ()
+  (let ((gptel-agent-skill-dirs '("/skills"))
+        (gptel-agent--bundled-skill-dir "/skills")
+        gptel-agent--skills cached-file cached-full scanned-directory)
+    (cl-letf (((symbol-function 'file-directory-p) (lambda (_dir) t))
+              ((symbol-function 'project-current) (lambda (&rest _) nil))
+              ((symbol-function 'gptel-agent--skill-files)
+               (lambda (dir &rest _args)
+                 (setq scanned-directory dir)
+                 '("/skills/example/SKILL.md")))
+              ((symbol-function 'gptel-agent--cached-read-skill-file)
+               (lambda (file full)
+                 (setq cached-file file
+                       cached-full full)
+                 '("example" :description "Example skill")))
+              ((symbol-function 'gptel-agent-read-file)
+               (lambda (&rest _args)
+                 (ert-fail "Skill discovery bypassed the file cache"))))
+      (gptel-agent--update-skills))
+    (should (equal scanned-directory "/skills"))
+    (should (equal cached-file "/skills/example/SKILL.md"))
+    (should-not cached-full)
+    (should (equal (car (alist-get "example" gptel-agent--skills
+                                   nil nil #'string-equal))
+                   "/skills/example/"))))
+
+(ert-deftest gptel-agent-project-registry-snapshot-is-isolated ()
+  (let ((gptel-agent--agents
+         '(("other-project" :description "Wrong project")))
+        (source (generate-new-buffer " *gptel-agent-project-source*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer source
+            (setq-local
+             gptel-agent--registry-snapshot
+             '(("this-project" :description "Right project" :system "local"))))
+          (with-temp-buffer
+            (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+            (let ((fsm (gptel-make-fsm :info (list :buffer source))))
+              (gptel-agent--localize-agent-tool fsm))
+            (should
+             (equal (append
+                     (plist-get (car (gptel-tool-args (car gptel-tools))) :enum)
+                     nil)
+                    '("this-project")))))
+      (when (buffer-live-p source) (kill-buffer source)))))
+
+(ert-deftest gptel-agent-default-preset-does-not-override-request-parent ()
+  (let ((gptel-agent--current-agent "ask"))
+    (with-temp-buffer
+      (setq-local gptel-agent--current-agent "test-worker"
+                  gptel-agent--registry-snapshot
+                  '(("ask" :agents ("test-worker"))
+                    ("test-worker" :agents ("researcher"))
+                    ("researcher" :description "Researches")))
+      (let ((fsm (gptel-make-fsm :info (list :buffer (current-buffer)))))
+        (with-temp-buffer
+          (setq-local gptel-tools (list (gptel-get-tool "Agent")))
+          (gptel-agent--localize-agent-tool fsm)
+          (should (equal (plist-get (car (gptel-tool-args (car gptel-tools))) :enum)
+                         ["researcher"])))))))
+
+(ert-deftest gptel-agent-subagent-configuration-applies-each-layer ()
+  (let (events)
+    (with-temp-buffer
+      (gptel-agent--apply-subagent-configuration
+       (list :pre (lambda () (push 'preset-pre events))
+             :post (lambda () (push 'preset-post events))
+             :stream nil :temperature 0.2)
+       (list :pre (lambda () (push 'agent-pre events))
+             :post (lambda () (push 'agent-post events))
+             :task-timeout 1200 :max-request-rounds 30
+             :stream t :temperature 0.7))
+      (should (eq gptel-stream t))
+      (should (= gptel-temperature 0.7)))
+    (should (equal (nreverse events)
+                   '(preset-pre preset-post agent-pre agent-post)))))
+
+(ert-deftest gptel-agent-supervision-values-are-per-agent ()
+  (let ((agent '(:task-timeout 1200 :max-request-rounds 30)))
+    (should (= (gptel-agent--supervision-value
+                agent :task-timeout 700) 1200))
+    (should (= (gptel-agent--supervision-value
+                agent :max-request-rounds 15) 30))
+    (should-not (gptel-agent--supervision-value
+                 '(:task-timeout nil) :task-timeout 700))
+    (should-not (gptel-agent--supervision-value
+                 nil :task-timeout nil))
+    (should-error
+     (gptel-agent--supervision-value
+      '(:task-timeout -1) :task-timeout nil)
+     :type 'user-error)))
+
+(ert-deftest gptel-agent-unknown-subagent-preset-is-an-error ()
+  (should-error
+   (gptel-agent--resolve-subagent-preset
+   'gptel-agent-test-missing-preset)
+   :type 'user-error))
+
+(ert-deftest gptel-agent-named-subagent-preset-applies-parents ()
+  (let ((gptel--known-presets (copy-tree gptel--known-presets)))
+    (gptel-make-preset 'gptel-agent-test-parent :max-tokens 222)
+    (gptel-make-preset 'gptel-agent-test-child
+      :parents 'gptel-agent-test-parent :model 'named-preset-model)
+    (with-temp-buffer
+      (gptel-agent--apply-subagent-configuration
+       (gptel-agent--resolve-subagent-preset 'gptel-agent-test-child)
+       '(:description "Test agent"))
+      (should (eq gptel-model 'named-preset-model))
+      (should (= gptel-max-tokens 222)))))
+
+(ert-deftest gptel-agent-task-pins-stream-and-child-buffer ()
+  (let* ((parent (generate-new-buffer " *gptel-agent-config-parent*"))
+         (parent-fsm (gptel-make-fsm))
+         captured requested-prompt run)
+    (unwind-protect
+        (progn
+          (with-current-buffer parent
+            (insert "prompt\n")
+            (setq-local gptel-stream t
+                        gptel-model 'test-model
+                        gptel-agent-preset
+                        '(:model preset-model :stream nil
+                          :temperature 0.2 :max-tokens 321
+                          :include-reasoning t :system "Preset system"))
+            (setf (gptel-fsm-info parent-fsm)
+                  (list :buffer parent :position (point-marker))))
+          (cl-letf (((symbol-function 'gptel--update-status) #'ignore)
+                    ((symbol-function 'gptel-request)
+                     (lambda (prompt &rest args)
+                       (setq requested-prompt prompt
+                             captured args)
+                       (let ((fsm (plist-get args :fsm)))
+                         (setf (gptel-fsm-info fsm)
+                               (list :buffer (plist-get args :buffer)
+                                     :context (plist-get args :context)
+                                     :callback (plist-get args :callback)))
+                         fsm))))
+            (gptel-agent--task
+             #'ignore "researcher" "pin config" "perform task" parent-fsm
+             '(("researcher" :description "Research" :system "Pinned system"
+                :temperature 0.7 :task-timeout 1200
+                :max-request-rounds 30))))
+          (setq run (plist-get captured :context))
+          (should (plist-member captured :stream))
+          (should-not (plist-get captured :stream))
+          (should (buffer-live-p (plist-get captured :buffer)))
+          (should-not (eq (plist-get captured :buffer) parent))
+          (should (eq (marker-buffer (plist-get captured :position)) parent))
+          (should (equal (plist-get captured :system) "Pinned system"))
+          (should (string-match-p
+                   "negative or inconclusive finding is a valid result"
+                   requested-prompt))
+          (should (eq (gptel-agent--run-parent-fsm run) parent-fsm))
+          (should (= (gptel-agent--run-task-timeout run) 1200))
+          (should (= (gptel-agent--run-max-request-rounds run) 30))
+          (with-current-buffer (gptel-agent--run-child-buffer run)
+            (should (string-match-p "Sub-agent run: agent-" (buffer-string)))
+            (should (string-match-p "perform task" (buffer-string)))
+            (should (eq gptel-model 'preset-model))
+            (should (= gptel-temperature 0.7))
+            (should (= gptel-max-tokens 321))
+            (should (eq gptel-include-reasoning t)))
+          (should (string-match-p
+                   "Inspect sub-agent"
+                   (overlay-get (gptel-agent--run-overlay run) 'msg)))
+          (should (string-match-p
+                   "preset-model"
+                   (overlay-get (gptel-agent--run-overlay run) 'msg)))
+          (should-not (string-match-p
+                       "test-model"
+                       (overlay-get (gptel-agent--run-overlay run) 'msg)))
+          (let (finalized-run)
+            (cl-letf (((symbol-function 'gptel-agent--begin-finalization)
+                       (lambda (owned-run _info)
+                         (setq finalized-run owned-run))))
+              (funcall (plist-get captured :callback)
+                       '(tool-result) '(:backend test)))
+            (should (eq finalized-run run))))
+      (when (and run (gptel-agent--run-active-p run))
+        (gptel-agent--run-finish run 'cancelled "cleanup" 'test-cleanup t))
+      (when (and run (buffer-live-p (gptel-agent--run-child-buffer run)))
+        (kill-buffer (gptel-agent--run-child-buffer run)))
+      (when (buffer-live-p parent) (kill-buffer parent)))))
+
+(provide 'gptel-agent-tools-test)
+;;; gptel-agent-tools-test.el ends here

@@ -2,7 +2,233 @@
 
 * 0.0.5-pre
 
+** Delegation configuration
+
+- Agent accepts a creation-time =model= override using an advertised
+  =Backend:model= choice, applied after shared and per-agent preset hooks.
+- Agent and Discussion accept =extra_tools= containing registered tool names
+  or groups. Additions preserve default tools, confirmations and disabled
+  tool-use settings; follow-ups retain the original configuration.
+- Result-explorer uses the existing tool-policy system to enforce its scoped
+  ResultRead/ResultGrep access even when extra tools are supplied.
+
+** Compatibility fixes
+
+- Resuming an Agent retains its exact tool-use mode and keeps disabled tools
+  out of active request schemas; enabled tools still return after synthesis.
+
+- File edits reject characters that cannot be saved in the file's fixed
+  encoding before writing any part of a batch or recording its history.
+  Automatic encoding selection for new and undecided files is preserved.
+
+- Single-file patches now follow symlinks consistently with batch edits and
+  review. Deletion preserves the link and removes its target, which history
+  can restore.
+
+- Skill discovery and interactive selections are local to each conversation.
+  Requests refresh discovery when their directory or configuration changes,
+  while in-flight requests retain their snapshots. Workers and discussions
+  inherit discovery configuration and discover skills in their own directory.
+
+- Saved sessions retain tool categories so same-named tools cannot be swapped
+  on restore. Legacy snapshots with name-only references remain readable.
+
+- Cloned chats receive independent MainChat identities, inboxes and request
+  dispatchers even when session persistence is disabled. Closing a clone no
+  longer stops the original chat's workers, discussions, shell jobs or timers.
+
+- WebFetch treats brackets and braces in URLs literally, and hidden HTML
+  elements no longer displace visible main content, articles or search results.
+
+- Non-ASCII paths in rewritten tool calls no longer fail with
+  ~wrong-type-argument json-value-p~ when an agent continues after approval.
+  Embedded OpenAI tool arguments are decoded from UTF-8 before sending.
+
+- Concurrent sub-agent tool approvals now have independent insertion markers
+  and preview regions. Approving a worker no longer merges prompts with the
+  main agent or disturbs its response text and prefixes. Task cards remain at
+  the delegation point, before any unsent draft.
+
+- Require gptel 0.9.9.6 or newer, matching the system-prompt and tool-steering
+  APIs used by the package. Subagents now continue after rejecting a tool with
+  steering instructions instead of stopping in the new steering state.
+
+- Compaction with extra instructions now preserves gptel's parsed directive
+  structure, including conversation templates and function-valued prompts.
+
+- Markdown agent files without YAML frontmatter retain their prompt text.
+
 ** New features and UI changes
+
+- Session titles now wait until at least one message has been sent. Autosaving
+  an unfinished first prompt no longer names the chat. Title context excludes
+  unsent follow-up drafts, and the submitted-message boundary survives restore.
+
+- Saved sessions now generate a short conversation title on their first save
+  with sent history, using the first and last messages (or the sole message).
+  The title also renames the buffer to ~*gptel:TITLE*~ and remains unchanged
+  through later saves and restores. Configure the title model with
+  ~gptel-agent-session-title-preset~, using a named preset or plist just like
+  ~gptel-agent-preset~. ~gptel-agent-session-generate-title~ refreshes a title
+  on demand; ~gptel-agent-session-auto-title~ disables automatic generation.
+  Browsing and restoring sessions never start title requests themselves.
+
+- Web tools now use bounded asynchronous downloads and isolated extraction
+  workers, preserving concurrent calls without parsing or laying out HTML in
+  interactive Emacs. A shared FIFO queue, response size limits, cancellation,
+  and deadlines cover searches, page fetches, and YouTube transcripts. Empty
+  JavaScript pages suggest available browser tools, preferably delegated to a
+  sub-agent that returns only relevant content and source URLs.
+
+- Discussion reporting instructions now exclude notices about asking or waiting
+  for user input, permission, tool approval or file review. These interactions
+  use the child's local controls and echo-area notices without requesting an
+  extra parent turn.
+
+- Failed or cancelled request preparation no longer leaves discussion-enabled
+  chats blocked from sending. Closing the last active discussion selected by a
+  pending wait now releases the wait, and a busy parent chat points to ~gptel-abort~
+  for recovery instead of the child-only steering command.
+
+- Tool continuations now retain the assistant's narration before a tool call,
+  including with streaming and immediate nonblocking acknowledgements. This
+  repairs missing text in OpenAI, Responses and Anthropic request histories
+  that could cause the model to repeat itself after calling a tool.
+
+- Session saves now stage immutable chat versions and atomically publish a
+  complete family manifest. Interrupted batches retain the previous complete
+  checkpoint; new children join before publication, unchanged versions are
+  reused, and missing members never trigger partial restore or automatic
+  respawning. Existing flat archives migrate on their next family save.
+
+- Session autosaving now stops its timer when the save queue is empty, avoids
+  dirtying unchanged parents on child status events or empty inbox reads, and
+  ignores unchanged setting assignments. Failed writes respect the save
+  interval before retrying automatically.
+
+- ~gptel-agent-sessions~ lists saved discussion families with chat counts,
+  open buffers and save times. ~RET~ restores, ~d~ deletes a whole family
+  after confirmation, and ~g~ refreshes. Deleting snapshots keeps live chats
+  usable and excludes them and new descendants from autosaving. Use
+  ~C-u M-x gptel-agent-session-save~ in a chat to save its family again.
+
+- Opt-in ~gptel-agent-session-mode~ saves ordinary chats and their discussion
+  relationships across Emacs restarts. ~gptel-agent-session-restore~ reopens a
+  chosen family with transcripts, drafts, queued messages, supported settings
+  and stable IDs; existing live buffers are reused. Restored delivery is paused,
+  and temporary Agent workers or request callbacks are never replayed.
+  Autosaving uses one dirty queue, bounded idle batches and an atomic file per
+  chat, with a 30-second minimum interval per chat. ~gptel-agent-session-save~,
+  buffer killing and normal shutdown save immediately. Private local storage
+  is protected by a single writer lock.
+
+- Invalid ~Glob~ and ~Grep~ arguments now return recoverable tool errors
+  instead of terminating sub-agents. Their request-local schemas include the
+  configured ~max_results~ and ~max_entries~ upper bounds.
+
+- File tools now request ordinary tool approval for each operation outside the
+  current project boundary, without changing the chat's working directory.
+  Approval precedes instruction discovery and file review hooks and does not
+  authorize later calls. The agent-controlled directory-changing tool is removed.
+
+- Skills with ~disable-model-invocation: true~ are hidden from automatic
+  discovery. In ~gptel-mode~, slash completion replaces ~gptel-agent-use-skill~.
+  Accepting ~/skill~ inserts a plain Skill tool request displayed as ~/skill~;
+  gptel sends the underlying text without a send-time expansion. The model uses
+  the existing ~Skill~ tool for instructions and ~allowed-tools~, just as for
+  other skills.
+
+- ~Discussion~ accepts an optional ~model~ in gptel's ~Backend:model~ format.
+  The tool advertises configured backend/model pairs and applies the selection
+  after the preset and its hooks, overriding both backend and model. Omission
+  preserves preset/inherited settings; unknown choices fail before creating
+  a chat or worktree. Status results now include the backend and model.
+  Sub-agent model configuration is unchanged.
+
+- ~Glob~ and ~Grep~ now use asynchronous subprocesses with request-owned
+  cancellation, a shared traversal/search deadline, and global entry, match,
+  metadata and output limits. Grep advertises its native rg / grep -E / Emacs
+  regexp dialect before use, and refreshes it only between model requests.
+  Traversal prefers Python 3 and falls back to isolated batch Emacs. Glob keeps
+  its basename matching, hidden/dependency entries, symlink handling and sorted
+  output. Limited searches explicitly report incomplete coverage. Both tools
+  accept ~max_results~ and ~max_entries~; Grep also accepts ~depth~. Local paths
+  are required; blocking remote traversal is no longer attempted.
+
+- ~DiscussionControl cleanup~ removes a finished discussion's generated
+  worktree, keeping its transcript and branch. Optional ~delete_branch: true~
+  also attempts safe Git branch deletion. Cleanup refuses unfinished work and
+  never forces Git removal; status reports retain metadata and cleanup state,
+  including when branch deletion must be retried after integration.
+
+- ~Discussion~ accepts ~worktree: true~ to create a randomly named Git
+  worktree and branch from the selected ~directory~, or the caller's directory.
+  The child starts at the new worktree root. Creation and status results
+  include the path, branch, source repository/directory and starting commit.
+  Worktrees start at the source's committed HEAD and remain after closing.
+
+- The bundled ~executor~ agent has been removed. The default agent now
+  handles implementation and verification directly, with ~researcher~ and
+  ~result-explorer~ available for delegated investigation.
+
+- File review now offers ~A~ to ask about a proposal in an independent gptel
+  aside, from the queue or either Ediff pane. It inherits conversation context
+  and settings, includes the displayed revision and selected lines, and keeps
+  questions and answers out of the original chat. Asking leaves the review
+  decision unchanged. Follow-ups use ~C-c RET~; ~C-c C-r~ returns to Ediff.
+
+- All gptel conversations now discover scoped ~AGENTS.md~ instructions, with private
+  per-conversation registries and replaceable per-call instruction blocks.
+  File mutations defer when their scope or instruction versions require a new
+  model decision. ~gptel-agent-toggle-project-instructions~ controls the local
+  preference; ~gptel-agent-describe-project-instructions~ shows discovered and
+  delivered instructions. ~gptel-agent-use-project-instructions~ controls the
+  global default regardless of preset, with per-buffer overrides.
+
+- ~AskUserQuestion~ now queues questions with ~action: "add"~ (the default)
+  and returns immediately. Repeated calls extend one live question buffer,
+  preserving saved answers. Before waiting, the agent can revise questions
+  by number with ~action: "update"~. Each changed question returns to
+  unanswered and requires a fresh response. ~action: "wait"~ pauses the turn and
+  collects all answers or cancellation. Users can save answers while the agent
+  works and submit when it waits. ~gptel-agent-questions~ reopens the queue.
+  If the model tries to finish with an uncollected batch, the runtime keeps the
+  turn open and waits automatically, then resumes with the submitted answers
+  or cancellation. Pending questions are no longer discarded on early completion.
+  Question windows now open below their owning conversation, leaving unrelated
+  windows alone. ~gptel-agent-questions-display~ can instead use ~same-window~
+  to temporarily replace that conversation. Hidden conversations keep their
+  questions queued until explicitly opened.
+
+- ~Discussion~ creates independent, editable gptel conversations that survive
+  their parent's turn. ~DiscussionControl~ monitors, steers, follows up, waits,
+  answers questions and closes discussions. Tool approvals stay in the child
+  buffer for the user to approve or reject; an echo-area notice identifies it.
+  Replies and attention alerts stay in the child. The child uses
+  ~DiscussionReport~ to send a chosen answer or useful update; only explicit
+  reports wake idle parents or arrive at safe request boundaries. Parents can
+  request reports with ~send~ or inspect work with ~read~. Unsent drafts defer
+  automatic sending. ~gptel-agent-discussions~
+  opens the conversation list; users can interact directly in each child chat.
+
+- ~Agent~ accepts ~background: true~ for immediate launch acknowledgements.
+  ~AgentControl~ lists, inspects, waits for, steers and cancels owned workers.
+  Completion reports arrive at safe request boundaries. A request-local gate
+  keeps parent turns open until all descendants finish and their outcomes are
+  delivered, including when a model attempts an early final answer. Blocking
+  calls and retained-conversation follow-ups remain supported.
+
+- Oversized ~Bash~ output is now saved in full and returned as a bounded
+  preview with an exact extraction query.  A new ~result-explorer~ agent
+  can analyze only that registered result file through harness-scoped
+  read/search tools and returns line-cited evidence for parent verification.
+
+- Sub-agent time and model-round budgets are now configurable per agent with
+  the ~task-timeout~ and ~max-request-rounds~ Markdown frontmatter or Org
+  property keys.  Omitted limits inherit the corresponding global fallback
+  options, which now default to nil.  The built-in researcher allows 3600
+  seconds and 100 rounds, and result-explorer allows 1800 seconds and 60 rounds.
+  The default web-tool budget is 50 calls per sub-agent run.
 
 - gptel-agent now works over TRAMP.  This means it can run processes on
   remote servers, grep and edit files and so on without the need to
@@ -51,6 +277,53 @@
   compaction might change in the future.
 
 ** Notable bug fixes
+
+- ~Process~ returns invalid read/wait arguments and other operation errors to
+  the model instead of aborting the request with a misleading HTTP 200 error.
+  Tail-view guidance now explicitly says to omit ~offset~, including zero.
+
+- Loading a skill preserves globally configured conversation tools across
+  turns. Discussions inherit the parent's full active tool list, including
+  tools activated by skills, without inheriting skill pre-approvals. An explicit
+  preset can override the child's tools; ~DiscussionReport~ remains available.
+
+- Discussion approval cleanup now supports gptel versions without the private
+  overlay cleanup helper, preventing failed approvals from stranding worker
+  tools. Worker ~TodoWrite~ calls use their own request and diagnostic buffer;
+  completing a chat's todo list also clears its active-task header immediately.
+
+- ~WebFetch~ now handles textual responses according to their content
+  type instead of sending JSON, source files and plain text through the
+  HTML readability parser.  HTML extraction falls back to a full-page
+  render or the decoded response body, HTTP failures include status and
+  response excerpts, and oversized output is bounded with an explicit
+  truncation notice.  Requests remain noninteractive, and YouTube URLs
+  are routed through the same tool to return descriptions and transcripts.
+
+- Restored ~gptel-agent-preset~ application for sub-agent requests.  The
+  option is read from the owning parent buffer and applied independently
+  before per-agent settings, preserving named-preset parents,
+  composition forms and pre/post hooks.  Unknown named presets now
+  report an error instead of being silently ignored.
+
+- Sub-agents now receive an explicit completion contract: negative and
+  inconclusive findings are valid outcomes and must include attempts,
+  limitations and confidence.  A repeated/cyclic call is blocked once
+  to allow a strategy change; continued looping or an exhausted web
+  budget now closes exploration and gives the same sub-agent a tool-free
+  finalization turn.  The sub-agent retains its full transcript and must
+  interpret the evidence and return its own final answer; raw tool output
+  is not substituted for an agent response.
+
+- The built-in researcher now prefers the current workspace for codebase
+  tasks, treats sufficient successful results as a stop signal, and uses
+  GitHub repository metadata instead of guessing branch names.
+
+- ~WebSearch~ now defaults to 10 results, supports a configurable bound
+  with ~gptel-agent-web-search-default-count~ and
+  ~gptel-agent-web-search-max-count~, and returns query/count/coverage
+  metadata.  Its instructions discourage identical retries and direct
+  agents to fetch URLs derived from structured identifiers directly.
 
 # Local Variables:
 # fill-column: 72

@@ -1,0 +1,72 @@
+;;; gptel-agent-compat-test.el --- Upstream API regressions -*- lexical-binding: t; -*-
+
+(require 'gptel-agent-workers-test)
+
+(ert-deftest gptel-agent-compat-plain-markdown-keeps-system-prompt ()
+  (let ((file (make-temp-file "agent-plain-prompt-" nil ".md" "Follow the task.\n")))
+    (unwind-protect
+        (should (equal (gptel-agent-parse-markdown-frontmatter file)
+                       '(:system "Follow the task.\n")))
+      (delete-file file))))
+
+(ert-deftest gptel-agent-compat-compaction-extra-preserves-directive-template ()
+  (dolist (prompt '("Summarize"
+                    ("Summarize" "Example user" "Example answer")
+                    (lambda () '("Summarize" "Example user" "Example answer"))))
+    (with-temp-buffer
+      (insert "Conversation to compact")
+      (let ((gptel-backend (gptel-make-openai "compact-test" :key "unused" :host "example.invalid"
+                                            :models '(test)))
+            (gptel-model 'test)
+            (gptel-use-curl t)
+            (gptel-use-context nil)
+            (gptel-agent-compact-prompt prompt)
+            request)
+        (cl-letf (((symbol-function 'gptel--update-status) #'ignore)
+                  ((symbol-function 'gptel-curl-get-response)
+                   (lambda (fsm) (setq request fsm))))
+          (gptel-agent-compact "Keep the unresolved TODOs"))
+        (let ((messages (append (plist-get (plist-get (gptel-fsm-info request) :data)
+                                         :messages) nil)))
+          (should (equal (plist-get (car messages) :content)
+                         "Summarize\n\nAdditional instructions:\n\nKeep the unresolved TODOs"))
+          (unless (stringp prompt)
+            (should (equal (mapcar (lambda (message) (plist-get message :content))
+                                  (seq-take (cdr messages) 2))
+                           '("Example user" "Example answer")))))))))
+
+(ert-deftest gptel-agent-compat-rejected-worker-tool-continues-with-steering ()
+  (dolist (backend (list (gptel-make-openai "steer-openai" :key "unused" :host "example.invalid" :models '(test))
+                         (gptel-make-openai-responses "steer-responses" :key "unused" :models '(test))
+                         (gptel-make-anthropic "steer-anthropic" :key "unused" :models '(test))
+                         (gptel-make-gemini "steer-gemini" :key "unused" :models '(test))))
+    (let ((gptel-agent-workers-test--backend backend))
+      (gptel-agent-workers-test--with-chat
+        (let* ((run (gptel-agent-workers-test--launch fsm "test-worker"))
+               (child (gptel-agent--run-fsm run))
+               (info (gptel-fsm-info child))
+               pending)
+          (with-current-buffer (gptel-agent--run-child-buffer run)
+            (setq-local gptel-confirm-tool-calls t))
+          (cl-letf (((symbol-function 'gptel--display-tool-calls)
+                     (lambda (calls _info) (setq pending calls))))
+            (gptel-agent-workers-test--tool child "WorkerTestTool" nil))
+          (should pending)
+          (let ((count (length requests)))
+            (with-current-buffer parent
+              (cl-letf (((symbol-function 'read-string)
+                         (lambda (&rest _) "Use the evidence already available")))
+                (gptel--steer-tool-calls pending nil info)))
+            (should (= (length requests) (1+ count))))
+          (should (eq (gptel-fsm-state child) 'WAIT))
+          (should-not tool-callback)
+          (should-not (plist-get info :steering-message))
+          (let ((data (gptel-agent-workers-test--data child)))
+            (should (< (string-match "Tool call rejected by user" data)
+                       (string-match "Use the evidence already available" data))))
+          (gptel-agent-workers-test--answer child "Final report")
+          (should (eq (gptel-agent--run-state run) 'completed))
+          (should (equal (gptel-agent--run-response run) "Final report")))))))
+
+(provide 'gptel-agent-compat-test)
+;;; gptel-agent-compat-test.el ends here
