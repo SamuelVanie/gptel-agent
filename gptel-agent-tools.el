@@ -98,10 +98,11 @@ Only directories freshly created by this Emacs process are used.")
 (defun gptel-agent--tool-result-owner (&optional buffer)
   "Return BUFFER's live conversation owner, defaulting to this buffer."
   (with-current-buffer (or buffer (current-buffer))
-    (let ((owner (or gptel-agent--result-owner (gptel-agent--process-owner))))
-      (unless (buffer-live-p owner)
-        (error "The saved-result owning conversation is unavailable"))
-      owner)))
+    ;; A detached discussion and its workers can outlive the manager that
+    ;; shared its results.  New results then belong to the surviving chat.
+    (if (buffer-live-p gptel-agent--result-owner)
+        gptel-agent--result-owner
+      (gptel-agent--process-owner))))
 
 (defun gptel-agent--release-result-pin ()
   "Release this buffer's active explorer reference."
@@ -293,6 +294,7 @@ A local nil requests discovery in this buffer's working directory.")
 
 (defvar-local gptel-agent--supervised-run nil
   "The `gptel-agent--run' owned by this sub-agent buffer.")
+(put 'gptel-agent--supervised-run 'permanent-local t)
 
 (defvar-local gptel-agent--child-chat-p nil
   "Non-nil in a generated worker, discussion or review aside.
@@ -2570,8 +2572,11 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
 
 (defun gptel-agent--workers-kill-buffer ()
   "Stop parked as well as requesting worker trees when their chat is closed."
-  (dolist (gate (copy-sequence gptel-agent--worker-requests))
-    (gptel-agent--workers-stop gate)))
+  ;; Leave buffer destruction to the owner's close hook.  Disposing of a
+  ;; cancelled run here would ask its kill queries during the parent's kill.
+  (let ((gptel-agent-keep-failed-run-buffers t))
+    (dolist (gate (copy-sequence gptel-agent--worker-requests))
+      (gptel-agent--workers-stop gate))))
 (put 'gptel-agent--workers-kill-buffer 'permanent-local-hook t)
 
 (defun gptel-agent--workers-schedule (gate)
@@ -2710,6 +2715,7 @@ steers current work without creating a run or resetting supervision budgets."
         (y-or-n-p
          (format "Sub-agent %s is still running; kill its buffer and cancel the task? "
                  (gptel-agent--run-agent run))))))
+(put 'gptel-agent--confirm-child-buffer-kill 'permanent-local-hook t)
 
 (defun gptel-agent--handle-child-buffer-kill ()
   "Cancel the active sub-agent owned by the current buffer before it is killed."
@@ -2731,25 +2737,34 @@ steers current work without creating a run or resetting supervision budgets."
         (setq gptel-agent--sessions
               (rassq-delete-all (gptel-agent--run-session run)
                                gptel-agent--sessions))))))
+(put 'gptel-agent--handle-child-buffer-kill 'permanent-local-hook t)
 
 (defun gptel-agent--close-sessions ()
   "Cancel and close all sub-agent conversations owned by this buffer."
   (gptel-agent--workers-kill-buffer)
-  (let ((sessions gptel-agent--sessions))
-    (setq gptel-agent--sessions nil)
-    (dolist (entry sessions)
-      (let* ((run (gptel-agent--session-run (cdr entry)))
-             (child (gptel-agent--run-child-buffer run))
-             ;; The parent is already being killed.  Never ask separately
-             ;; about its children, or deliver into its dying request.
-             (gptel-agent-keep-failed-run-buffers t))
+  (let ((owner (current-buffer))
+        (gptel-agent-keep-failed-run-buffers t)
+        (runs (mapcar (lambda (entry) (gptel-agent--session-run (cdr entry)))
+                      gptel-agent--sessions)))
+    ;; A later kill hook can signal after a worker unregisters its session,
+    ;; leaving the buffer alive.  Its run still identifies the exact owner.
+    (dolist (child (buffer-list))
+      (when-let* ((run (buffer-local-value 'gptel-agent--supervised-run child))
+                  ((gptel-agent--run-p run))
+                  ((eq child (gptel-agent--run-child-buffer run)))
+                  ((eq owner (gptel-agent--run-parent-buffer run))))
+        (cl-pushnew run runs)))
+    (dolist (run runs)
+      (when (eq owner (gptel-agent--run-parent-buffer run))
         (gptel-agent--run-finish
          run 'cancelled "Error: Parent chat buffer was closed." 'parent-killed t)
-        (when (buffer-live-p child)
+        (when-let* ((child (gptel-agent--run-child-buffer run))
+                    ((buffer-live-p child)))
           (with-current-buffer child
             (let ((kill-buffer-query-functions nil))
               (set-buffer-modified-p nil)
-              (kill-buffer child))))))))
+              (kill-buffer child))))))
+    (setq gptel-agent--sessions nil)))
 (put 'gptel-agent--close-sessions 'permanent-local-hook t)
 
 (defun gptel-agent--run-inspect-button (run)
@@ -3803,7 +3818,8 @@ category names after preset hooks.  They apply only to new conversations."
         (with-current-buffer parent-buffer
           (setf (alist-get (gptel-agent--session-id session)
                            gptel-agent--sessions nil nil #'equal) session)
-          (add-hook 'kill-buffer-hook #'gptel-agent--close-sessions nil t))
+          ;; Close workers before discussion or host hooks abort the request.
+          (add-hook 'kill-buffer-hook #'gptel-agent--close-sessions -80 t))
         (with-current-buffer child-buffer
           (setq-local gptel-agent--supervised-run run
                       gptel-agent--child-chat-p t)

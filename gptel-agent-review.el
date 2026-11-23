@@ -76,7 +76,10 @@ Changing this setting affects new review queues only."
     (cancel-timer gptel-agent-review--delivery-timer))
   (when (and gptel-agent-review--queue
              (eq (current-buffer) (gptel-agent-review--queue-owner gptel-agent-review--queue)))
-    (gptel-agent-review--close gptel-agent-review--queue)))
+    ;; Ediff restores a window configuration.  Later kill hooks must still
+    ;; see the conversation whose buffer Emacs is killing.
+    (save-current-buffer
+      (gptel-agent-review--close gptel-agent-review--queue))))
 
 (defun gptel-agent-review--close (queue)
   "Close QUEUE and its Ediff view without writing files."
