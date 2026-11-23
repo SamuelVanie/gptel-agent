@@ -52,18 +52,23 @@
 
 (ert-deftest gptel-agent-project-preset-header-selects-current-project ()
   (gptel-agent-project-preset-test--with-projects
-    (let ((chat-name (generate-new-buffer-name "*gptel-agent:Alpha*"))
-          (gptel-use-header-line t))
+    (let ((gptel-display-buffer-action '(display-buffer-same-window))
+          (gptel-use-header-line t)
+          chat)
       (save-window-excursion
         (unwind-protect
             (progn
               (gptel-agent alpha)
+              (setq chat (window-buffer))
+              (should (equal (buffer-name chat)
+                             (format "*gptel-agent:%s Alpha*"
+                                     (gptel-agent-discussion-test--family-tag chat))))
               (gptel-agent-project-preset-test--refresh bravo)
-              (with-current-buffer chat-name
+              (with-current-buffer chat
                 (gptel-agent-startup-header-test--click-selector header-line-format)
                 (gptel-request "Plan this change")
                 (should (equal (pop requests) '("Alpha gptel-plan" 111)))))
-          (when (get-buffer chat-name) (kill-buffer chat-name)))))))
+          (when (buffer-live-p chat) (kill-buffer chat)))))))
 
 (ert-deftest gptel-agent-project-preset-menu-and-inline-select-current-project ()
   (gptel-agent-project-preset-test--with-projects

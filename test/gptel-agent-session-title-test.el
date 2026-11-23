@@ -54,6 +54,10 @@
   "Complete captured REQUEST with RESPONSE."
   (funcall (plist-get (plist-get request :args) :callback) response nil))
 
+(defun gptel-agent-session-title-test--name (title)
+  "Return the expected generated name for TITLE in this chat's family."
+  (format "*gptel:%s %s*" (gptel-agent-discussion-test--family-tag (current-buffer)) title))
+
 (ert-deftest gptel-agent-session-title-first-save-uses-one-message-and-never-retitles ()
   (gptel-agent-session-title-test--with-request
     (gptel-agent-session-save)
@@ -67,7 +71,8 @@
     (should (= 1 (length requests)))
     (gptel-agent-session-title-test--reply (car requests) "\"Session\n naming explained\"")
     (should (equal "Session naming explained" gptel-agent-session--title))
-    (should (equal "*gptel:Session naming explained*" (buffer-name)))
+    (should (equal (gptel-agent-session-title-test--name "Session naming explained")
+                   (buffer-name)))
     (should (gethash buffer gptel-agent-session--dirty))
     (should-not (buffer-live-p (plist-get (car requests) :buffer)))
     (should-not gptel-agent-session--title-request)
@@ -76,7 +81,8 @@
     (should (= 1 (length requests)))
     (should (equal "Session naming explained"
                    (plist-get (gptel-agent-session--read gptel-agent-session--id) :name)))
-    (should (equal "*gptel:Session naming explained*" (buffer-name)))))
+    (should (equal (gptel-agent-session-title-test--name "Session naming explained")
+                   (buffer-name)))))
 
 (ert-deftest gptel-agent-session-title-first-save-uses-first-and-last-messages ()
   (gptel-agent-session-title-test--with-request
@@ -122,7 +128,9 @@
     (gptel-agent-session-save)
     (should (= 1 (length requests)))
     (gptel-agent-session-title-test--reply (car requests) "Readable session titles")
-    (let ((id gptel-agent-session--id))
+    (let ((id gptel-agent-session--id)
+          (name (gptel-agent-session-title-test--name "Readable session titles")))
+      (should (equal name (buffer-name)))
       (gptel-agent-session-save)
       (should (equal "Readable session titles" (plist-get (gptel-agent-session--read id) :name)))
       (should (equal "Readable session titles" (plist-get (car (gptel-agent-session--catalog)) :name)))
@@ -130,7 +138,7 @@
       (gptel-agent-session-test--forget buffer)
       (with-current-buffer (gptel-agent-session-restore id)
         (should (equal "Readable session titles" gptel-agent-session--title))
-        (should (equal "*gptel:Readable session titles*" (buffer-name)))
+        (should (equal name (buffer-name)))
         (org-mode)
         (should (equal "Readable session titles" gptel-agent-session--title))
         (gptel-mode 1)
@@ -138,6 +146,29 @@
         (insert "More messages after restoring")
         (gptel-agent-session-save))
       (should (= 1 (length requests))))))
+
+(ert-deftest gptel-agent-session-title-standalone-copies-and-host-restores ()
+  (gptel-agent-session-title-test--with-request
+    (gptel-agent-session-save)
+    (gptel-agent-session-title-test--reply (car requests) "Shared title")
+    (let* ((tag (gptel-agent-discussion-test--family-tag buffer))
+           (record (gptel-agent-session-buffer-record buffer))
+           (new-chat (gptel-agent-session-buffer-from-record record))
+           (host-chat (gptel-agent-session-buffer-from-record record t)))
+      (should-not (equal tag (gptel-agent-discussion-test--family-tag new-chat)))
+      (should (equal tag (gptel-agent-discussion-test--family-tag host-chat)))
+      (should (buffer-local-value 'gptel-agent-session-managed-externally host-chat))
+      (should-not (buffer-local-value 'gptel-agent-session--id host-chat)))))
+
+(ert-deftest gptel-agent-session-title-clone-has-an-independent-visible-id ()
+  (gptel-agent-session-title-test--with-request
+    (gptel-agent-session-save)
+    (gptel-agent-session-title-test--reply (car requests) "Original session")
+    (let* ((original-name (buffer-name))
+           (tag (gptel-agent-discussion-test--family-tag buffer))
+           (clone (clone-buffer)))
+      (should-not (equal tag (gptel-agent-discussion-test--family-tag clone)))
+      (should (equal original-name (buffer-name buffer))))))
 
 (ert-deftest gptel-agent-session-title-ignores-stale-and-reasoning-results ()
   (gptel-agent-session-title-test--with-request
@@ -183,7 +214,8 @@
           (should (equal "Customized chat instructions" gptel-system-prompt))
           (should (= 0.7 gptel-temperature))
           (should (equal "Preset and title coexist" gptel-agent-session--title))
-          (should (equal "*gptel:Preset and title coexist*" (buffer-name)))
+          (should (equal (gptel-agent-session-title-test--name "Preset and title coexist")
+                         (buffer-name)))
           (goto-char (point-max))
           (insert "A later message")
           (gptel-agent-session-save)))
@@ -345,12 +377,15 @@
 
 (ert-deftest gptel-agent-session-title-buffer-name-collisions-keep-both-chats ()
   (gptel-agent-session-title-test--with-request
-    (let ((other (generate-new-buffer "*gptel:Shared title*")))
-      (gptel-agent-session-save)
+    (gptel-agent-session-save)
+    (gptel-agent-session-title-test--reply (car requests) "Initial title")
+    (let* ((name (gptel-agent-session-title-test--name "Shared title"))
+           (other (generate-new-buffer name)))
+      (gptel-agent-session-generate-title)
       (gptel-agent-session-title-test--reply (car requests) "Shared title")
       (should (buffer-live-p other))
-      (should (equal "*gptel:Shared title*" (buffer-name other)))
-      (should (string-prefix-p "*gptel:Shared title*" (buffer-name)))
+      (should (equal name (buffer-name other)))
+      (should (string-prefix-p name (buffer-name)))
       (should-not (equal (buffer-name other) (buffer-name)))
       (should (equal "Shared title" gptel-agent-session--title)))))
 

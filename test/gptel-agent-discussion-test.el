@@ -77,6 +77,32 @@
   "Return BUFFER's visible transcript."
   (with-current-buffer buffer (buffer-substring-no-properties (point-min) (point-max))))
 
+(defun gptel-agent-discussion-test--family-tag (buffer)
+  "Return the shared ID in brackets, which must occur once in BUFFER's name."
+  (let ((name (buffer-name buffer))
+        (case-fold-search nil)
+        (regexp (rx "[" (= 8 (any "0-9a-f")) "]")))
+    (should (string-match regexp name))
+    (let ((tag (match-string 0 name)))
+      (should-not (string-match-p regexp name (match-end 0)))
+      tag)))
+
+(ert-deftest gptel-agent-discussion-same-titles-follow-the-owning-chat ()
+  (gptel-agent-discussion-test--with-chat
+    (let ((owner parent) (owner-fsm fsm))
+      (gptel-agent-discussion-test--with-chat
+        (gptel-agent-discussion-test--spawn fsm parent)
+        ;; A request callback may run while a different main chat is current.
+        (with-current-buffer parent
+          (let* ((first (gptel-agent-discussion-test--spawn owner-fsm owner))
+                 (second (gptel-agent-discussion-test--spawn owner-fsm owner))
+                 (tag (gptel-agent-discussion-test--family-tag owner))
+                 (name (format "*gptel:%s Independent chat*" tag)))
+            (should-not (equal tag (gptel-agent-discussion-test--family-tag parent)))
+            (should (equal name (buffer-name (gptel-agent-discussion--chat-buffer first))))
+            (should (equal (concat name "<2>")
+                           (buffer-name (gptel-agent-discussion--chat-buffer second))))))))))
+
 (ert-deftest gptel-agent-discussion-startup-failure-releases-owner ()
   (dolist (entrypoint '(send request))
     (dolist (failure '(error quit))
@@ -1519,9 +1545,14 @@ CLOSE-FIRST closes monitoring while the editable transcript is still live."
              (gptel-agent-workers-test--tool
               child-fsm "Agent" '(:subagent_type "researcher" :description "Research"
                                               :prompt "Find evidence" :background t))
-             (let ((run (car (hash-table-values gptel-agent--runs))))
+             (let* ((run (car (hash-table-values gptel-agent--runs)))
+                    (worker (gptel-agent--run-child-buffer run))
+                    (tag (gptel-agent-discussion-test--family-tag parent)))
                (should (eq (gptel-agent--run-parent-buffer run) child))
                (should (eq (gptel-agent--run-parent-fsm run) child-fsm))
+               (should (equal tag (gptel-agent-discussion-test--family-tag child)))
+               (should (equal (buffer-name worker)
+                              (format " *gptel-agent-run:%s researcher*" tag)))
                (should-not (gptel-agent--workers-active (gptel-agent--workers-for fsm)))
                (when (zerop turn) (gptel-abort parent))
                (should (gptel-agent--run-active-p run))
@@ -1530,6 +1561,9 @@ CLOSE-FIRST closes monitoring while the editable transcript is still live."
                (should (eq (gptel-fsm-state child-fsm) 'AGWT))
                (gptel-agent-workers-test--answer
                 (gptel-agent--run-fsm run) "CHILD-OWNED-EVIDENCE")
+               (should (equal (buffer-name worker)
+                              (format "*gptel-agent-run:%s %s:completed*"
+                                      tag (gptel-agent--run-id run))))
                (gptel-agent-workers-test--wake child-fsm)
                (should (eq (gptel-fsm-state child-fsm) 'WAIT))
                (should (string-match-p "CHILD-OWNED-EVIDENCE"

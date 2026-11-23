@@ -126,6 +126,37 @@
                        (plist-put (copy-sequence record) (car entry) (cdr entry)))))
       (should-not gptel-agent-session-mode))))
 
+(ert-deftest gptel-agent-session-legacy-nested-restore-shares-one-visible-id ()
+  (gptel-agent-session-test--with-store
+    (let ((root (make-string 64 ?a))
+          (middle (make-string 64 ?b))
+          (leaf (make-string 64 ?c))
+          (backend (gptel-make-openai "legacy-family" :key "unused" :models '(test))))
+      ;; Seed the v1 records used before buffer names carried family IDs.
+      (dolist (entry (list (list root nil "Project")
+                           (list middle root "Review")
+                           (list leaf middle "Research")))
+        (pcase-let ((`(,key ,owner ,title) entry))
+          (gptel-agent-session--write-record
+           (list :version 1 :id key :parent owner :title title :name title
+                 :buffer-name (format "*gptel:%s*" title)
+                 :directory default-directory :mode 'text-mode :point 1 :updated 0
+                 :text "" :backend (gptel-backend-name backend)
+                 :discussion (and owner (list :id title :title title :state 'idle :turn 1)))
+           (expand-file-name (concat key ".eld") gptel-agent-session-directory))))
+      ;; Restore from a leaf while the pre-upgrade parent is still open.
+      (let ((parent (gptel-agent-session-test--buffer "*gptel:Project*" "Unsaved live draft")))
+        (with-current-buffer parent (setq-local gptel-agent-session--id root))
+        (gptel-agent-session-mode 1)
+        (should (eq parent (gptel-agent-session-restore leaf)))
+        (should (equal "Unsaved live draft" (with-current-buffer parent (buffer-string))))
+        (let ((tag (gptel-agent-discussion-test--family-tag parent)))
+          (should (equal (buffer-name parent) (format "*gptel:%s Project*" tag)))
+          (should (equal (buffer-name (gethash middle gptel-agent-session--buffers))
+                         (format "*gptel:%s Review*" tag)))
+          (should (equal (buffer-name (gethash leaf gptel-agent-session--buffers))
+                         (format "*gptel:%s Research*" tag))))))))
+
 (ert-deftest gptel-agent-session-roundtrip-nested-discussions-and-followup ()
   (gptel-agent-session-test--with-store
     (gptel-agent-discussion-test--with-chat
@@ -141,8 +172,11 @@
                 (car (buffer-local-value 'gptel-agent-discussion--children child))))
              (grandchild (gptel-agent-discussion--chat-buffer grandchat))
              (id (buffer-local-value 'gptel-agent-session--id parent))
+             (tag (gptel-agent-discussion-test--family-tag parent))
              (discussion-id (gptel-agent-discussion--chat-id chat))
              (grand-id (gptel-agent-discussion--chat-id grandchat)))
+        (should (equal (buffer-name child) (format "*gptel:%s Independent chat*" tag)))
+        (should (equal tag (gptel-agent-discussion-test--family-tag grandchild)))
         (gptel-agent-workers-test--answer fsm "Parent answer")
         (gptel-agent-workers-test--answer child-fsm "Child answer")
         (gptel-agent-workers-test--answer
@@ -156,6 +190,8 @@
               child (gptel-agent-discussion--chat-buffer chat)
               grandchat (car (buffer-local-value 'gptel-agent-discussion--children child))
               grandchild (gptel-agent-discussion--chat-buffer grandchat))
+        (dolist (buffer (list parent child grandchild))
+          (should (equal tag (gptel-agent-discussion-test--family-tag buffer))))
         (should (equal discussion-id (gptel-agent-discussion--chat-id chat)))
         (should (equal grand-id (gptel-agent-discussion--chat-id grandchat)))
         (should (eq (gptel-agent-discussion--chat-owner chat) parent))

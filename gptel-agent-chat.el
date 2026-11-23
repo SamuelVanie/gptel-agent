@@ -91,6 +91,18 @@ Keep this value when reloading the module, just like the counter.")
                             tool))
                         gptel-tools))))
 
+(defun gptel-agent-chat--clone-family ()
+  "Give an independent clone its own family, preserving an explicit new name."
+  (when gptel-agent--family-id
+    (if (string-match-p (concat gptel-agent--chat-name-prefix
+                                (regexp-quote (concat "[" gptel-agent--family-id "] ")))
+                        (buffer-name))
+        (gptel-agent--show-family-id (gptel-agent--new-family-id))
+      (setq gptel-agent--family-id nil))))
+
+;; Renaming can notify session observers.  Detach the clone's ownership first.
+(add-hook 'clone-buffer-hook #'gptel-agent-chat--clone-family 80)
+
 (defun gptel-agent-chat--main-p (buffer)
   "Whether BUFFER is a live top-level gptel chat, never a generated child."
   (and (buffer-live-p buffer)

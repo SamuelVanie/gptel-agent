@@ -283,9 +283,11 @@ there is only one sent message, that message alone is used, even while its
 response is pending. Unsent drafts, tool output and reasoning are excluded.
 Saving a draft before sending anything never generates a title. The title
 appears in the session browser and restore picker and renames the current
-buffer to =*gptel:TITLE*=, matching spawned
-discussions. The title and buffer name survive restarting Emacs. Until a title
-is available, the session uses its existing buffer name.
+buffer to =*gptel:[ID] TITLE*=. The same eight-character ID appears in
+the main chat, its managed discussions, and its subagent buffer names,
+including nested chats. For example, =*gptel:[a1b2c3d4] Review*= and
+=*gptel-agent-run:[a1b2c3d4] agent-2:completed*= belong to the same
+family. Restoring a saved family preserves its ID.
 
 Title generation runs as a separate, non-streaming request using the chat's
 backend and model by default. Configure =gptel-agent-session-title-preset= just

@@ -302,6 +302,53 @@ Keep this origin even after closing monitoring or changing major modes, so
 the buffer cannot become a main-chat messaging endpoint.")
 (put 'gptel-agent--child-chat-p 'permanent-local t)
 
+(defvar-local gptel-agent--family-id nil
+  "Short display ID shared by a chat and its descendants.")
+(put 'gptel-agent--family-id 'permanent-local t)
+
+(defun gptel-agent--new-family-id ()
+  "Return a short identifier for display in related buffer names."
+  (format "%04x%04x" (random #x10000) (random #x10000)))
+
+(defun gptel-agent--family-id ()
+  "Return the current chat's display ID, allocating it on first use."
+  (or gptel-agent--family-id
+      (setq gptel-agent--family-id (gptel-agent--new-family-id))))
+
+(defconst gptel-agent--chat-name-prefix
+  (rx string-start (* " ") (? "*") (? (or "gptel:" "gptel-agent:" "gptel-agent-run:")))
+  "Part of a chat buffer name preceding its family tag.")
+
+(defun gptel-agent--family-name (name id &optional previous)
+  "Insert ID in NAME, replacing PREVIOUS's tag when present.
+Keep the role prefix, leading spaces of hidden buffers and Emacs suffixes."
+  (save-match-data
+    (string-match gptel-agent--chat-name-prefix name)
+    (let* ((prefix (match-end 0))
+           (label (substring name prefix)))
+      (concat (substring name 0 prefix) "[" id "] "
+              (if previous (string-remove-prefix (concat "[" previous "] ") label)
+                label)))))
+
+(defun gptel-agent--show-family-id (id)
+  "Set the current chat's family ID to ID and show it in the buffer name."
+  (let ((name (gptel-agent--family-name (buffer-name) id gptel-agent--family-id)))
+    (setq gptel-agent--family-id id)
+    (unless (equal name (buffer-name)) (rename-buffer name t))
+    id))
+
+(defun gptel-agent--new-chat-buffer (name &optional parent)
+  "Create a chat named NAME, sharing its visible family ID with PARENT."
+  (let* ((id (if parent
+                 (with-current-buffer parent
+                   (if (or gptel-mode gptel-agent--child-chat-p)
+                       (gptel-agent--show-family-id (gptel-agent--family-id))
+                     (gptel-agent--family-id)))
+               (gptel-agent--new-family-id)))
+         (buffer (generate-new-buffer (gptel-agent--family-name name id))))
+    (with-current-buffer buffer (setq gptel-agent--family-id id))
+    buffer))
+
 (defvar-local gptel-agent-session-managed-externally nil
   "Non-nil when a host owns this buffer's persistence.
 Hosts should set this before enabling `gptel-mode'.  Such buffers and
@@ -2910,8 +2957,9 @@ references after delivery or enqueueing, preserving the worker session."
              (buffer-live-p (gptel-agent--run-child-buffer run)))
         (with-current-buffer (gptel-agent--run-child-buffer run)
           (rename-buffer
-           (format "*gptel-agent-run:%s:%s*"
-                   (gptel-agent--run-id run) state)
+           (gptel-agent--family-name
+            (format "*gptel-agent-run:%s:%s*" (gptel-agent--run-id run) state)
+            (gptel-agent--family-id))
            t))
       (gptel-agent--task-cleanup-overlay (gptel-agent--run-overlay run))
       (when (buffer-live-p (gptel-agent--run-child-buffer run))
@@ -3786,8 +3834,8 @@ category names after preset hooks.  They apply only to new conversations."
              task-timeout max-request-rounds
              (child-buffer
               (if previous (gptel-agent--run-child-buffer previous)
-                (generate-new-buffer
-                 (format " *gptel-agent-run:%s*" agent-type))))
+                (gptel-agent--new-chat-buffer
+                 (format " *gptel-agent-run:%s*" agent-type) parent-buffer)))
              (preset (buffer-local-value 'gptel-agent-preset parent-buffer))
              (task-prompt
               (gptel-agent--prepare-task-prompt

@@ -1039,7 +1039,8 @@ EXTRA-TOOLS appends registered tool names or categories after the preset."
                         (gptel-agent-discussion--make-worktree directory)))
          (directory (or (plist-get worktree :path) directory))
          (id (gptel-agent-discussion--id "discussion")))
-    (let* ((buffer (generate-new-buffer (format "*gptel:%s*" (truncate-string-to-width title 70))))
+    (let* ((buffer (gptel-agent--new-chat-buffer
+                    (format "*gptel:%s*" (truncate-string-to-width title 70)) owner))
            (chat (gptel-agent-discussion--make-chat
                   :id id :title title :owner owner :buffer buffer :worktree worktree)))
       (condition-case err

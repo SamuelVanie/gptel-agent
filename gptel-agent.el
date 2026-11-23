@@ -1353,9 +1353,10 @@ this session, which defaults to the default `gptel-agent'."
          (cl-letf (((default-value 'gptel-mode-hook)
                     (cons #'gptel-agent--setup-header
                           (default-value 'gptel-mode-hook))))
-           (gptel (generate-new-buffer-name
-                   (format "*gptel-agent:%s*"
-                           (cadr (nreverse (file-name-split project-dir)))))
+           (gptel (buffer-name
+                   (gptel-agent--new-chat-buffer
+                    (format "*gptel-agent:%s*"
+                            (cadr (nreverse (file-name-split project-dir))))))
                   nil
                   (and (use-region-p)
                        (buffer-substring (region-beginning)

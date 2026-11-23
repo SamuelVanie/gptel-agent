@@ -48,8 +48,8 @@ A single large transcript can exceed this budget; it is written atomically."
   "Generate a short title when saving a chat with sent message history.
 Unsent drafts do not trigger generation or contribute to the title.
 Titles use `gptel-agent-session-title-preset' and also rename the chat
-buffer using the *gptel:TITLE* convention.  Once generated, a title is
-never automatically updated.  Set to nil to generate titles only on
+buffer using the *gptel:[FAMILY-ID] TITLE* convention.  Once generated,
+a title is never automatically updated.  Set to nil to generate titles only on
 demand with `gptel-agent-session-generate-title'."
   :type 'boolean :group 'gptel-agent)
 
@@ -255,7 +255,11 @@ Return (START ROLE TEXT), skipping tool, reasoning and ignored regions."
                                (gptel-agent-session--eligible-p source))
                       (setq gptel-agent-session--title
                             (truncate-string-to-width title 80 nil nil "…"))
-                      (rename-buffer (format "*gptel:%s*" gptel-agent-session--title) t)
+                      (rename-buffer
+                       (gptel-agent--family-name
+                        (format "*gptel:%s*" gptel-agent-session--title)
+                        (gptel-agent--family-id))
+                       t)
                       (gptel-agent-session--mark-dirty))
                   (setq gptel-agent-session--title-context-hash nil)
                   (unless (eq response 'abort)
@@ -511,6 +515,7 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
         (list :version 1 :id gptel-agent-session--id
               :parent gptel-agent-session--parent-id :name (gptel-agent-session--name)
               :title gptel-agent-session--title :buffer-name (buffer-name)
+              :family-id gptel-agent--family-id
               :sent-end (gptel-agent-session--history-end)
               :directory default-directory :source-file buffer-file-name
               :mode (cond ((derived-mode-p 'org-mode) 'org-mode)
@@ -933,12 +938,22 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
               (put-text-property (point) (line-end-position)
                                  'keymap gptel--markdown-block-map))))))))
 
-(defun gptel-agent-session--restore-buffer (record &optional external)
-  "Restore RECORD into a buffer, with host-owned persistence if EXTERNAL."
-  (let ((buffer (generate-new-buffer (or (plist-get record :buffer-name)
-                                        (plist-get record :name)))))
+(defun gptel-agent-session--restore-buffer (record &optional external family-id)
+  "Restore RECORD into a buffer, with host-owned persistence if EXTERNAL.
+FAMILY-ID supplies the shared display identity for a native family restore."
+  (let* ((name (or (plist-get record :buffer-name) (plist-get record :name)))
+         (saved-id (plist-get record :family-id))
+         (id (or family-id
+                 (if external saved-id
+                   (when (or saved-id (plist-get record :title))
+                     (gptel-agent--new-family-id)))))
+         (buffer (generate-new-buffer
+                  (if (and id (not (equal id saved-id)))
+                      (gptel-agent--family-name name id saved-id)
+                    name))))
     (condition-case err
         (with-current-buffer buffer
+          (setq-local gptel-agent--family-id id)
           (when external (setq-local gptel-agent-session-managed-externally t))
           (let ((mode (plist-get record :mode)))
             (unless (memq mode '(text-mode org-mode markdown-mode))
@@ -1015,7 +1030,7 @@ Restore Markdown fence keymaps too, so TAB can reopen the blocks."
              (signal (car err) (cdr err))))))
 
 (defconst gptel-agent-session--standalone-fields
-  '(:version :name :title :buffer-name :sent-end :directory :mode :point
+  '(:version :name :title :buffer-name :family-id :sent-end :directory :mode :point
     :narrow :updated :text :bounds :backend :tools :settings :draft)
   "Native snapshot fields belonging to one standalone conversation.")
 
@@ -1062,6 +1077,10 @@ survive restoration.  Saving works independently of `gptel-agent-session-mode'."
           (and end (equal (plist-get record :version) 1)
                (stringp (plist-get record :name))
                (string-or-null-p (plist-get record :buffer-name))
+               (or (null (plist-get record :family-id))
+                   (and (stringp (plist-get record :family-id))
+                        (string-match-p (rx string-start (= 8 xdigit) string-end)
+                                        (plist-get record :family-id))))
                (string-or-null-p (plist-get record :title))
                (memq (plist-get record :mode) '(text-mode markdown-mode org-mode))
                (stringp directory) (file-name-absolute-p directory)
@@ -1144,6 +1163,18 @@ When EXTERNAL is non-nil, the caller owns the imported chat's persistence."
   (when (file-remote-p file) (user-error "Session storage must be local"))
   (gptel-agent-session-buffer-from-record (gptel-agent-session--read-record file) external))
 
+(defun gptel-agent-session--display-family-id (root records)
+  "Return ROOT's display ID for the family in RECORDS.
+Older families use the first eight digits of their persistent root ID."
+  (let ((live (gethash root gptel-agent-session--buffers))
+        (record (cl-find root records :key (lambda (r) (plist-get r :id)) :test #'equal)))
+    (or (and (buffer-live-p live) (buffer-local-value 'gptel-agent--family-id live))
+        (plist-get record :family-id)
+        (and (or (cdr records) (plist-get record :title) (plist-get record :discussion)
+                 (string-prefix-p "*gptel-agent:" (or (plist-get record :buffer-name)
+                                                     (plist-get record :name))))
+             (substring root 0 8)))))
+
 ;;;###autoload
 (defun gptel-agent-session-restore (id)
   "Reopen ID's saved family with ownership, drafts and queued messages.
@@ -1158,7 +1189,7 @@ approval callbacks cannot survive a restart and are never replayed."
         (family (make-hash-table :test #'equal))
         (children (make-hash-table :test #'equal))
         (gptel-agent-session--restoring t)
-        root seen records created connections)
+        root family-id seen records created connections)
     (dolist (record (gptel-agent-session--catalog))
       (puthash (plist-get record :id) record headers)
       (push (plist-get record :id) (gethash (plist-get record :parent) children)))
@@ -1176,12 +1207,13 @@ approval callbacks cannot survive a restart and are never replayed."
             (dolist (child (gethash key children)) (push child pending))))))
     ;; Read every required file before touching live buffers.
     (maphash (lambda (key _) (push (gptel-agent-session--read key) records)) family)
+    (setq family-id (gptel-agent-session--display-family-id root records))
     (condition-case err
         (progn
           (dolist (record records)
             (let ((key (plist-get record :id)))
               (unless (buffer-live-p (gethash key gptel-agent-session--buffers))
-                (let ((buffer (gptel-agent-session--restore-buffer record)))
+                (let ((buffer (gptel-agent-session--restore-buffer record nil family-id)))
                   (push buffer created)
                   (puthash key buffer gptel-agent-session--buffers)
                   (gptel-agent-session-checkpoint--register buffer)))))
@@ -1200,6 +1232,12 @@ approval callbacks cannot survive a restart and are never replayed."
                                               :key #'gptel-agent-discussion--chat-id :test #'equal)))
                   (add-hook 'kill-buffer-hook #'gptel-agent-discussion--kill nil t)
                   (gptel-agent-discussion--refresh-list)))))
+          ;; A partial restore can reuse a live, previously untagged chat.
+          (when family-id
+            (dolist (record records)
+              (with-current-buffer (gethash (plist-get record :id) gptel-agent-session--buffers)
+                (unless (equal gptel-agent--family-id family-id)
+                  (gptel-agent--show-family-id family-id)))))
           (let ((buffer (gethash root gptel-agent-session--buffers)))
             (when (called-interactively-p 'interactive) (pop-to-buffer buffer))
             buffer))
