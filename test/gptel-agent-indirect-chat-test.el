@@ -112,6 +112,28 @@
             (should-not (gptel-agent-chat--guard-indirect-request)))
         (kill-buffer view)))))
 
+(ert-deftest gptel-agent-indirect-chat-inline-edits-only-writable-chats ()
+  (skip-unless (require 'gptel-inline nil t))
+  (gptel-agent-session-test--with-store
+    (let* ((gptel-default-mode 'text-mode)
+           (gptel-use-header-line t)
+           (chat (gptel-agent-session-test--buffer " *inline-chat*" "Prior turn"))
+           (gptel-backend (buffer-local-value 'gptel-backend chat))
+           (gptel-model (buffer-local-value 'gptel-model chat)))
+      (save-window-excursion
+        (switch-to-buffer chat)
+        (let ((prompt (gptel-inline nil (buffer-name chat))))
+          (should (eq (buffer-base-buffer prompt) chat))
+          (with-current-buffer prompt
+            (insert "Inline question")
+            (should-error (gptel-request) :type 'user-error)
+            (gptel-inline-append))
+          (should-not (buffer-live-p prompt))
+          (should (string-suffix-p "Inline question" (with-current-buffer chat (buffer-string)))))
+        (with-current-buffer chat (setq buffer-read-only t))
+        (with-current-buffer (gptel-inline nil (buffer-name chat))
+          (should-error (insert "A locked edit") :type 'buffer-read-only))))))
+
 (ert-deftest gptel-agent-indirect-chat-preserves-base-session-and-title-request ()
   (gptel-agent-session-test--with-store
     (let* ((source (gptel-agent-session-test--buffer " *indirect-session-owner*" "Original"))

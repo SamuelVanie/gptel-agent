@@ -39,10 +39,12 @@ Keep this value when reloading the module, just like the counter.")
 
 (defun gptel-agent-chat--clone ()
   "Clear copied peer identity and request state in a cloned buffer."
-  ;; An indirect chat shares text with its live owner.  It is a reading view,
-  ;; not another place to edit the transcript or launch concurrent requests.
-  (when (and (buffer-base-buffer) (or gptel-mode gptel-agent--child-chat-p))
-    (setq buffer-read-only t))
+  ;; Preserve inherited locks.  Mark only the lock we add to a writable
+  ;; transcript, so gptel-inline can edit its narrowed prompt after setup.
+  (cond ((eq buffer-read-only 'gptel-agent-chat-view) (setq buffer-read-only t))
+        ((and (not buffer-read-only) (buffer-base-buffer)
+              (or gptel-mode gptel-agent--child-chat-p))
+         (setq buffer-read-only 'gptel-agent-chat-view)))
   (gptel-agent--todo-header-detach)
   (when (local-variable-p 'kill-buffer-hook)
     (setq kill-buffer-hook (copy-sequence kill-buffer-hook)))
@@ -295,6 +297,18 @@ even without MainChat in the recipient's tools, allowing one-way messages."
 (add-hook 'clone-buffer-hook #'gptel-agent-chat--clone -90)
 (add-hook 'clone-indirect-buffer-hook #'gptel-agent-chat--clone -90)
 (advice-add 'gptel-request :before #'gptel-agent-chat--guard-indirect-request)
+
+(defun gptel-agent-chat--inline-prompt (prompt)
+  "Release the agent's view lock on the completed inline PROMPT."
+  (when (and (buffer-live-p prompt)
+             (eq (buffer-local-value 'buffer-read-only prompt) 'gptel-agent-chat-view))
+    (with-current-buffer prompt (setq buffer-read-only nil)))
+  prompt)
+
+;; The clone hook runs before gptel-inline identifies its prompt.  It
+;; returns the prompt and sends from the base chat, which still owns it.
+(with-eval-after-load 'gptel-inline
+  (advice-add 'gptel-inline :filter-return #'gptel-agent-chat--inline-prompt))
 
 (provide 'gptel-agent-chat)
 ;;; gptel-agent-chat.el ends here
