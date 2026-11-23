@@ -14,6 +14,11 @@
 
 ** Compatibility fixes
 
+- Grep and other agent tools can now return matches containing malformed
+  UTF-8. Recoverable UTF-8 is decoded and unrepresentable characters appear
+  as � in the text sent to the model. Saved tool results can be sent again.
+  The Emacs Grep fallback also accepts Unicode patterns and filenames.
+
 - Resuming an Agent retains its exact tool-use mode and keeps disabled tools
   out of active request schemas; enabled tools still return after synthesis.
 

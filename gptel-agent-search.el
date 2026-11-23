@@ -393,9 +393,13 @@ Grep filenames end at NUL, so embedded newlines in filenames remain literal."
 
 (defun gptel-agent--repo-emacs-command (job form)
   "Return a clean batch worker invocation for JOB evaluating FORM."
-  (list (plist-get (gptel-agent--repo-backend job) :emacs) "--batch" "-Q"
-        "-l" gptel-agent--repo-worker "--eval"
-        (prin1-to-string `(let ((coding-system-for-write 'utf-8-unix)) ,form))))
+  ;; The worker starts in the C locale.  Keep its Lisp argv ASCII so Emacs
+  ;; reads Unicode patterns and filenames back as the original characters.
+  (let ((print-escape-multibyte t)
+        (print-escape-nonascii t))
+    (list (plist-get (gptel-agent--repo-backend job) :emacs) "--batch" "-Q"
+          "-l" gptel-agent--repo-worker "--eval"
+          (prin1-to-string `(let ((coding-system-for-write 'utf-8-unix)) ,form)))))
 
 (defun gptel-agent--repo-walk-directories (job directories)
   "Enumerate DIRECTORIES for JOB within the remaining entry budget.

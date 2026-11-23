@@ -2,6 +2,52 @@
 
 (require 'gptel-agent-workers-test)
 
+(ert-deftest gptel-agent-compat-replay-grep-result-with-invalid-text ()
+  (with-temp-buffer
+    (let* ((gptel-mode t)
+           (gptel-backend (gptel-make-openai "grep-replay" :host "example.invalid"
+                                            :key "unused" :models '(test)))
+           (gptel-model 'test)
+           (regex "café\\s+雪")
+           (prefix "café\t雪: ")
+           (suffix "\r\n\"quoted\" 😀")
+           ;; A previous Grep could store this Emacs-only character after
+           ;; decoding the malformed UTF-8 sequence F4 90 80 80.
+           (result (concat prefix (string #x110000) suffix)))
+      (gptel--parse-list-and-insert
+       `((tool . (:id "call_1" :name "Grep" :args (:regex ,regex) :result ,result))))
+      (let* ((prompts (gptel--parse-buffer gptel-backend))
+             (data (gptel--request-data gptel-backend prompts))
+             (messages (plist-get (gptel--json-read-string (gptel--json-encode data)) :messages))
+             (call (seq-find (lambda (message) (plist-get message :tool_calls)) messages))
+             (args (plist-get (plist-get (aref (plist-get call :tool_calls) 0) :function)
+                              :arguments))
+             (reply (seq-find (lambda (message) (equal (plist-get message :role) "tool"))
+                              messages)))
+        (should (equal (plist-get (gptel--json-read-string args) :regex) regex))
+        (should (equal (plist-get reply :content) (concat prefix "\ufffd" suffix)))
+        (should (string-suffix-p result (buffer-string)))))))
+
+(ert-deftest gptel-agent-compat-bedrock-replays-grep-with-invalid-text ()
+  (skip-unless (require 'gptel-bedrock nil t))
+  (with-temp-buffer
+    (let* ((gptel-mode t)
+           (gptel-backend (gptel--make-bedrock :name "grep-replay" :models '(test)))
+           (gptel-model 'test) (gptel-use-curl t) (gptel-post-request-hook nil)
+           (result (concat "雪" (string #x110000) "😀"))
+           wire)
+      (gptel--parse-list-and-insert
+       `((tool . (:id "call_1" :name "Grep" :args (:regex "雪") :result ,result))))
+      (cl-letf (((symbol-function 'gptel-curl-get-response)
+                 (lambda (fsm)
+                   (setq wire (gptel--json-encode (plist-get (gptel-fsm-info fsm) :data))))))
+        (gptel-request nil :transforms nil :callback #'ignore))
+      (let ((messages (plist-get (gptel--json-read-string wire) :messages)))
+        (should (equal (map-nested-elt messages '(0 :content 0 :toolUse :input :regex)) "雪"))
+        (should (equal (map-nested-elt messages '(1 :content 0 :toolResult :content 0 :text))
+                       "雪\uFFFD😀"))
+        (should (string-suffix-p result (buffer-string)))))))
+
 (ert-deftest gptel-agent-compat-plain-markdown-keeps-system-prompt ()
   (let ((file (make-temp-file "agent-plain-prompt-" nil ".md" "Follow the task.\n")))
     (unwind-protect

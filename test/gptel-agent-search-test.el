@@ -2,6 +2,7 @@
 
 (require 'gptel-agent-edit-test)
 (require 'gptel-agent-read-test)
+(require 'gptel-agent-workers-test)
 
 (defun gptel-agent-repo-test--backend (matcher walker)
   "Select MATCHER and WALKER, retaining the actual batch Emacs executable."
@@ -273,6 +274,52 @@
                                    (should (string-match-p "complete;" (plist-get call :result)))
                                    (should (string-match-p "results=70" (plist-get call :result))))
                                  (should-not gptel-agent--repository-searches))))
+
+(ert-deftest gptel-agent-repo-grep-binary-match-survives-tool-continuation ()
+  (gptel-edit-test--with-files nil
+    (let ((prefix "café 😀 \"quoted\"\\path\t")
+          (file "résultats-😀.bin"))
+      (let ((coding-system-for-write 'no-conversion))
+        (with-temp-file file
+          (set-buffer-multibyte nil)
+          (insert (encode-coding-string prefix 'utf-8)
+                  (unibyte-string #xff) "|"
+                  ;; Emacs can decode this sequence to a character above U+10FFFF.
+                  (unibyte-string #xf4 #x90 #x80 #x80) "\0end\n")))
+      (dolist (matcher '(rg grep emacs))
+        (when (or (eq matcher 'emacs) (executable-find (symbol-name matcher)))
+          (ert-info ((format "Grep matcher: %s" matcher))
+            (let ((selected (gptel-agent-repo-test--backend matcher 'emacs))
+                  (gptel-backend (gptel-make-openai-responses "grep-json" :key "unused" :models '(test)))
+                  (gptel-model 'test) (gptel-tools (list (gptel-get-tool "Grep")))
+                  (gptel-use-curl t) (gptel-use-tools t) (gptel-confirm-tool-calls nil)
+                  (gptel-agent-use-project-instructions nil)
+                  (fsm (gptel-make-fsm)) results requests)
+              (cl-letf (((symbol-function 'gptel-agent--repo-select-backend) (lambda () selected))
+                        ((symbol-function 'gptel-curl-get-response)
+                         (lambda (request)
+                           (push (gptel--json-encode (plist-get (gptel-fsm-info request) :data))
+                                 requests))))
+                (gptel-request "Find the matching line" :fsm fsm
+                  :transforms '(gptel-agent--localize-agent-tool)
+                  :callback (lambda (response _info)
+                              (when (eq (car-safe response) 'tool-result)
+                                (push (nth 2 (cadr response)) results))))
+                (gptel-agent-workers-test--tool fsm "Grep" (list :regex "café" :path file))
+                (gptel-agent-read-test--wait (lambda () (not (eq (gptel-fsm-state fsm) 'TOOL))))
+                (should-not (plist-get (gptel-fsm-info fsm) :error))
+                (should (eq (gptel-fsm-state fsm) 'WAIT))
+                (should (= (length requests) 2))
+                (should (= (length results) 1))
+                (let* ((data (gptel--json-read-string (car requests)))
+                       (items (plist-get data :input))
+                       (item (aref items (1- (length items))))
+                       (content (plist-get item :output)))
+                  (should (equal (plist-get item :type) "function_call_output"))
+                  (should (equal content (car results)))
+                  (should (string-match-p (concat (regexp-quote (concat file "\":1:" prefix))
+                                                  "�+|�+\0end\n") content))
+                  (should (string-match-p "Grep complete;" content)))))))))))
 
 (ert-deftest gptel-agent-repo-wire-contract-refreshes-only-between-requests ()
   (skip-unless (and (executable-find "rg") (executable-find "grep")))

@@ -366,6 +366,76 @@ undelivered result.  WAITERS and automatic delivery consume the same inbox."
   "Worker gates owned by this buffer, including parked requests.")
 (put 'gptel-agent--worker-requests 'permanent-local t)
 
+;;; Tool text in JSON requests
+
+(defun gptel-agent--json-text (text)
+  "Return TEXT as Unicode suitable for a JSON string.
+Recover UTF-8 from unibyte strings and runs of Emacs raw-byte characters.
+Represent undecodable bytes and other non-Unicode characters with U+FFFD."
+  (unless (multibyte-string-p text)
+    (setq text (decode-coding-string text 'utf-8-unix t)))
+  (let ((non-scalar "[^\0-\uD7FF\uE000-\U0010FFFF]"))
+    (if (not (string-match-p non-scalar text)) text
+      ;; Raw bytes can coexist with decoded text, for example when a tool
+      ;; combines a filename with output from a binary process.
+      (setq text (replace-regexp-in-string
+                  "[\x3FFF80-\x3FFFFF]+"
+                  (lambda (raw)
+                    (decode-coding-string (string-to-unibyte raw) 'utf-8-unix))
+                  text t t))
+      ;; Emacs can decode extended UTF-8 to characters above U+10FFFF.
+      (replace-regexp-in-string non-scalar "\uFFFD" text t t))))
+
+(defun gptel-agent--process-tool-call (process fsm tool call result)
+  "Pass agent TOOL's RESULT to PROCESS as text safe to record in FSM's CALL."
+  (funcall process fsm tool call
+           (if (and (stringp result) (gptel-agent--builtin-tool-name tool))
+               (gptel-agent--json-text result)
+             result)))
+
+(advice-add 'gptel--process-tool-call :around #'gptel-agent--process-tool-call)
+
+(defun gptel-agent--parse-tool-results (parse backend calls)
+  "Pass JSON-encodable result text from CALLS to BACKEND's PARSE function.
+gptel uses this boundary for both live calls and tools read from a chat."
+  (funcall parse backend
+           (mapcar (lambda (call)
+                     (let* ((result (plist-get call :result))
+                            (text (if (stringp result) (gptel-agent--json-text result) result)))
+                       (if (eq result text) call
+                         (plist-put (copy-sequence call) :result text))))
+                   calls)))
+
+(advice-add 'gptel--parse-tool-results :around #'gptel-agent--parse-tool-results)
+
+(defun gptel-agent--prepare-tool-text (fsm)
+  "Repair embedded tool text in FSM's outgoing request.
+OpenAI argument rewrites can embed UTF-8 bytes as JSON text.  Bedrock
+reconstructs old tool results directly from the buffer, bypassing
+`gptel--parse-tool-results'."
+  (let* ((info (gptel-fsm-info fsm))
+         (data (plist-get info :data))
+         (input (plist-get data :input)))
+    (cl-flet ((repair (object key)
+                (let ((value (plist-get object key)))
+                  (when (stringp value)
+                    (let ((text (gptel-agent--json-text value)))
+                      (unless (eq value text) (plist-put object key text)))))))
+      (seq-doseq (message (plist-get data :messages))
+        (seq-doseq (call (plist-get message :tool_calls))
+          (repair (plist-get call :function) :arguments))
+        (when (and (equal (plist-get message :role) "user")
+                   (vectorp (plist-get message :content)))
+          (seq-doseq (block (plist-get message :content))
+            (seq-doseq (part (plist-get (plist-get block :toolResult) :content))
+              (repair part :text)))))
+      (unless (stringp input)           ; Responses also accepts a plain prompt.
+        (seq-doseq (item input)
+          (when (equal (plist-get item :type) "function_call")
+            (repair item :arguments)))))))
+
+(advice-add 'gptel--handle-wait :before #'gptel-agent--prepare-tool-text)
+
 ;;; Tool call repetition detection
 (defvar-local gptel-agent--last-tool-call-key nil
   "Last tool call key tracked for repetition detection.
@@ -2413,25 +2483,6 @@ Set the owning worker's STATE, defaulting to `waiting-for-agents'."
     (gptel-agent--run-finish
      run 'cancelled "Error: Owning request stopped." 'parent-stopped t)))
 
-(defun gptel-agent--workers-decode-tool-arguments (data)
-  "Keep embedded tool argument JSON in DATA as text before sending it.
-Some gptel tool-call rewrites store `json-serialize' output directly in
-OpenAI argument fields.  That output is unibyte UTF-8, which the enclosing
-request's serializer rejects when it contains non-ASCII bytes.  Decode only
-those fields; tool inputs for other backends and signed reasoning are left
-alone."
-  (let (calls)
-    (seq-doseq (message (plist-get data :messages))
-      (seq-doseq (call (plist-get message :tool_calls))
-        (push (plist-get call :function) calls)))
-    (seq-doseq (item (plist-get data :input))
-      (when (equal (plist-get item :type) "function_call")
-        (push item calls)))
-    (dolist (call calls)
-      (let ((args (plist-get call :arguments)))
-        (when (and (stringp args) (not (multibyte-string-p args)))
-          (plist-put call :arguments (decode-coding-string args 'utf-8 t)))))))
-
 (defun gptel-agent--workers-dispatch (gate state)
   "Run request-local handlers for STATE, enforcing GATE's lifecycle."
   (unless (gptel-agent--workers-closed gate)
@@ -2451,7 +2502,6 @@ alone."
                  (gptel-agent--workers-wrap-callback gate)
                  (gptel-agent--workers-inject gate)
                  (let ((data (plist-get info :data)))
-                   (gptel-agent--workers-decode-tool-arguments data)
                    (plist-put info :agent-tool-prompt-count
                               (length (or (plist-get data :messages)
                                           (plist-get data :contents)
