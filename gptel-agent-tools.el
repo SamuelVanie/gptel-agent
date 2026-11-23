@@ -45,6 +45,7 @@
 
 (require 'gptel)
 (require 'cl-lib)
+(require 'gptel-agent-text)
 (require 'gptel-agent-edit)
 (require 'gptel-agent-instructions)
 (require 'gptel-agent-access)
@@ -367,24 +368,6 @@ undelivered result.  WAITERS and automatic delivery consume the same inbox."
 (put 'gptel-agent--worker-requests 'permanent-local t)
 
 ;;; Tool text in JSON requests
-
-(defun gptel-agent--json-text (text)
-  "Return TEXT as Unicode suitable for a JSON string.
-Recover UTF-8 from unibyte strings and runs of Emacs raw-byte characters.
-Represent undecodable bytes and other non-Unicode characters with U+FFFD."
-  (unless (multibyte-string-p text)
-    (setq text (decode-coding-string text 'utf-8-unix t)))
-  (let ((non-scalar "[^\0-\uD7FF\uE000-\U0010FFFF]"))
-    (if (not (string-match-p non-scalar text)) text
-      ;; Raw bytes can coexist with decoded text, for example when a tool
-      ;; combines a filename with output from a binary process.
-      (setq text (replace-regexp-in-string
-                  "[\x3FFF80-\x3FFFFF]+"
-                  (lambda (raw)
-                    (decode-coding-string (string-to-unibyte raw) 'utf-8-unix))
-                  text t t))
-      ;; Emacs can decode extended UTF-8 to characters above U+10FFFF.
-      (replace-regexp-in-string non-scalar "\uFFFD" text t t))))
 
 (defun gptel-agent--process-tool-call (process fsm tool call result)
   "Pass agent TOOL's RESULT to PROCESS as text safe to record in FSM's CALL."

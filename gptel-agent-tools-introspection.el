@@ -35,6 +35,7 @@
 ;;; Code:
 
 (require 'gptel-request)
+(require 'gptel-agent-text)
 (require 'info)
 (require 'find-func)
 (eval-when-compile (require 'cl-lib))
@@ -43,6 +44,11 @@
 (declare-function orderless-filter "orderless")
 
 ;;; Helper functions
+
+(defun gptel-agent--introspect-names-json (names)
+  "Return Info NAMES as a JSON array suitable for a text tool result."
+  (gptel-agent--json-text
+   (json-serialize (vconcat (mapcar #'gptel-agent--json-text names)))))
 
 (defun gptel-agent--introspect-manual-node-contents (manual node)
   "Return contents of NODE in Info MANUAL."
@@ -130,8 +136,8 @@ Emacs installation.")
 
 (gptel-make-tool
  :function (lambda ()
-             (json-serialize (vconcat (info--filter-manual-names
-                                       (info--manual-names nil)))))
+             (gptel-agent--introspect-names-json
+              (info--filter-manual-names (info--manual-names nil))))
  :name "manual_names"
  :include t
  :category "introspection"
@@ -153,8 +159,8 @@ used liberally.")
 
 (gptel-make-tool
  :function (lambda (name)
-             (json-serialize
-              (vconcat (mapcar #'car (Info-build-node-completions name)))))
+             (gptel-agent--introspect-names-json
+              (mapcar #'car (Info-build-node-completions name))))
  :name "manual_nodes"
  :include t
  :category "introspection"
