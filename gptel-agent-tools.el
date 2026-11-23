@@ -316,17 +316,18 @@ the buffer cannot become a main-chat messaging endpoint.")
       (setq gptel-agent--family-id (gptel-agent--new-family-id))))
 
 (defconst gptel-agent--chat-name-prefix
-  (rx string-start (* " ") (? "*") (? (or "gptel:" "gptel-agent:" "gptel-agent-run:")))
+  (rx string-start (* " ") (? "*") (? (or "gptel:" "gptel-agent:" "gptel-agent-run:" "Review aside: ")))
   "Part of a chat buffer name preceding its family tag.")
 
 (defun gptel-agent--family-name (name id &optional previous)
   "Insert ID in NAME, replacing PREVIOUS's tag when present.
+A nil ID omits the tag so NAME can label the owner of another chat.
 Keep the role prefix, leading spaces of hidden buffers and Emacs suffixes."
   (save-match-data
     (string-match gptel-agent--chat-name-prefix name)
     (let* ((prefix (match-end 0))
            (label (substring name prefix)))
-      (concat (substring name 0 prefix) "[" id "] "
+      (concat (substring name 0 prefix) (when id (concat "[" id "] "))
               (if previous (string-remove-prefix (concat "[" previous "] ") label)
                 label)))))
 

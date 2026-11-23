@@ -13,6 +13,8 @@
 
 (declare-function gptel-agent--copy-parent-request-config "gptel-agent-tools")
 (declare-function gptel-agent--child-buffer-created "gptel-agent-tools")
+(declare-function gptel-agent--family-name "gptel-agent-tools")
+(declare-function gptel-agent--new-chat-buffer "gptel-agent-tools")
 (declare-function gptel-agent-instructions--transform "gptel-agent-instructions")
 (declare-function smv/gptel-ediff-open "gptel-ediff-prehook")
 (defvar gptel-agent-instructions--targets)
@@ -113,9 +115,13 @@
             (save-excursion
               (goto-char (point-max))
               (let ((mark-active nil)) (gptel--create-prompt-buffer (point))))))
-         (buffer (generate-new-buffer
+         (owner-label (gptel-agent--family-name
+                       (buffer-name owner) nil
+                       (buffer-local-value 'gptel-agent--family-id owner)))
+         (buffer (gptel-agent--new-chat-buffer
                   (format "*Review aside: %s — %s*" (file-name-nondirectory path)
-                          (buffer-name owner))))
+                          owner-label)
+                  owner))
          ready)
     (unwind-protect
         (with-current-buffer buffer

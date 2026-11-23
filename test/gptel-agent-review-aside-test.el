@@ -57,6 +57,20 @@
   "Return serialized payload of FSM."
   (prin1-to-string (plist-get (gptel-fsm-info fsm) :data)))
 
+(ert-deftest gptel-aside-name-shares-the-owner-family-once ()
+  (dolist (existing-id '(nil "1234abcd"))
+    (gptel-aside-test--with-chat
+      (rename-buffer "*gptel:Patch review*")
+      (when existing-id (gptel-agent--show-family-id existing-id))
+      (setq aside (gptel-agent-review-aside
+                   gptel-agent-review--queue (gptel-review-test--file 1) ""))
+      (let ((id (buffer-local-value 'gptel-agent--family-id aside)))
+        (should (and id (equal id gptel-agent--family-id)))
+        (when existing-id (should (equal id existing-id)))
+        (should (equal (buffer-name owner) (format "*gptel:[%s] Patch review*" id)))
+        (should (equal (buffer-name aside)
+                       (format "*Review aside: [%s] one — *gptel:Patch review**" id)))))))
+
 (ert-deftest gptel-aside-ediff-question-keeps-review-and-parent-independent ()
   (dolist (applied '(nil t))
     (gptel-aside-test--with-chat
