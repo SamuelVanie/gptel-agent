@@ -12,6 +12,13 @@
   "Append TEXT to BUFFER as an ordinary edit."
   (with-current-buffer buffer (goto-char (point-max)) (insert text)))
 
+(defun gptel-agent-session-checkpoint-test--save-status ()
+  "Run the interactive save command and return its count and echo message."
+  (let ((noninteractive nil) status)
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (setq status (and fmt (apply #'format-message fmt args))))))
+      (list (call-interactively #'gptel-agent-session-save) status))))
+
 (ert-deftest gptel-agent-session-checkpoint-initial-family-is-hidden-until-complete ()
   (gptel-agent-session-test--with-store
     (let* ((gptel-agent-session-batch-size 1)
@@ -51,22 +58,32 @@
   (gptel-agent-session-test--with-store
     (let* ((parent (gptel-agent-session-test--buffer " *manifest-parent*" "Old"))
            (child (gptel-agent-session-manager-test--child parent " *manifest-child*"))
-           (rename (symbol-function 'rename-file)) old-child)
+           (rename (symbol-function 'rename-file)) old-child manifest)
       (gptel-agent-session-mode 1)
-      (gptel-agent-session-save)
-      (setq old-child (gptel-agent-session-checkpoint-test--text child))
+      (should (= 2 (gptel-agent-session-save)))
+      (setq old-child (gptel-agent-session-checkpoint-test--text child)
+            manifest (expand-file-name
+                      (format "families/%s.eld" (gptel-agent-session-manager-test--id parent))
+                      gptel-agent-session-directory))
       (gptel-agent-session-checkpoint-test--append parent " updated")
       (gptel-agent-session-checkpoint-test--append child " updated")
       (cl-letf (((symbol-function 'rename-file)
                  (lambda (old new &optional replace)
-                   (when (string-prefix-p (file-truename (expand-file-name "families/" gptel-agent-session-directory))
-                                          (file-truename new))
+                   (when (file-equal-p new manifest)
                      (signal 'file-error '("Simulated family publication failure")))
                    (funcall rename old new replace))))
-        (gptel-agent-session--drain t))
+        (should (equal '(0 "Saved 0 chats, 1 family pending")
+                       (gptel-agent-session-checkpoint-test--save-status)))
+        (let ((other (gptel-agent-session-test--buffer " *independent-family*" "Independent")))
+          (should (equal '(1 "Saved 1 chat, 1 family pending")
+                         (gptel-agent-session-checkpoint-test--save-status)))
+          (should (equal "Independent" (gptel-agent-session-checkpoint-test--text other)))))
       (should (equal "Old" (gptel-agent-session-checkpoint-test--text parent)))
       (should (equal old-child (gptel-agent-session-checkpoint-test--text child)))
-      (gptel-agent-session--drain t)
+      (cl-letf (((symbol-function 'gptel-agent-session--write)
+                 (lambda (&rest _) (ert-fail "Already staged both chats"))))
+        (should (equal '(2 "Saved 2 chats, 0 families pending")
+                       (gptel-agent-session-checkpoint-test--save-status))))
       (should (equal "Old updated" (gptel-agent-session-checkpoint-test--text parent)))
       (should (equal (concat old-child " updated") (gptel-agent-session-checkpoint-test--text child))))))
 
@@ -203,7 +220,7 @@
       (gptel-agent-session-checkpoint-test--append child " changed")
       (cl-letf (((symbol-function 'gptel-agent-session--write)
                  (lambda (record) (push (plist-get record :id) written) (funcall write record))))
-        (gptel-agent-session-save))
+        (should (= 1 (gptel-agent-session-save))))
       (should (equal (list (gptel-agent-session-manager-test--id child)) written))
       (should (equal before (gptel-agent-session--file (gptel-agent-session-manager-test--id parent)))))))
 
@@ -314,7 +331,8 @@
       (gptel-agent-session-mode 1)
       (cl-letf (((symbol-function 'gptel-agent-session-checkpoint--begin)
                  (lambda (&rest _) (cl-incf attempts) (error "Simulated checkpoint planning failure"))))
-        (gptel-agent-session--drain t))
+        (should (equal '(0 "Saved 0 chats, 1 family pending")
+                       (gptel-agent-session-checkpoint-test--save-status))))
       (should (= 1 attempts))
       (should (gethash buffer gptel-agent-session--dirty))
       (should (memq buffer gptel-agent-session--queue))
@@ -375,7 +393,7 @@
           (gptel-agent-session-checkpoint-test--append staged " newest revision")
           ;; The explicit command must finish the existing generation and then
           ;; include edits already present when the command was invoked.
-          (gptel-agent-session-save)
+          (should (= 2 (gptel-agent-session-save)))
           (should (string-suffix-p " first revision newest revision"
                                    (gptel-agent-session-checkpoint-test--text staged)))
           (should (= 3 (length written)))
@@ -396,7 +414,8 @@
                    (when (> writes 2) (error "Manual save must not chase continuous edits"))
                    (funcall write record)
                    (gptel-agent-session-checkpoint-test--append buffer " arrived during write"))))
-        (gptel-agent-session-save))
+        (should (equal '(1 "Saved 1 chat, 1 family pending")
+                       (gptel-agent-session-checkpoint-test--save-status))))
       (should (= 1 writes))
       (should (equal "Committed before manual save"
                      (gptel-agent-session-checkpoint-test--text buffer)))

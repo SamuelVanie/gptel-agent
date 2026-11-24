@@ -596,7 +596,8 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
 
 (defun gptel-agent-session--drain (&optional all)
   "Stage bounded chat versions, atomically publishing complete families.
-ALL finishes each initially queued family without the automatic interval."
+Return the number staged.  With ALL, flush initially queued work without
+the automatic interval and return the number of distinct chats published."
   (gptel-agent-session-checkpoint--drain all))
 
 (defun gptel-agent-session--tick ()
@@ -610,6 +611,8 @@ ALL finishes each initially queued family without the automatic interval."
 ;;;###autoload
 (defun gptel-agent-session-save (&optional include-current)
   "Save changed ordinary chats immediately, including ownership and inboxes.
+Return the number of distinct chats whose new snapshots were committed.
+Interactively, also report how many families still have changes to save.
 With prefix INCLUDE-CURRENT, resume saving the current live discussion
 family after deleting its snapshots with `gptel-agent-session-delete'."
   (interactive "P")
@@ -631,7 +634,10 @@ family after deleting its snapshots with `gptel-agent-session-delete'."
   (gptel-agent-session--track-all)
   (let ((count (gptel-agent-session--drain t)))
     (when (called-interactively-p 'interactive)
-      (message "Saved %d chats; %d pending" count (hash-table-count gptel-agent-session--dirty)))
+      (let ((pending (gptel-agent-session-checkpoint--pending-families)))
+        (message "Saved %d chat%s, %d %s pending"
+                 count (if (= count 1) "" "s")
+                 pending (if (= pending 1) "family" "families"))))
     count))
 
 (defun gptel-agent-session--read-record (file &optional header-only)

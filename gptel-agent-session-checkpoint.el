@@ -22,6 +22,8 @@
 
 (cl-defstruct (gptel-agent-session-checkpoint--transaction
                (:constructor gptel-agent-session-checkpoint--make))
+  "A family generation.  REQUIRED maps member IDs to t, or `staged'
+once this transaction has written a new snapshot for the member."
   root generation entries required pending old membership-revision (attempt 0) error)
 
 (defvar gptel-agent-session-directory)
@@ -172,7 +174,7 @@
           (setq header (list :id id :parent (plist-get record :parent)
                              :name (truncate-string-to-width (plist-get record :name) 160)
                              :updated (plist-get record :updated)))
-          (setq gptel-agent-session--last-save (float-time) gptel-agent-session--error nil
+          (setq gptel-agent-session--error nil
                 gptel-agent-session--staged-revision revision)
           (when (= revision gptel-agent-session--revision)
             (remhash buffer gptel-agent-session--dirty)))
@@ -191,6 +193,7 @@
     (setf (plist-get header :file)
           (concat "snapshots/" (file-name-nondirectory file)))
     (puthash id header (gptel-agent-session-checkpoint--transaction-entries transaction))
+    (puthash id 'staged (gptel-agent-session-checkpoint--transaction-required transaction))
     (let ((pending (gptel-agent-session-checkpoint--transaction-pending transaction)))
       (setf (gptel-agent-session-checkpoint--transaction-pending transaction)
             (if (equal id (car pending)) (cdr pending) (delete id pending))))
@@ -245,8 +248,11 @@
 
 (defun gptel-agent-session-checkpoint--drain (&optional all)
   "Stage a bounded batch, or flush entry revisions with ALL.
+Return the number staged in a bounded batch.  With ALL, return the
+number of distinct chats whose new snapshots were published by the flush.
 Failures remain queued without retrying in a tight loop."
-  (let ((started (float-time)) (examined 0) (saved 0)
+  (let ((started (float-time)) (examined 0) (staged 0)
+        (committed (and all (make-hash-table :test #'equal)))
         (blocked (make-hash-table :test #'equal))
         (targets (make-hash-table :test #'eq)) deferred)
     (when all
@@ -299,18 +305,19 @@ Failures remain queued without retrying in a tight loop."
                         (gptel-agent-session-checkpoint--extend transaction)
                         (when-let* ((id (car (gptel-agent-session-checkpoint--transaction-pending transaction))))
                           (gptel-agent-session-checkpoint--stage transaction id)
-                          (cl-incf saved))
+                          (cl-incf staged))
                         (if (gptel-agent-session-checkpoint--publish transaction)
                             (when all
                               (let (unfinished)
                                 (maphash
-                                 (lambda (id _)
+                                 (lambda (id state)
+                                   (when (eq state 'staged) (puthash id t committed))
                                    (when-let* ((live (gethash id gptel-agent-session--buffers))
                                                (target (gethash live targets))
                                                ((buffer-live-p live)))
                                      (when (< (buffer-local-value 'gptel-agent-session--staged-revision live) target)
                                        (setq unfinished t))))
-                                 (gethash root gptel-agent-session--family-members))
+                                 (gptel-agent-session-checkpoint--transaction-required transaction))
                                 (unless unfinished (puthash root t blocked))))
                           (gptel-agent-session-checkpoint--enqueue root))))
                   ((error quit)
@@ -336,7 +343,17 @@ Failures remain queued without retrying in a tight loop."
           (remhash item gptel-agent-session--queued)
           (gptel-agent-session-checkpoint--enqueue item))))
     (gptel-agent-session--stop-if-clean)
-    saved))
+    (if all (hash-table-count committed) staged)))
+
+(defun gptel-agent-session-checkpoint--pending-families ()
+  "Count families with a dirty chat or an unpublished transaction."
+  (let ((families (copy-hash-table gptel-agent-session--transactions)))
+    (maphash (lambda (buffer _)
+               (when (buffer-live-p buffer)
+                 (let ((id (buffer-local-value 'gptel-agent-session--id buffer)))
+                   (puthash (gethash id gptel-agent-session--member-roots id) t families))))
+             gptel-agent-session--dirty)
+    (hash-table-count families)))
 
 (provide 'gptel-agent-session-checkpoint)
 ;;; gptel-agent-session-checkpoint.el ends here

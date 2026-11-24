@@ -272,7 +272,10 @@ Use =M-x gptel-agent-discussions= and
 =RET= to visit the children as usual. Restoring never starts model requests.
 Send a new message normally, or use =gptel-agent-discussion-resume= in a chat
 without an unsent draft to resume delivery of queued discussion messages.
-=M-x gptel-agent-session-save= saves changed chats immediately.
+=M-x gptel-agent-session-save= saves changed chats immediately. It reports
+how many chats had new snapshots committed and how many families still have
+work pending. If a manifest write fails, the family stays pending. Running
+the command again retries publication using the snapshots already written.
 
 ** Generated titles
 
