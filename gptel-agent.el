@@ -1301,37 +1301,44 @@ confirmation before proceeding."
         (let ((info (gptel-fsm-info fsm)))
           (plist-put info :post (cons post-func (plist-get info :post))))))))
 
+(defconst gptel-agent--header-presets
+  '((gptel-agent "Agent" font-lock-keyword-face)
+    (gptel-plan "Plan" font-lock-doc-face)
+    (ask "Ask" font-lock-string-face))
+  "Presets in selector order, with their display names and faces.")
+
+(defun gptel-agent--next-header-preset ()
+  "Return the selector entry following the current gptel preset."
+  (let ((current (assq gptel--preset gptel-agent--header-presets)))
+    (or (cadr (memq current gptel-agent--header-presets))
+        (car gptel-agent--header-presets))))
+
+(defun gptel-agent--cycle-header-preset (&rest _)
+  "Apply the next selector preset in this chat."
+  (let ((next (car (gptel-agent--next-header-preset))))
+    (gptel--apply-preset
+     next (lambda (sym val) (set (make-local-variable sym) val)))
+    (setq-local gptel-agent--current-agent (symbol-name next))
+    (force-mode-line-update)))
+
+(defun gptel-agent--header-selector ()
+  "Render the backend and the current gptel preset."
+  (let ((entry (assq gptel--preset gptel-agent--header-presets)))
+    (concat
+     (propertize " " 'display '(space :align-to 0))
+     (gptel-backend-name gptel-backend)
+     (propertize
+      (buttonize (format "[%s]" (or (nth 1 entry) gptel--preset "Select preset"))
+                 #'gptel-agent--cycle-header-preset nil
+                 (format "Switch to %s preset" (nth 1 (gptel-agent--next-header-preset))))
+      'face (or (nth 2 entry) 'mode-line-emphasis)))))
+
 (defun gptel-agent--setup-header ()
   "Install the agent preset selector in the native gptel header.
 Run before other `gptel-mode-hook' functions so optional display modes
 can save and compose the native header, including this selector."
   (when (and gptel-mode gptel-use-header-line)
-    (let* ((modes '((gptel-agent "[Agent]" font-lock-keyword-face
-                               "Switch to planning preset")
-                   (gptel-plan  "[Plan]"  font-lock-doc-face
-                               "Switch to ask preset")
-                   (ask         "[Ask]"   font-lock-string-face
-                                "Switch to agent preset")))
-           (current 0)
-           (switch-mode
-            (lambda (&rest _)
-              (setq current (mod (1+ current) (length modes)))
-              (gptel--apply-preset
-               (car (nth current modes))
-               (lambda (sym val) (set (make-local-variable sym) val)))
-              (setq-local gptel-agent--current-agent
-                          (symbol-name (car (nth current modes))))
-              (force-mode-line-update)))
-           (display-mode
-            (lambda ()
-              (pcase-let ((`(,_ ,label ,face ,help) (nth current modes)))
-                (concat
-                 (propertize " " 'display '(space :align-to 0))
-                 (format "%s" (gptel-backend-name gptel-backend))
-                 (propertize (buttonize label switch-mode nil help)
-                             'face face))))))
-      (setcar header-line-format
-              `(:eval (funcall ,display-mode))))))
+    (setcar header-line-format '(:eval (gptel-agent--header-selector)))))
 
 ;;;###autoload
 (defun gptel-agent (&optional project-dir agent-preset)

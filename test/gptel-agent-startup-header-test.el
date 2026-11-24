@@ -88,6 +88,24 @@
                  "\\[Agent\\]"
                  (gptel-agent-startup-header-test--selector header-line-format)))))))
 
+(ert-deftest gptel-agent-startup-selector-follows-native-preset-changes ()
+  (require 'gptel-transient)
+  (let ((gptel-mode-hook nil)
+        (gptel-use-header-line t))
+    (gptel-agent-startup-header-test--with-chat
+      (gptel-make-preset 'custom-review :description "Custom review preset")
+      (dolist (case '((ask "[Ask]" gptel-agent)
+                      (gptel-plan "[Plan]" ask)
+                      (custom-review "[custom-review]" gptel-agent)))
+        (pcase-let ((`(,preset ,label ,next) case))
+          (gptel-preset
+           preset (lambda (sym val) (set (make-local-variable sym) val)))
+          (should (string-suffix-p
+                   label (gptel-agent-startup-header-test--selector header-line-format)))
+          (gptel-agent-startup-header-test--click-selector header-line-format)
+          (should (eq gptel--preset next))
+          (should (equal gptel-agent--current-agent (symbol-name next))))))))
+
 (ert-deftest gptel-agent-startup-native-without-header ()
   (let ((gptel-mode-hook nil)
         (gptel-use-header-line nil)

@@ -58,9 +58,9 @@ There are two ways to use gptel-agent:
   can reset the agent configuration by (re)applying the "gptel-agent" preset
   from gptel's menu.
 
-- You can switch between an agent preset (gptel-agent) and a planning preset
-  (gptel-plan) by applying them from gptel's menu, or clicking on the backend
-  name in the header line.
+- The header shows the preset applied to this chat, including changes made
+  from gptel's menu. Click the preset name to cycle through Agent, Plan,
+  and Ask. From a custom preset, the first click switches to Agent.
 
   The planning preset has read-only access to the filesystem and works with you
   to settle a concrete implementation design. The implementation preset makes
