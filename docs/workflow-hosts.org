@@ -41,20 +41,36 @@ transcript content without including them in the final result.
 
 | Public function | Purpose |
 |-----------------+---------|
-| =gptel-agent-supervise= | Establish buffer ownership before starting requests; accepts =:on-state-change= and =:on-tool-approval= callbacks |
+| =gptel-agent-supervise= | Establish buffer ownership and attach state, approval and question callbacks before starting requests |
 | =gptel-agent-supervision-request-live-p= | Check whether a retained request still belongs to the active handle and can advance |
+| =gptel-agent-supervision-question-live-p= | Check whether a question batch still awaits an answer from this supervisor |
+| =gptel-agent-supervision-answer-questions= | Deliver one answer per question or cancel the batch and continue the request |
 | =gptel-agent-supervision-allow-outside-reads= | Attach the initializing root request to its handle and allow local outside reads during supervision |
 | =gptel-agent-supervision-retry= | Rearm a failed root request's completion gate before the host resumes that same FSM |
 | =gptel-agent-supervision-stop= | Idempotently release supervision and cancel descendants while retaining inspection buffers |
 
-The state callback receives =(handle fsm event)=, where =event= is
-=waiting-discussions= or =changed=. Notifications can repeat. The approval
-callback receives =(handle fsm calls)= with gptel's live tool/callback entries;
-return non-nil to handle the approval, or nil to keep native display. Before
-accepting saved calls, check =gptel-agent-supervision-request-live-p=, that the
-FSM still awaits tools, and that its request info is the same object that
-produced the approval. Approval callbacks and handles must never be persisted.
-Question forms and separate file-review interfaces retain their existing UI.
+The =:on-state-change= callback receives =(handle fsm event)=, where =event= is
+=waiting-discussions= or =changed=. Notifications can repeat. The
+=:on-tool-approval= callback receives =(handle fsm calls)= with gptel's live
+tool/callback entries. Return non-nil to handle the approval, or nil to keep
+native display. Before accepting saved calls, check
+=gptel-agent-supervision-request-live-p=, that the FSM still awaits tools, and
+that its request info is the same object that produced the approval. Approval
+callbacks and handles must never be persisted.
+File reviews use their native interface.
+
+Use =:on-question= to show an =AskUserQuestion= batch in a host interface.
+The callback receives =(handle fsm questions batch)= when the model waits for
+answers or finishes a turn with questions outstanding. The ordered =questions=
+list contains each =:question= and its =:choices= with =:value=, =:description=
+and =:recommended= fields. Offer free text for every question.
+Keep the opaque =batch= and supervision =handle= in the owning process.
+A remote interface can publish the questions with its own ID and route a reply
+back to that process. Call =gptel-agent-supervision-answer-questions= with
+the handle, the batch and one nonblank string per question in an ordered list
+or vector. Passing =nil= for the answers cancels that batch and delivers the
+cancellation to its waiting request.
+Native submission, cancellation and stopped supervision expire the host action.
 
 The host owns the root transport, terminal handlers, retry policy and request
 budget. Stop supervision when an invocation ends, and abort the root transport

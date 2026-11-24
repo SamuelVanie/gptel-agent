@@ -7,13 +7,16 @@
   (declare (indent 0))
   `(gptel-agent-discussion-test--with-chat
      (gptel-agent-workers-test--answer fsm "Initial turn complete")
-     (let* (events approvals
+     (let* (events approvals batches
             (scope (gptel-agent-supervise
                     parent
                     :on-state-change
                     (lambda (handle request event) (push (list handle request event) events))
                     :on-tool-approval
-                    (lambda (handle request calls) (push (list handle request calls) approvals) t))))
+                    (lambda (handle request calls) (push (list handle request calls) approvals) t)
+                    :on-question
+                    (lambda (handle request questions batch)
+                      (push (list handle request questions batch) batches)))))
        (unwind-protect
            (progn
              (with-current-buffer parent
@@ -112,6 +115,75 @@
       (let ((new (gptel-agent-supervise parent)))
         (should-not (eq new scope))
         (gptel-agent-supervision-stop new)))))
+
+(ert-deftest gptel-agent-supervision-questions-continue-only-the-owning-request ()
+  (gptel-agent-supervision-test--with-chat
+    (setq chat (gptel-agent-discussion-test--spawn fsm parent))
+    (let ((child (gptel-agent-discussion--chat-fsm chat)))
+      (gptel-agent-workers-test--tool
+       child "AskUserQuestion" '(:questions [(:question "Which finish?")]))
+      (gptel-agent-workers-test--tool
+       fsm "AskUserQuestion" '(:questions [(:question "Superseded") (:question "Where?")]))
+      (gptel-agent-workers-test--tool
+       fsm "AskUserQuestion"
+       '(:action "update"
+         :questions [(:question_number 1 :question "Which model?"
+                      :choices [(:value "Custom" :description "Hand-built" :recommended t)])]))
+      (should-not batches)
+      (gptel-agent-workers-test--tool fsm "AskUserQuestion" '(:action "wait"))
+      (gptel-agent-workers-test--answer child "Provisional conclusion")
+      (should (eq (gptel-fsm-state child) 'AGQA))
+      (pcase-let ((`((,child-scope ,child-fsm ,_ ,child-batch)
+                     (,root-scope ,root-fsm ,questions ,root-batch)) batches))
+        (should (and (eq scope child-scope) (eq scope root-scope)))
+        (should (and (eq child child-fsm) (eq fsm root-fsm)))
+        (should (equal questions
+                       '((:question "Which model?"
+                          :choices ((:value "Custom" :description "Hand-built" :recommended t)))
+                         (:question "Where?" :choices nil))))
+        (let ((count (length requests)))
+          (dolist (invalid '(("short") ["valid" " "] "invalid"))
+            (should-error (gptel-agent-supervision-answer-questions scope root-batch invalid)
+                          :type 'user-error))
+          (should (gptel-agent-supervision-question-live-p scope root-batch))
+          (should (= count (length requests)))
+          (gptel-agent-supervision-answer-questions scope child-batch nil)
+          (should-not (gptel-agent-discussion--chat-pending chat))
+          (gptel-agent-workers-test--wake child)
+          (should (eq (gptel-fsm-state child) 'WAIT))
+          (should (string-match-p "User cancelled interaction" (gptel-agent-workers-test--data child)))
+          (should (eq (gptel-fsm-state fsm) 'TOOL))
+          (gptel-agent-supervision-answer-questions scope root-batch ["Custom" "Any town"])
+          (should (= (+ 2 count) (length requests)))
+          (should (eq (gptel-fsm-state fsm) 'WAIT))
+          (should (string-match-p (regexp-quote "Q1: Which model?\nR1: Custom\n\nQ2: Where?\nR2: Any town")
+                                  (gptel-agent-workers-test--data fsm))))
+        ;; A fresh queue in the very same FSM must reject the previous token.
+        (gptel-agent-workers-test--tool
+         fsm "AskUserQuestion" '(:questions [(:question "Another?")]))
+        (gptel-agent-workers-test--tool fsm "AskUserQuestion" '(:action "wait"))
+        (should-error (gptel-agent-supervision-answer-questions scope root-batch nil)
+                      :type 'user-error)
+        (let ((fresh (nth 3 (car batches))))
+          (should (gptel-agent-supervision-question-live-p scope fresh))
+          (gptel-agent-supervision-stop scope)
+          (should-error (gptel-agent-supervision-answer-questions scope fresh '("late"))
+                        :type 'user-error))))))
+
+(ert-deftest gptel-agent-supervision-native-question-submission-expires-host-batch ()
+  (gptel-agent-supervision-test--with-chat
+    (gptel-agent-workers-test--tool
+     fsm "AskUserQuestion" '(:questions [(:question "Color?" :choices [(:value "Red")])]))
+    (gptel-agent-workers-test--tool fsm "AskUserQuestion" '(:action "wait"))
+    (let ((batch (nth 3 (car batches))) (count (length requests)))
+      (with-current-buffer (gptel-agent--question-queue-buffer batch)
+        (goto-char (point-min))
+        (gptel-agent--ask-confirm-choice)
+        (gptel-agent--ask-submit))
+      (should (= (1+ count) (length requests)))
+      (should-not (gptel-agent-supervision-question-live-p scope batch))
+      (should-error (gptel-agent-supervision-answer-questions scope batch '("Blue"))
+                    :type 'user-error))))
 
 (ert-deftest gptel-agent-supervision-retry-restores-report-delivery ()
   (gptel-agent-supervision-test--with-chat

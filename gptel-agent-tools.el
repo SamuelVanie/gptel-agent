@@ -2053,13 +2053,13 @@ file/query pair registered for SOURCE's conversation (default current buffer)."
 (cl-defstruct (gptel-agent--supervision
                (:constructor gptel-agent--make-supervision))
   "Private state behind the public supervision API."
-  buffer requests timer stopped on-state-change on-tool-approval allow-outside-reads)
+  buffer requests timer stopped on-state-change on-tool-approval allow-outside-reads on-question)
 
 (defvar-local gptel-agent--supervision nil
   "Host supervision rooted in this conversation, if any.")
 (put 'gptel-agent--supervision 'permanent-local t)
 
-(cl-defun gptel-agent-supervise (buffer &key on-state-change on-tool-approval)
+(cl-defun gptel-agent-supervise (buffer &key on-state-change on-tool-approval on-question)
   "Supervise agent requests rooted in BUFFER and return an opaque handle.
 Call before starting requests.  One live supervisor is allowed per buffer.
 Agent workers and managed discussions inherit supervision, including nested
@@ -2076,6 +2076,11 @@ live tool/callback entries; a host must validate request liveness before
 accepting them with gptel's tool confirmation machinery.  Use
 `gptel-agent-supervision-request-live-p' to reject stopped or closed requests.
 
+ON-QUESTION receives (HANDLE FSM QUESTIONS BATCH) when a request waits
+for its completed question batch.  QUESTIONS contains ordered plists with
+:question text and :choices.  BATCH is a process-local handle for
+`gptel-agent-supervision-answer-questions'.  Native forms remain usable.
+
 The host still owns the root request, its completion callback, transport
 retries and cancellation.  Call `gptel-agent-supervision-stop' when that
 invocation ends, and `gptel-agent-supervision-retry' before retrying a failed
@@ -2088,7 +2093,7 @@ root FSM.  Handles and callbacks are process-local, never persistent data."
     (setq gptel-agent--supervision
           (gptel-agent--make-supervision
            :buffer buffer :on-state-change on-state-change
-           :on-tool-approval on-tool-approval))
+           :on-tool-approval on-tool-approval :on-question on-question))
     (add-hook 'kill-buffer-hook #'gptel-agent--supervision-kill nil t)
     gptel-agent--supervision))
 
@@ -2218,7 +2223,8 @@ transport.  Pending descendant callbacks and automatic sends are invalidated."
           (setq gptel-agent--supervision nil))))
     (setf (gptel-agent--supervision-requests scope) nil
           (gptel-agent--supervision-on-state-change scope) nil
-          (gptel-agent--supervision-on-tool-approval scope) nil)))
+          (gptel-agent--supervision-on-tool-approval scope) nil
+          (gptel-agent--supervision-on-question scope) nil)))
 
 (defun gptel-agent--supervision-kill ()
   "Release this buffer's host supervisor when it is killed."
@@ -4081,6 +4087,44 @@ use `gptel-agent-questions' to show them explicitly."
 (defvar-local gptel-agent--question-queue nil
   "Queue displayed in this questions buffer.")
 
+(defun gptel-agent-supervision-question-live-p (scope batch)
+  "Whether the opaque question BATCH from SCOPE still awaits an answer."
+  (and (gptel-agent--question-queue-p batch)
+       (let ((fsm (gptel-agent--question-queue-fsm batch)))
+         (and (eq scope (plist-get (gptel-fsm-info fsm) :agent-supervision))
+              (gptel-agent-supervision-request-live-p scope fsm)
+              (eq batch (plist-get (gptel-fsm-info fsm) :agent-questions))
+              (gptel-agent--question-queue-callback batch)
+              (overlay-buffer (gptel-agent--question-queue-overlay batch))))))
+
+(defun gptel-agent-supervision-answer-questions (scope batch answers)
+  "Answer SCOPE's pending BATCH once through its native completion callback.
+ANSWERS is a list or vector of nonblank strings in question order.
+Each string may be a choice value or free text.  Use nil to cancel the
+questions and let their request continue.  Invalid answers leave BATCH open."
+  (unless (gptel-agent-supervision-question-live-p scope batch)
+    (user-error "This question batch is no longer pending"))
+  (let* ((ov (gptel-agent--question-queue-overlay batch))
+         (count (length (overlay-get ov 'gptel-ask--questions))))
+    (unless (or (null answers)
+                (and (or (proper-list-p answers) (vectorp answers))
+                     (= (length answers) count)
+                     (seq-every-p (lambda (answer)
+                                    (and (stringp answer)
+                                         (not (string-blank-p answer))))
+                                  answers)))
+      (user-error "Supply one nonblank answer for each of the %d questions" count))
+    (gptel-agent--ask-complete ov answers)))
+
+(defun gptel-agent--ask-description (item)
+  "Return ITEM's question and model choices for a supervising host.
+The last choice opens the native free-text editor and is omitted."
+  (list :question (plist-get item :question)
+        :choices (cl-loop for choice in (butlast (plist-get item :choices))
+                          collect (list :value (plist-get choice :value)
+                                        :description (plist-get choice :description)
+                                        :recommended (eq (plist-get choice :recommended) t)))))
+
 (defun gptel-agent--ask-display-below (buffer alist)
   "Display BUFFER in a new window below the selected one, using ALIST.
 Return nil if that window cannot be split.  Never reuse a neighboring
@@ -4370,6 +4414,13 @@ CALLBACK receives an acknowledgement for edits, or the user's result for wait."
           (with-current-buffer (gptel-agent--question-queue-owner queue)
             (run-hook-with-args 'gptel-agent-question-functions
                                 ov (overlay-get ov 'gptel-ask--questions) source))
+          (when-let* ((scope (plist-get (gptel-fsm-info fsm) :agent-supervision))
+                      (notify (gptel-agent--supervision-on-question scope))
+                      ((gptel-agent-supervision-question-live-p scope queue)))
+            (funcall notify scope fsm
+                     (mapcar #'gptel-agent--ask-description
+                             (overlay-get ov 'gptel-ask--questions))
+                     queue))
           (when (overlay-buffer ov) (gptel-agent--ask-display queue))))))
      (t (setq result "Error: action must be add, update or wait.")))
     (unless deferred (funcall callback result))
@@ -4633,13 +4684,26 @@ interaction."
         (gptel-agent--ask-teardown ov)
         (funcall callback val)))))
 
+(defun gptel-agent--ask-complete (ov answers)
+  "Close OV and deliver ANSWERS in order, or a cancellation for nil."
+  (let ((callback (overlay-get ov 'gptel-ask--callback))
+        (result (if answers
+                    (string-join
+                     (cl-loop for item in (overlay-get ov 'gptel-ask--questions)
+                              for answer in (append answers nil)
+                              for n from 1
+                              collect (format "Q%d: %s\nR%d: %s"
+                                              n (plist-get item :question) n answer))
+                     "\n\n")
+                  "User cancelled interaction.")))
+    (gptel-agent--ask-teardown ov)
+    (when callback (funcall callback result))))
+
 (defun gptel-agent--ask-submit ()
   "Submit all saved answers in the current ask interaction."
   (interactive)
   (when-let* ((ov (gptel-agent--ask-overlay-at-point))
-              (questions (overlay-get ov 'gptel-ask--questions))
-              (answers (overlay-get ov 'gptel-ask--answers))
-              (callback (overlay-get ov 'gptel-ask--callback)))
+              (answers (overlay-get ov 'gptel-ask--answers)))
     (cond
      ((and-let* ((queue (overlay-get ov 'gptel-ask--queue)))
         (not (gptel-agent--question-queue-callback queue)))
@@ -4648,25 +4712,13 @@ interaction."
       (let ((missing (cl-position nil answers)))
         (gptel-agent--ask-goto-question ov missing)
         (message "Answer question %d before submitting" (1+ missing))))
-     (t
-      (let ((formatted-output
-             (mapconcat
-              (lambda (idx)
-                (format "Q%d: %s\nR%d: %s"
-                        (1+ idx) (plist-get (nth idx questions) :question)
-                        (1+ idx) (aref answers idx)))
-              (number-sequence 0 (1- (length questions)))
-              "\n\n")))
-        (gptel-agent--ask-teardown ov)
-        (funcall callback formatted-output))))))
+     (t (gptel-agent--ask-complete ov answers)))))
 
 (defun gptel-agent--ask-cancel ()
   "Cancel ask interaction."
   (interactive)
   (when-let* ((ov (gptel-agent--ask-overlay-at-point)))
-    (let ((cb (overlay-get ov 'gptel-ask--callback)))
-      (gptel-agent--ask-teardown ov)
-      (when cb (funcall cb "User cancelled interaction.")))))
+    (gptel-agent--ask-complete ov nil)))
 
 (defun gptel-agent--ask-presentation-buffer ()
   "Return the buffer in which an Ask interaction should be displayed.
