@@ -184,6 +184,48 @@
         (gptel-agent-compact-test--answer fsm "Summary")
         (should (equal (buffer-string) (concat properties "Summary\n")))))))
 
+(ert-deftest gptel-agent-compact-preserves-completed-org-subtopics-and-ids ()
+  (dolist (child-properties '(":GPTEL_TOPIC: child\n:ID: persistent-id"
+                              ":ID: persistent-id"))
+    (gptel-agent-compact-test--with-chat
+      (let ((backend gptel-backend))
+        (org-mode)
+        (setq-local gptel-backend backend gptel-model 'test gptel-use-curl t))
+      (let* ((nested-topic (string-prefix-p ":GPTEL_TOPIC:" child-properties))
+             (header (concat "* Parent topic\n:PROPERTIES:\n:GPTEL_TOPIC: parent\n:END:\n"
+                             "Earlier turns\n** Child\n:PROPERTIES:\n" child-properties
+                             "\n:END:\n"))
+             (child "Child discussion\n*** Nested reply\nMore detail\n")
+             (later "** Back to parent\nLater discussion")
+             (suffix "\nUnselected draft"))
+        (insert header child later suffix)
+        (backward-char (length suffix))
+        (let* ((fsm (gptel-agent-compact))
+               (messages (plist-get (plist-get (gptel-fsm-info fsm) :data) :messages)))
+          (should (equal (plist-get (aref messages 1) :content)
+                         (concat (unless nested-topic child) later)))
+          (gptel-agent-compact-test--answer fsm "Summary")
+          (should (equal (buffer-string)
+                         (concat header (when nested-topic child) "Summary\n" suffix))))))))
+
+(ert-deftest gptel-agent-compact-protects-custom-org-exclusions ()
+  (gptel-agent-compact-test--with-chat
+    (let ((backend gptel-backend))
+      (org-mode)
+      (setq-local gptel-backend backend gptel-model 'test gptel-use-curl t
+                  gptel-org-ignore-elements '(property-drawer comment)))
+    (let ((transcript "Old discussion\n# Private note\nNew discussion"))
+      (insert transcript)
+      (should-error (gptel-agent-compact) :type 'user-error)
+      (should (equal (buffer-string) transcript))
+      (should-not requests)
+      (let ((transient-mark-mode t))
+        (set-mark (line-beginning-position))
+        (activate-mark)
+        (let ((fsm (gptel-agent-compact)))
+          (gptel-agent-compact-test--answer fsm "Summary")
+          (should (equal (buffer-string) "Old discussion\n# Private note\nSummary\n")))))))
+
 (ert-deftest gptel-agent-compact-prefix-snapshot-matches-word-end ()
   (gptel-agent-compact-test--with-chat
     (insert "Earlier conversation\nDraft")

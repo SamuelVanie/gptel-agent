@@ -81,6 +81,10 @@
 (declare-function org-entry-properties "org")
 (declare-function org-end-of-meta-data "org")
 (declare-function org-at-heading-p "org")
+(declare-function org-end-of-subtree "org")
+(declare-function org-element-map "org-element")
+(declare-function org-element-parse-buffer "org-element")
+(declare-function org-element-type "org-element")
 (declare-function gptel-org--get-topic-start "gptel-org")
 (declare-function gptel-agent--update-skill-tool "gptel-agent-tools")
 (declare-function gptel-agent--update-agent-tool "gptel-agent-tools")
@@ -90,6 +94,8 @@
 (defvar org-inhibit-startup)
 (defvar project-prompter)
 (defvar gptel-org-branching-context)
+(defvar gptel-org-ignore-elements)
+(defvar org-property-drawer-re)
 
 ;;; User options
 (defcustom gptel-agent-dirs
@@ -1263,26 +1269,49 @@ See `gptel-request' for the meanings of RESP and INFO."
          info (if (eq resp 'abort) "Compaction canceled"
                 "Compaction stalled or failed"))))))
 
+(defun gptel-agent-compact--org-start (start end)
+  "Find the contiguous conversation suffix between START and END in Org."
+  (require 'gptel-org)
+  (save-excursion
+    (save-restriction
+      (widen)
+      (goto-char (max start (1- end)))
+      (let ((topic (gptel-org--get-topic-start)))
+        (goto-char (or topic (point-min)))
+        (when (and topic (org-at-heading-p)) (org-end-of-meta-data))
+        (setq start (max start (point)))
+        ;; gptel normally strips property drawers while building its prompt.
+        ;; Keep them in the transcript.  A different topic owns its whole
+        ;; subtree, including turns that follow the topic's property drawer.
+        (while (and (re-search-forward org-property-drawer-re nil t)
+                    (< (match-beginning 0) end))
+          (let ((drawer-end (point)))
+            (goto-char (match-beginning 0))
+            (if-let* ((owner (gptel-org--get-topic-start))
+                      ((not (equal owner topic)))
+                      ((progn (goto-char owner) (org-at-heading-p))))
+                (org-end-of-subtree t t)
+              (goto-char drawer-end)
+              (forward-line 1))
+            (setq start (max start (point))))))))
+  ;; Custom Org exclusions can omit larger structures such as comments or
+  ;; source blocks.  A narrower explicit selection lets the user keep them.
+  (when-let* (((< start end))
+              (ignored (remq 'property-drawer gptel-org-ignore-elements))
+              (element
+               (with-restriction start end :label 'gptel-agent-compact
+                 (org-element-map (org-element-parse-buffer 'element) ignored
+                   #'org-element-type nil t))))
+    (user-error "Selection contains an excluded Org %s; select a smaller range" element))
+  start)
+
 (defun gptel-agent-compact--bounds ()
   "Return the accessible transcript range to compact."
   (let* ((region (use-region-p))
          (start (if region (region-beginning) (point-min)))
          (end (if region (region-end) (gptel--at-word-end (point)))))
     (when (derived-mode-p 'org-mode)
-      (require 'gptel-org)
-      (save-excursion
-        (save-restriction
-          (widen)
-          (goto-char (max start (1- end)))
-          (let ((topic (gptel-org--get-topic-start)))
-            (goto-char (or topic (point-min)))
-            (if (org-at-heading-p)
-                (when topic (org-end-of-meta-data))
-              ;; Preserve the file-level properties of a saved gptel chat.
-              (when-let* ((drawer (org-get-property-block)))
-                (goto-char (cdr drawer))
-                (forward-line 1)))
-            (setq start (max start (point)))))))
+      (setq start (gptel-agent-compact--org-start start end)))
     (when (>= start end)
       (user-error "No conversation text to compact"))
     ;; Keep later insertions at either boundary outside the selection.
@@ -1295,7 +1324,9 @@ This will replace buffer text with an LLM generated summary, provided
 the selected text has not changed while the request was in progress.
 Include all turns in the selection regardless of the chat history limit.
 When the selection ends in an Org topic, compact only its body within
-the selection.  Preserve the topic heading and its properties.
+the selection.  Preserve its heading, property drawers and completed
+child topics by compacting the contiguous text after them.  Select a
+smaller range if it contains another excluded Org element.
 If replacement fails, keep the summary in a separate buffer instead.
 Empty or reasoning-only output leaves the transcript intact.  If the
 provider reports an incomplete or unrecognized stop reason, retain the
