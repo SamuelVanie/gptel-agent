@@ -1,0 +1,150 @@
+;;; gptel-agent-session-damage-test.el --- Damaged family isolation -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'gptel-agent-session-checkpoint-test)
+
+(defun gptel-agent-session-damage-test--manifest (id)
+  "Return the path to ID's family manifest in the test store."
+  (expand-file-name (concat "families/" id ".eld") gptel-agent-session-directory))
+
+(defun gptel-agent-session-damage-test--contents (file)
+  "Return the literal contents of FILE."
+  (with-temp-buffer
+    (insert-file-contents-literally file)
+    (buffer-string)))
+
+(ert-deftest gptel-agent-session-damage-isolated-at-startup ()
+  (gptel-agent-session-test--with-store
+    (let* ((good (gptel-agent-session-test--buffer " *intact session*" "Intact"))
+           (bad (gptel-agent-session-test--buffer " *damaged session*" "Parent"))
+           (child (gptel-agent-session-manager-test--child bad " *damaged child*"))
+           (leaf (gptel-agent-session-manager-test--child child " *damaged grandchild*")))
+      (gptel-agent-session-mode 1)
+      (gptel-agent-session-save)
+      (let* ((good-id (gptel-agent-session-manager-test--id good))
+             (bad-id (gptel-agent-session-manager-test--id bad))
+             (child-id (gptel-agent-session-manager-test--id child))
+             (leaf-id (gptel-agent-session-manager-test--id leaf))
+             (leaf-file (gptel-agent-session--file leaf-id))
+             (manifest (gptel-agent-session-damage-test--manifest bad-id))
+             (backup (gptel-agent-session-damage-test--contents manifest))
+             (versions (mapcar #'gptel-agent-session--file (list bad-id child-id)))
+             (legacy (mapcar (lambda (id) (expand-file-name (concat id ".eld")
+                                                            gptel-agent-session-directory))
+                             (list bad-id child-id)))
+             warnings)
+        (gptel-agent-session-mode -1)
+        (mapc #'kill-buffer (list leaf child bad good))
+        ;; Leftover pre-migration copies must stay both hidden and intact.
+        (cl-mapc #'copy-file versions legacy)
+        (with-temp-file manifest (insert "("))
+        (cl-letf (((symbol-function 'display-warning)
+                   (lambda (type message &rest _)
+                     (when (eq type 'gptel-agent-session) (push message warnings)))))
+          (setq good (gptel-agent-session-restore good-id))
+          (should (equal "Intact" (with-current-buffer good (buffer-string))))
+          (should gptel-agent-session-mode)
+          (should (equal (list good-id)
+                         (mapcar (lambda (r) (plist-get r :id)) (gptel-agent-session--catalog))))
+          (dolist (id (list bad-id child-id))
+            (should (string-search (file-truename manifest)
+                                   (error-message-string
+                                    (should-error (gptel-agent-session-restore id)
+                                                  :type 'user-error)))))
+          (should (= 1 (length warnings)))
+          (should (string-search (file-truename manifest) (car warnings))))
+        (gptel-agent-session-checkpoint-test--append good " autosaved")
+        (gptel-agent-session--drain)
+        (should (equal "Intact autosaved" (gptel-agent-session-checkpoint-test--text good)))
+        (should (equal "(" (gptel-agent-session-damage-test--contents manifest)))
+        (should (file-exists-p leaf-file))
+        (dolist (file (append versions legacy)) (should (file-exists-p file)))
+        ;; Repair and refresh make the family available without restarting.
+        (with-temp-file manifest (insert backup))
+        (setq bad (gptel-agent-session-restore child-id))
+        (should (equal "Parent" (with-current-buffer bad (buffer-string))))
+        (setq child (gptel-agent-discussion--chat-buffer
+                     (car (buffer-local-value 'gptel-agent-discussion--children bad)))
+              leaf (gptel-agent-discussion--chat-buffer
+                    (car (buffer-local-value 'gptel-agent-discussion--children child))))
+        (should (equal child-id (gptel-agent-session-manager-test--id child)))
+        (should (equal leaf-id (gptel-agent-session-manager-test--id leaf)))
+        (should (equal bad-id (gethash leaf-id gptel-agent-session--member-roots)))
+        (gptel-agent-session-checkpoint-test--append leaf " recovered")
+        (gptel-agent-session--drain)
+        (should (string-suffix-p " recovered" (gptel-agent-session-checkpoint-test--text leaf)))))))
+
+(ert-deftest gptel-agent-session-damage-live-autosave-preserves-manifest ()
+  (gptel-agent-session-test--with-store
+    (let* ((bad (gptel-agent-session-test--buffer " *live damage*" "Original"))
+           (good (gptel-agent-session-test--buffer " *live healthy*" "Unrelated")))
+      (gptel-agent-session-mode 1)
+      (gptel-agent-session-save)
+      (let* ((id (gptel-agent-session-manager-test--id bad))
+             (version (gptel-agent-session--file id))
+             (manifest (gptel-agent-session-damage-test--manifest id))
+             (backup (gptel-agent-session-damage-test--contents manifest)))
+        ;; Damage after the initial scan, with both previously saved chats live.
+        (with-temp-file manifest (insert "("))
+        (gptel-agent-session-checkpoint-test--append bad " queued")
+        (gptel-agent-session-checkpoint-test--append good " saved")
+        (gptel-agent-session--drain)
+        (should (equal "(" (gptel-agent-session-damage-test--contents manifest)))
+        (should (file-exists-p version))
+        (should (equal "Unrelated saved" (gptel-agent-session-checkpoint-test--text good)))
+        ;; A refresh detects the damage.  An in-flight transaction must still
+        ;; respect it on retry, even if all its versions have been staged.
+        (gptel-agent-session--catalog)
+        (gptel-agent-session-save)
+        (should (equal "(" (gptel-agent-session-damage-test--contents manifest)))
+        (should (file-exists-p version))
+        ;; A different valid checkpoint can be restored from backup.  A
+        ;; queued transaction based on the old versions must not overwrite it.
+        (let* ((repaired (read backup))
+               (entry (car (plist-get repaired :members)))
+               (copy (gptel-agent-session-store--version-file
+                      gptel-agent-session-directory id (gptel-agent-session--new-id))))
+          (copy-file version copy)
+          (setf (plist-get entry :file) (concat "snapshots/" (file-name-nondirectory copy)))
+          (with-temp-file manifest (prin1 repaired (current-buffer)))
+          (gptel-agent-session--catalog)
+          (gptel-agent-session-save)
+          (should (equal repaired (gptel-agent-session-store--read manifest)))
+          (should (file-exists-p copy)))
+        (with-temp-file manifest (insert backup))
+        (gptel-agent-session--catalog)
+        (gptel-agent-session-save)
+        (should (equal "Original queued" (gptel-agent-session-checkpoint-test--text bad)))))))
+
+(ert-deftest gptel-agent-session-damage-conflicting-members-hide-both-families ()
+  (gptel-agent-session-test--with-store
+    (let* ((one (gptel-agent-session-test--buffer " *first owner*" "One"))
+           (two (gptel-agent-session-test--buffer " *second owner*" "Two"))
+           (child (gptel-agent-session-manager-test--child one " *disputed child*"))
+           (good (gptel-agent-session-test--buffer " *independent owner*" "Independent")))
+      (gptel-agent-session-mode 1)
+      (gptel-agent-session-save)
+      (let* ((one-id (gptel-agent-session-manager-test--id one))
+             (two-id (gptel-agent-session-manager-test--id two))
+             (good-id (gptel-agent-session-manager-test--id good))
+             (child-id (gptel-agent-session-manager-test--id child))
+             (file (gptel-agent-session-damage-test--manifest two-id))
+             (manifest (gptel-agent-session-store--read file))
+             (entry (copy-sequence (gptel-agent-session-store--entry
+                                    gptel-agent-session-directory child-id))))
+        (gptel-agent-session-mode -1)
+        (mapc #'kill-buffer (list child one two good))
+        (setf (plist-get entry :parent) two-id)
+        (push entry (plist-get manifest :members))
+        (with-temp-file file (prin1 manifest (current-buffer)))
+        (should (buffer-live-p (gptel-agent-session-restore good-id)))
+        (should (equal (list good-id)
+                       (mapcar (lambda (r) (plist-get r :id)) (gptel-agent-session--catalog))))
+        (dolist (id (list one-id two-id child-id))
+          (should (string-search "claimed by both"
+                                 (error-message-string
+                                  (should-error (gptel-agent-session-restore id)
+                                                :type 'user-error)))))))))
+
+(provide 'gptel-agent-session-damage-test)
+;;; gptel-agent-session-damage-test.el ends here

@@ -61,23 +61,23 @@ once this transaction has written a new snapshot for the member."
   (gptel-agent-session-checkpoint--reset)
   (let ((index (gptel-agent-session-store--index gptel-agent-session-directory t)))
     (maphash
-     (lambda (id root)
-       (puthash id root gptel-agent-session--member-roots)
-       (unless (gethash root gptel-agent-session--family-members)
-         (puthash root (make-hash-table :test #'equal) gptel-agent-session--family-members))
-       (puthash id t (gethash root gptel-agent-session--family-members)))
-     (plist-get index :owners))))
+     (lambda (id _)
+       (let ((root (gethash id (plist-get index :owners))))
+         (puthash id root gptel-agent-session--member-roots)
+         (unless (gethash root gptel-agent-session--family-members)
+           (puthash root (make-hash-table :test #'equal) gptel-agent-session--family-members))
+         (puthash id t (gethash root gptel-agent-session--family-members))))
+     (plist-get index :entries))))
 
-(defun gptel-agent-session-checkpoint--register (buffer)
-  "Update BUFFER's family membership without scanning unrelated chats."
+(defun gptel-agent-session-checkpoint--register (buffer &optional restored-root)
+  "Update BUFFER's family membership without scanning unrelated chats.
+RESTORED-ROOT is the verified root when restoring from a fresh store index."
   (with-current-buffer buffer
     (let* ((id gptel-agent-session--id)
            (old (gethash id gptel-agent-session--member-roots))
-           (root (if gptel-agent-session--parent-id
-                     (or (gethash gptel-agent-session--parent-id gptel-agent-session--member-roots)
-                         old
-                         gptel-agent-session--parent-id)
-                   (or old id))))
+           (root (or restored-root
+                     (gethash gptel-agent-session--parent-id gptel-agent-session--member-roots)
+                     old gptel-agent-session--parent-id id)))
       (unless (gethash root gptel-agent-session--family-members)
         (puthash root (make-hash-table :test #'equal) gptel-agent-session--family-members))
       ;; A new child is initially enabled as an ordinary gptel buffer before
@@ -140,16 +140,22 @@ once this transaction has written a new snapshot for the member."
                              :root root :generation (gptel-agent-session--new-id)
                              :entries entries :required required :old old
                              :membership-revision (gethash root gptel-agent-session--membership-revisions 0))))
-          (dolist (entry old) (puthash (plist-get entry :id) entry entries))
+          ;; A repair can reveal archived members after mode startup.  Include
+          ;; them even when no live buffer has registered their membership.
+          (dolist (entry old)
+            (let ((id (plist-get entry :id)))
+              (puthash id entry entries)
+              (puthash id t required)))
+          (maphash (lambda (id _) (puthash id t required))
+                   (gethash root gptel-agent-session--family-members))
           (maphash
            (lambda (id _)
-             (puthash id t required)
              (let ((entry (gethash id entries)) (live (gethash id gptel-agent-session--buffers)))
                (when (or (null entry)
                          (not (string-prefix-p "snapshots/" (plist-get entry :file)))
                          (and (buffer-live-p live) (gethash live gptel-agent-session--dirty)))
                  (push id pending))))
-           (gethash root gptel-agent-session--family-members))
+           required)
           (setf (gptel-agent-session-checkpoint--transaction-pending transaction) (nreverse pending))
           (puthash root transaction gptel-agent-session--transactions)
           transaction))))
@@ -212,7 +218,8 @@ once this transaction has written a new snapshot for the member."
       (gptel-agent-session--assert-writer)
       (gptel-agent-session-store--commit
        gptel-agent-session-directory root
-       (gptel-agent-session-checkpoint--transaction-generation transaction) entries)
+       (gptel-agent-session-checkpoint--transaction-generation transaction) entries
+       (gptel-agent-session-checkpoint--transaction-old transaction))
       (remhash root gptel-agent-session--transactions)
       ;; Only changed obsolete versions are collected, never a store-wide scan
       ;; on each save.  A crash during cleanup leaves harmless unused files.

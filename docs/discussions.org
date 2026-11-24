@@ -369,6 +369,14 @@ their history or safely infer which work was already done. A missing or corrupt
 member of a committed checkpoint makes restoration fail before opening a
 partial family.
 
+When a store scan finds an unreadable manifest, a damaged legacy header, or
+conflicting ownership, Emacs reports the file path and reason in =*Warnings*=.
+The session browser omits the affected records. Other families can still be
+saved and restored. While a manifest is damaged, legacy records with unknown
+parents also stay hidden. The saver preserves the affected files and defers
+pruning unreferenced versions. After repairing the files, refresh the session
+browser with =g=. A pending save can retry against its original checkpoint.
+
 Saving is incremental: edits and metadata changes queue a chat once, without
 scanning its transcript on every keystroke. While changes are queued, one timer
 checks each second and processes a small batch while Emacs is idle. When the
