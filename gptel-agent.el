@@ -79,6 +79,9 @@
 (declare-function project-root "project")
 (declare-function org-get-property-block "org")
 (declare-function org-entry-properties "org")
+(declare-function org-end-of-meta-data "org")
+(declare-function org-at-heading-p "org")
+(declare-function gptel-org--get-topic-start "gptel-org")
 (declare-function gptel-agent--update-skill-tool "gptel-agent-tools")
 (declare-function gptel-agent--update-agent-tool "gptel-agent-tools")
 (declare-function gptel-agent--full-agent-definitions "gptel-agent-tools")
@@ -1242,11 +1245,39 @@ See `gptel-request' for the meanings of RESP and INFO."
          info (if (eq resp 'abort) "Compaction canceled"
                 "Compaction stalled or failed"))))))
 
+(defun gptel-agent-compact--bounds ()
+  "Return the accessible transcript range to compact."
+  (let* ((region (use-region-p))
+         (start (if region (region-beginning) (point-min)))
+         (end (if region (region-end) (gptel--at-word-end (point)))))
+    (when (derived-mode-p 'org-mode)
+      (require 'gptel-org)
+      (save-excursion
+        (save-restriction
+          (widen)
+          (goto-char (max start (1- end)))
+          (let ((topic (gptel-org--get-topic-start)))
+            (goto-char (or topic (point-min)))
+            (if (org-at-heading-p)
+                (when topic (org-end-of-meta-data))
+              ;; Preserve the file-level properties of a saved gptel chat.
+              (when-let* ((drawer (org-get-property-block)))
+                (goto-char (cdr drawer))
+                (forward-line 1)))
+            (setq start (max start (point)))))))
+    (when (>= start end)
+      (user-error "No conversation text to compact"))
+    ;; Keep later insertions at either boundary outside the selection.
+    (cons (copy-marker start t) (copy-marker end nil))))
+
 (defun gptel-agent-compact (&optional extra post-func confirm)
   "Compact contents of buffer up to point, or region if active.
 
 This will replace buffer text with an LLM generated summary, provided
 the selected text has not changed while the request was in progress.
+Include all turns in the selection regardless of the chat history limit.
+When the selection ends in an Org topic, compact only its body within
+the selection.  Preserve the topic heading and its properties.
 If replacement fails, keep the summary in a separate buffer instead.
 For prompt compaction instructions see `gptel-agent-compact-prompt'.
 
@@ -1266,40 +1297,38 @@ confirmation before proceeding."
    (list (and current-prefix-arg
               (read-string "Extra compaction instructions: "))
          nil t))
-  (when confirm
-    (unless (y-or-n-p
-             (concat "Prompt compaction will replace all buffer text "
-                     (if (use-region-p) "in the region." "before point.")
-                     "  Proceed?"))
-      (user-error "Prompt compaction canceled")))
-  (gptel--update-status " Compacting..." 'warning)
-  (let* ((gptel-include-reasoning)
-         (gptel-use-tools)
-         (gptel-org-branching-context)
-         (start (if (use-region-p) (region-beginning) (point-min)))
-         (end (if (use-region-p) (region-end) (gptel--at-word-end (point))))
-         ;; Track the original text, excluding new insertions at either
-         ;; boundary.  Outside edits can move the selection without
-         ;; invalidating the summary or being removed by its insertion.
-         (context (list :start (copy-marker start t)
-                        :end (copy-marker end nil)
-                        :original (buffer-substring-no-properties start end)))
-         (fsm (gptel-request nil
-                :system
-                (if extra
-                    (let ((parts (gptel--parse-directive gptel-agent-compact-prompt t)))
-                      (cons (concat (car parts)
-                                    "\n\nAdditional instructions:\n\n" extra)
-                            (cdr parts)))
-                  gptel-agent-compact-prompt)
-                :transforms (list 'gptel-agent-instructions--skip
-                                  'gptel--transform-add-context)
-                :context context
-                :callback #'gptel-agent-compact--callback)))
-    (prog1 fsm
+  (pcase-let ((`(,start . ,end) (gptel-agent-compact--bounds)))
+    (when (and confirm
+               (not (y-or-n-p (format "Replace %d characters of conversation with a summary? "
+                                      (- end start)))))
+      (user-error "Prompt compaction canceled"))
+    (gptel--update-status " Compacting..." 'warning)
+    (let* ((gptel-include-reasoning nil)
+           (gptel-use-tools nil)
+           (gptel-org-branching-context nil)
+           (gptel--num-messages-to-send nil)
+           (context (list :start start :end end
+                          :original (buffer-substring-no-properties start end)))
+           (system (if extra
+                       (let ((parts (gptel--parse-directive gptel-agent-compact-prompt t)))
+                         (cons (concat (car parts) "\n\nAdditional instructions:\n\n" extra)
+                               (cdr parts)))
+                     gptel-agent-compact-prompt))
+           (mark-active nil)
+           (fsm (save-excursion
+                  ;; Org topic lookup can widen even inside an active region.
+                  (with-restriction start end :label 'gptel-agent-compact
+                    (goto-char (point-max))
+                    (gptel-request nil
+                      :system system
+                      :transforms '(gptel-agent-instructions--skip
+                                    gptel--transform-add-context)
+                      :context context
+                      :callback #'gptel-agent-compact--callback)))))
       (when (functionp post-func)
         (let ((info (gptel-fsm-info fsm)))
-          (plist-put info :post (cons post-func (plist-get info :post))))))))
+          (plist-put info :post (cons post-func (plist-get info :post)))))
+      fsm)))
 
 (defconst gptel-agent--header-presets
   '((gptel-agent "Agent" font-lock-keyword-face)

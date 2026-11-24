@@ -104,6 +104,86 @@
       (should-not (plist-get (gptel-fsm-info fsm) :summary-buffer))
       (should-not displayed))))
 
+(ert-deftest gptel-agent-compact-sends-all-selected-turns-despite-history-limit ()
+  (gptel-agent-compact-test--with-chat
+    (setq-local gptel-mode t gptel--num-messages-to-send 1)
+    (insert "Unselected start\n")
+    (let ((transient-mark-mode t)
+          (start (point)))
+      (dotimes (i 5)
+        (insert (format "Question %s\n" i)
+                (propertize (format "Answer %s" i) 'gptel 'response) "\n"))
+      (let ((end (point)))
+        (insert "Unsent draft")
+        (set-mark end)
+        (goto-char start)
+        (activate-mark)
+        (let* ((fsm (gptel-agent-compact))
+               (messages (plist-get (plist-get (gptel-fsm-info fsm) :data)
+                                    :messages)))
+          (should (equal
+                   (cl-loop for message across messages
+                            unless (equal (plist-get message :role) "system")
+                            collect (list (plist-get message :role)
+                                          (plist-get message :content)))
+                   (cl-loop for i below 5
+                            append (list (list "user" (format "Question %s" i))
+                                         (list "assistant" (format "Answer %s" i))))))
+          (should (equal gptel--num-messages-to-send 1))
+          (gptel-agent-compact-test--answer fsm "Summary")
+          (should (equal (buffer-string) "Unselected start\nSummary\nUnsent draft")))))))
+
+(ert-deftest gptel-agent-compact-org-topic-keeps-heading-properties-and-other-topic ()
+  (dolist (selection '(prefix region crossing-region))
+    (gptel-agent-compact-test--with-chat
+      (let ((backend gptel-backend))
+        (org-mode)
+        (setq-local gptel-backend backend gptel-model 'test gptel-use-curl t))
+      (let* ((transient-mark-mode t)
+             (header (concat "* Old topic\nOther conversation\n* Current topic\n"
+                             ":PROPERTIES:\n:GPTEL_TOPIC: current\n:END:\n"))
+             (earlier "Earlier within topic\n")
+             (selected "** Follow-up\nLatest question\n")
+             (suffix " A later draft"))
+        (insert header earlier selected suffix)
+        (goto-char (- (point-max) (length suffix)))
+        (unless (eq selection 'prefix)
+          (set-mark (point))
+          (if (eq selection 'region)
+              (backward-char (length selected))
+            (goto-char (point-min)))
+          (activate-mark))
+        (let* ((fsm (gptel-agent-compact))
+               (messages (plist-get (plist-get (gptel-fsm-info fsm) :data)
+                                    :messages))
+               (turns (cl-loop for message across messages
+                               when (equal (plist-get message :role) "user")
+                               collect (plist-get message :content))))
+          (should (equal turns
+                         (list (string-trim-right
+                                (if (eq selection 'region) selected
+                                  (concat earlier selected))))))
+          (gptel-agent-compact-test--answer fsm "Summary")
+          (should (equal (buffer-string)
+                         (concat header (when (eq selection 'region) earlier)
+                                 "Summary\n" suffix))))))))
+
+(ert-deftest gptel-agent-compact-preserves-org-file-properties ()
+  (gptel-agent-compact-test--with-chat
+    (let ((backend gptel-backend)
+          (properties ":PROPERTIES:\n:GPTEL_MODEL: private-setting\n:END:\n"))
+      (org-mode)
+      (setq-local gptel-backend backend gptel-model 'test gptel-use-curl t)
+      (insert properties)
+      (should-error (gptel-agent-compact) :type 'user-error)
+      (should-not requests)
+      (insert "The conversation")
+      (let* ((fsm (gptel-agent-compact))
+             (messages (plist-get (plist-get (gptel-fsm-info fsm) :data) :messages)))
+        (should (equal (plist-get (aref messages 1) :content) "The conversation"))
+        (gptel-agent-compact-test--answer fsm "Summary")
+        (should (equal (buffer-string) (concat properties "Summary\n")))))))
+
 (ert-deftest gptel-agent-compact-prefix-snapshot-matches-word-end ()
   (gptel-agent-compact-test--with-chat
     (insert "Earlier conversation\nDraft")
