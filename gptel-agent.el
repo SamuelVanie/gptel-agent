@@ -1197,6 +1197,12 @@ When SUMMARY is available, retain it in a separate buffer for recovery."
                (format "; summary saved in %s" (buffer-name summary-buffer))
              "")))
 
+(defun gptel-agent-compact--missing-summary-p (info)
+  "Fail a finished request in INFO if gptel delivered no summary callback."
+  (unless (or (plist-get info :error) (plist-get info :summary))
+    (gptel-agent-compact--fail info "No summary received; transcript preserved")
+    t))
+
 (defun gptel-agent-compact--callback (resp info)
   "Callback for `gptel-agent-compact'.
 
@@ -1204,16 +1210,28 @@ See `gptel-request' for the meanings of RESP and INFO."
   (let ((buf (plist-get info :buffer)))
     (cond
      ((and (consp resp) (eq (car resp) 'reasoning)) nil)
+     ((plist-get info :error)
+      (let ((partial (and (stringp resp) (not (string-blank-p resp)) resp)))
+        (when partial (plist-put info :summary partial))
+        (gptel-agent-compact--fail info (plist-get info :error) partial)))
      ((null resp)                       ;error
       (gptel-agent-compact--fail
-       info (or (plist-get info :error) (plist-get info :status)
-                "No summary received")))
+       info (or (plist-get info :status) "No summary received")))
+     ((and (stringp resp)
+           (or (string-blank-p resp)
+               ;; gptel passes an unclosed reasoning block through as text.
+               (string-match-p "\\`[[:space:]]*<think>" resp)))
+      (gptel-agent-compact--fail info "No summary received; transcript preserved"))
      ((stringp resp)
       (plist-put info :summary resp)
       ;; Callback errors are demoted by gptel.  Set :error explicitly so
       ;; its state machine and post functions see failed replacements.
       (condition-case err
           (progn
+            (when-let* ((reason (plist-get info :stop-reason))
+                        ((not (member reason '("stop" "STOP" "end_turn"
+                                               "stop_sequence" "completed")))))
+              (error "Provider stopped with %s; transcript preserved" reason))
             (unless (buffer-live-p buf)
               (error "Session buffer is no longer available"))
             (with-current-buffer buf
@@ -1279,6 +1297,9 @@ Include all turns in the selection regardless of the chat history limit.
 When the selection ends in an Org topic, compact only its body within
 the selection.  Preserve the topic heading and its properties.
 If replacement fails, keep the summary in a separate buffer instead.
+Empty or reasoning-only output leaves the transcript intact.  If the
+provider reports an incomplete or unrecognized stop reason, retain the
+returned text in the recovery buffer for inspection or retry.
 For prompt compaction instructions see `gptel-agent-compact-prompt'.
 
 With prefix argument, prompt for EXTRA instructions.
@@ -1321,6 +1342,12 @@ confirmation before proceeding."
                     (goto-char (point-max))
                     (gptel-request nil
                       :system system
+                      ;; On HTTP success with no text gptel may skip CALLBACK
+                      ;; entirely.  Detect this before its terminal handlers.
+                      :fsm (gptel-make-fsm
+                            :table (cons `(TYPE (gptel-agent-compact--missing-summary-p . ERRS)
+                                                ,@(alist-get 'TYPE gptel-request--transitions))
+                                         gptel-request--transitions))
                       :transforms '(gptel-agent-instructions--skip
                                     gptel--transform-add-context)
                       :context context
