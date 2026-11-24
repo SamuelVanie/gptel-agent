@@ -114,12 +114,35 @@
       (gptel-agent-session-save)
       (should (equal "Source" (plist-get (gptel-agent-session--read copy-id) :text))))))
 
+(ert-deftest gptel-agent-session-standalone-captures-effective-directive ()
+  (gptel-agent-session-test--with-store
+    (let ((source (gptel-agent-session-test--buffer "*directive chat*" "Prompt"))
+          (gptel--known-presets (copy-tree gptel--known-presets))
+          (activations 0))
+      (gptel-make-preset 'session-directive :system "Original instructions"
+                         :post (lambda () (cl-incf activations)))
+      (with-current-buffer source
+        (gptel--apply-preset
+         'session-directive (lambda (key value) (set (make-local-variable key) value)))
+        (dolist (expected '(nil "Custom instructions" ("Custom" "Example" "Response")))
+          (setq-local gptel-system-prompt
+                      (lambda () (should (eq source (current-buffer))) expected))
+          (let* ((record (gptel-agent-session-buffer-record source))
+                 (setting (assq 'gptel-system-prompt (plist-get record :settings)))
+                 (copy (gptel-agent-session-buffer-from-record record)))
+            (should setting)
+            (should (equal expected (cdr setting)))
+            (should (equal expected (buffer-local-value 'gptel-system-prompt copy)))
+            (should (eq 'session-directive (buffer-local-value 'gptel--preset copy))))))
+      (should (= activations 1)))))
+
 (ert-deftest gptel-agent-session-standalone-rejects-invalid-records ()
   (gptel-agent-session-test--with-store
     (let* ((source (gptel-agent-session-test--buffer "*source chat*" "Prompt"))
            (record (gptel-agent-session-buffer-record source)))
       (dolist (entry '((:version . 2) (:mode . fundamental-mode)
                        (:settings (gptel-system-prompt . kill-emacs))
+                       (:settings (gptel-system-prompt . "Safe") (gptel-system-prompt . kill-emacs))
                        (:settings (gptel-use-curl . "/unknown/program"))
                        (:bounds (response (1 99))) (:draft . -1)))
         (should-error (gptel-agent-session-buffer-from-record

@@ -1051,6 +1051,8 @@ FAMILY-ID supplies the shared display identity for a native family restore."
   "Capture BUFFER as an independent, data-only gptel session record.
 The record contains the full chat, role boundaries, draft, view and
 session settings.  A workflow host can embed it in its own checkpoint.
+Function-valued system prompts are resolved in BUFFER at capture time,
+including any example conversation in the directive.
 If supplied, FSM is the host-owned request whose policy ceiling should
 survive restoration.  Saving works independently of `gptel-agent-session-mode'."
   (unless (and (buffer-live-p buffer) (buffer-local-value 'gptel-mode buffer))
@@ -1058,17 +1060,17 @@ survive restoration.  Saving works independently of `gptel-agent-session-mode'."
   (when (and fsm (not (eq buffer (plist-get (gptel-fsm-info fsm) :buffer))))
     (error "Tool policy request belongs to a different conversation"))
   (with-current-buffer buffer
-    (let ((record (gptel-agent-session--standalone-record
-                   (gptel-agent-session--snapshot fsm))))
-      ;; Keep executable settings local to the host that configured them.
-      (setf (plist-get record :settings)
-            (cl-remove-if
-             (lambda (entry)
-               (pcase (car entry)
-                 ('gptel-system-prompt (functionp (cdr entry)))
-                 ('gptel-use-curl (stringp (cdr entry)))))
-             (plist-get record :settings)))
-      record)))
+    (let* ((record (gptel-agent-session--snapshot fsm))
+           (settings (plist-get record :settings)))
+      (when (functionp gptel-system-prompt)
+        (let ((parts (gptel--parse-directive gptel-system-prompt 'raw)))
+          (setf (alist-get 'gptel-system-prompt settings)
+                (if (cdr parts) parts (car parts)))))
+      ;; A host-specific executable path must stay local.
+      (when (stringp (alist-get 'gptel-use-curl settings))
+        (setq settings (assq-delete-all 'gptel-use-curl settings)))
+      (setf (plist-get record :settings) settings)
+      (gptel-agent-session--standalone-record record))))
 
 (defun gptel-agent-session--check-standalone (record)
   "Check the structure and text positions of a standalone chat RECORD."
@@ -1104,13 +1106,18 @@ survive restoration.  Saving works independently of `gptel-agent-session-mode'."
                                     (cl-every #'stringp reference))))
                          (plist-get record :tools))
                (proper-list-p settings)
-               (cl-every (lambda (entry)
-                           (and (consp entry) (memq (car entry) gptel-agent-session--settings)))
-                         settings)
-               (let ((prompt (alist-get 'gptel-system-prompt settings)))
-                 (or (string-or-null-p prompt)
-                     (and (proper-list-p prompt) (cl-every #'string-or-null-p prompt))))
-               (booleanp (alist-get 'gptel-use-curl settings))
+               (cl-every
+                (lambda (entry)
+                  (and (consp entry)
+                       (pcase (car entry)
+                         ('gptel-system-prompt
+                          (let ((prompt (cdr entry)))
+                            (or (string-or-null-p prompt)
+                                (and (proper-list-p prompt)
+                                     (cl-every #'string-or-null-p prompt)))))
+                         ('gptel-use-curl (booleanp (cdr entry)))
+                         (key (memq key gptel-agent-session--settings)))))
+                settings)
                (proper-list-p bounds)
                (cl-every
                 (lambda (role)
