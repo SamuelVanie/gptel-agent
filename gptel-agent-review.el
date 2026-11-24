@@ -22,6 +22,7 @@
 (declare-function smv/gptel-ediff-validate "gptel-ediff-prehook")
 (declare-function gptel-agent--run-parent-buffer "gptel-agent-tools")
 (declare-function gptel-agent--run-active-p "gptel-agent-tools")
+(declare-function gptel-agent-session--history-end "gptel-agent-session")
 (defvar gptel-agent--supervised-run)
 (defvar gptel-agent--result-file-scope)
 (defvar gptel-agent-read-file-size-threshold)
@@ -573,38 +574,90 @@ create a draft, schedule delivery, or change an active request's callback."
     (setq gptel-agent-review--delivery-timer
           (run-at-time 0 nil #'gptel-agent-review--flush (current-buffer)))))
 
+(defun gptel-agent-review--goto-prompt ()
+  "Move to the start of the editable prompt, before any unsent draft."
+  (let* ((info (and gptel--fsm-last (gptel-fsm-info gptel--fsm-last)))
+         (end (plist-get info :tracking-marker)))
+    (goto-char
+     (or (and (markerp end) (eq (marker-buffer end) (current-buffer)) end)
+         ;; Restored conversations have no live request markers.  Use the
+         ;; same sent-history boundary as session saving and titling.
+         (progn (require 'gptel-agent-session) (gptel-agent-session--history-end))
+         (point-min)))
+    (when (and gptel-mode
+               (or (null info) (eq (gptel-fsm-state gptel--fsm-last) 'DONE))
+               (not (plist-get info :in-place)))
+      (let ((prefix (concat (unless (bobp) gptel-response-separator)
+                            (gptel-prompt-prefix-string)))
+            (case-fold-search nil))
+        (when (looking-at-p (regexp-quote prefix))
+          (forward-char (length prefix)))))))
+
+(defun gptel-agent-review--insert-feedback (texts)
+  "Insert queued TEXTS at point as user input, in their original order."
+  (let ((beg (point)))
+    (insert "\n\n" (mapconcat #'identity (nreverse texts) "\n\n") "\n")
+    (remove-text-properties beg (point) '(gptel nil))))
+
+(defun gptel-agent-review--post-feedback (pending cancelled)
+  "Post PENDING feedback before the draft, leaving CANCELLED input unsent."
+  (let* ((start (save-excursion (gptel-agent-review--goto-prompt) (point)))
+         ;; Most positions in the draft track edits naturally.  At its first
+         ;; character, point and mark must follow insertions on their left.
+         (point-at-start (and (< start (point-max)) (= (point) start)))
+         (mark-at-start (and (< start (point-max)) (eq (mark t) start)))
+         (draft (and (or point-at-start mark-at-start) (copy-marker start t))))
+    (unwind-protect
+        (save-excursion
+          (goto-char start)
+          (let ((inhibit-read-only t))
+            (when cancelled
+              (save-excursion (gptel-agent-review--insert-feedback cancelled)))
+            (when pending (gptel-agent-review--insert-feedback pending)))
+          (when pending
+            ;; Leave the trailing newline before a caret at the start of a
+            ;; draft, so later streamed insertions stay on its left too.
+            (when draft (backward-char))
+            (save-restriction
+              ;; gptel-send otherwise extends point into a leading draft word.
+              (narrow-to-region (point-min) (point))
+              (let ((mark-active nil)) (gptel-send)))))
+      (when point-at-start (goto-char draft))
+      (when mark-at-start (set-marker (mark-marker) draft))
+      (when draft (set-marker draft nil)))))
+
+(defun gptel-agent-review--after-widen ()
+  "Resume queued review feedback after the user widens the owner."
+  (unless (buffer-narrowed-p)
+    (remove-hook 'post-command-hook #'gptel-agent-review--after-widen t)
+    (gptel-agent-review--schedule-delivery)))
+
 (defun gptel-agent-review--flush (owner)
   "Finish delivering OWNER's outcomes, including when no more tools were called."
   (when (buffer-live-p owner)
     (with-current-buffer owner
       (setq gptel-agent-review--delivery-timer nil)
-      (unless (gptel-agent-review--live-p gptel--fsm-last)
-        (let (texts revise)
+      (cond
+       ((or (null gptel-agent-review--delivery)
+            (gptel-agent-review--live-p gptel--fsm-last)))
+       ((buffer-narrowed-p)
+        ;; gptel inserts asynchronous responses within the buffer's current
+        ;; restriction.  Its marker could otherwise be clamped into the draft.
+        (add-hook 'post-command-hook #'gptel-agent-review--after-widen nil t)
+        (message "Review feedback queued until you widen %s" (buffer-name)))
+       (t
+        (let (pending cancelled)
           (dolist (entry gptel-agent-review--delivery)
             (pcase-let ((`(,text ,retry ,fsm) entry))
               ;; Older versions could have queued acceptance summaries before
               ;; this library was reloaded.  Never turn those into user input.
               (when retry
-                (push text texts)
-                ;; Do not revive a request aborted after the feedback was queued.
-                ;; New explicit feedback after a terminal request has no FSM and
-                ;; should still send automatically.
-                (setq revise (or revise (and retry
-                                             (not (and fsm (memq (gptel-fsm-state fsm)
-                                                                 '(ABRT ERRS))))))))))
-          (when texts
-            (let ((inhibit-read-only t) beg)
-              (save-excursion
-                (goto-char (point-max))
-                (setq beg (point))
-                (insert "\n\n" (mapconcat #'identity (nreverse texts) "\n\n") "\n")
-                (remove-text-properties beg (point) '(gptel nil)))))
+                (if (and fsm (memq (gptel-fsm-state fsm) '(ABRT ERRS)))
+                    (push text cancelled)
+                  (push text pending)))))
           (setq gptel-agent-review--delivery nil)
-          (when revise
-            ;; A region selected during review must not replace the feedback
-            ;; with that selection when gptel constructs the follow-up request.
-            (let ((mark-active nil))
-              (save-excursion (goto-char (point-max)) (gptel-send)))))))))
+          (when (or pending cancelled)
+            (gptel-agent-review--post-feedback pending cancelled))))))))
 
 (add-hook 'gptel-post-response-functions #'gptel-agent-review--schedule-delivery)
 (add-hook 'gptel-post-tool-call-functions #'gptel-agent-review--post-tool)

@@ -1,6 +1,7 @@
 ;;; gptel-agent-review-test.el --- Live file review regressions -*- lexical-binding: t; -*-
 
 (require 'gptel-agent-edit-test)
+(require 'gptel-agent-discussion-test)
 (require 'gptel-openai)
 
 (defmacro gptel-review-test--with-files (files &rest body)
@@ -550,6 +551,85 @@
       (should (= 1 (length tabulated-list-entries)))
       (gptel-agent-review-cancel-all))
     (should-not (file-exists-p "new"))))
+
+(ert-deftest gptel-review-followup-sends-history-and-feedback-before-editable-draft ()
+  (dolist (stream '(nil t))
+    (dolist (restored '(nil t))
+      (let ((gptel-agent-workers-test--stream stream))
+        (gptel-agent-discussion-test--with-chat
+          (gptel-agent-workers-test--answer fsm "First answer" stream)
+          (with-current-buffer parent
+            (goto-char (point-max))
+            (insert "Second user turn")
+            (gptel-send)
+            (gptel-agent-workers-test--answer (car requests) "Second answer" stream)
+            (when restored
+              ;; Old saved chats have response properties but no request markers.
+              (setq gptel--fsm-last nil gptel-agent-discussion--fsm nil
+                    gptel-agent-discussion--draft-start nil))
+            (goto-char (point-max))
+            (let* ((draft (propertize "Private.note\nSecond draft line" 'help-echo "draft"))
+                   (file (list :id 1 :path "one" :status 'pending :revision 1))
+                   (queue (gptel-agent-review--make-queue :owner parent :files (list file)))
+                   (count (length requests)))
+              (insert draft)
+              (push-mark (point) t t)
+              (backward-word)
+              (cl-letf (((symbol-function 'run-at-time) #'ignore))
+                (gptel-agent-review--comment queue file "Actual review comment"))
+              (save-restriction
+                ;; The editor may be showing only part of the private draft.
+                (narrow-to-region (line-beginning-position) (point-max))
+                (gptel-agent-review--flush parent)
+                (should (equal (buffer-string) "Second draft line"))
+                (should (= count (length requests)))
+                (should (memq #'gptel-agent-review--after-widen post-command-hook)))
+              (gptel-agent-review--after-widen)
+              (should (timerp gptel-agent-review--delivery-timer))
+              (cancel-timer gptel-agent-review--delivery-timer)
+              ;; Exercise point and mark exactly at the draft boundary as
+              ;; well as inside the draft, where ordinary markers suffice.
+              (if restored
+                  (goto-char (- (point-max) (length draft)))
+                (set-marker (mark-marker) (- (point-max) (length draft))))
+              (gptel-agent-review--flush parent)
+              (should (= (1+ count) (length requests)))
+              (let* ((data (plist-get (gptel-fsm-info (car requests)) :data))
+                     (messages (append (plist-get data :messages) nil))
+                     (feedback (car (last messages))))
+                (should (equal (mapcar (lambda (msg) (plist-get msg :content))
+                                       (butlast (cdr messages)))
+                               '("Initial parent request" "First answer" "Second user turn" "Second answer")))
+                (should (equal (plist-get feedback :role) "user"))
+                (should (string-search "Actual review comment" (plist-get feedback :content)))
+                (should-not (string-search "Private" (plist-get feedback :content))))
+              (gptel-agent-workers-test--answer (car requests) "Review reply" stream)
+              (should (equal-including-properties
+                       (buffer-substring (- (point-max) (length draft)) (point-max)) draft))
+              (should (looking-at-p (if restored "Private" "line")))
+              (unless restored
+                (should (save-excursion (goto-char (mark)) (looking-at-p "Private"))))
+              (deactivate-mark)
+              (goto-char (point-max))
+              (insert " edited")
+              (gptel-send)
+              (let* ((data (plist-get (gptel-fsm-info (car requests)) :data))
+                     (last-two (last (append (plist-get data :messages) nil) 2)))
+                (should (equal (plist-get (car last-two) :content) "Review reply"))
+                (should (equal (cadr last-two)
+                               (list :role "user" :content (concat draft " edited"))))))))))))
+
+(ert-deftest gptel-review-new-feedback-excludes-cancelled-input-and-first-unsent-draft ()
+  (with-temp-buffer
+    (insert "Unsent first prompt")
+    (let ((fsm (gptel-make-fsm :state 'ABRT)) sent)
+      (setq gptel-agent-review--delivery
+            `(("Cancelled comment" t ,fsm) ("Fresh comment" t nil)))
+      (cl-letf (((symbol-function 'gptel-send) (lambda () (setq sent (buffer-string)))))
+        (gptel-agent-review--flush (current-buffer)))
+      (should (equal sent "\n\nFresh comment\n"))
+      (should (string-search "Cancelled comment" (buffer-string)))
+      (should (string-suffix-p "Unsent first prompt" (buffer-string))))))
 
 (ert-deftest gptel-review-idle-feedback-sends-once-and-acceptance-creates-nothing ()
   (dolist (revise '(nil t))

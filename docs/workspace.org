@@ -391,7 +391,9 @@ repeat the command.
 Comments and refusals are submitted immediately, without waiting for =D=.
 An active agent receives feedback at the next completed tool boundary, before
 its next model request. If its response ends without another tool call, the
-feedback starts a follow-up response. Aborting or failing a request cancels
+feedback starts a follow-up response. It uses the prior chat history and
+leaves your unsent draft editable after the reply. If the chat is narrowed,
+the follow-up stays queued until you widen it. Aborting or failing a request cancels
 feedback already waiting on it; a new comment/refusal afterward still sends
 automatically. Active sub-agent authors also receive feedback
 in their next tool result. Comments retain the displayed revision, filename,
