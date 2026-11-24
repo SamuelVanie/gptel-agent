@@ -1275,54 +1275,51 @@ diagnostics."
                  :old_str old-str :new_str new-str :operations operations))))
 
 (defun gptel-agent--insert-in-file-preview-setup (arg-values _info)
-  "Preview setup for Insert.
-INFO is the tool call info plist.
-ARG-VALUES is a list: (path line-number new-str)"
-  (let ((from (point)) (line-offset)
-        (face-bg (gptel-agent--block-bg))
-        (cb (current-buffer)))
-    (pcase-let ((`(,path ,line-number ,new-str) arg-values))
-      (gptel-agent-edit-prepare "Insert" (list :file_path path :line_number line-number :new_str new-str))
-      (insert "("
-              (propertize "insert_into_file " 'font-lock-face 'font-lock-keyword-face)
-              (propertize (concat "\"" path "\"")
-                          'font-lock-face 'font-lock-constant-face)
-              ")\n")
-      (if (file-readable-p path)
-          (insert
-           (with-temp-buffer       ;NEW-STR with context lines, styled as a diff
-             (insert-file-contents path)
-             (pcase line-number
-               (-1 (goto-char (point-max)))
-               (_ (forward-line line-number)))
-             (save-excursion
-               (forward-line -6)
-               (setq line-offset (line-number-at-pos))
-               (delete-region (point-min) (point))
-               (dotimes (_ 12)
-                 (put-text-property
-                  (line-beginning-position) (line-end-position)
-                  'line-prefix (propertize (format "%4d " line-offset) 'face
-                                           `(:inherit ,face-bg :inherit line-number)))
-                 (forward-line 1) (when (eolp) (insert " "))
-                 (cl-incf line-offset)))
-             (insert (propertize new-str 'font-lock-face 'diff-added
-                                 'fontified t 'font-lock-multiline t
-                                 'line-prefix (propertize "   + " 'face 'diff-added)))
-             (save-excursion
-               (forward-line 6)
-               (delete-region (point) (point-max)))
-             (font-lock-append-text-property
-              (point-min) (point-max) 'font-lock-face face-bg)
-             (when (provided-mode-derived-p
-                    (buffer-local-value 'major-mode cb) 'org-mode)
-               (org-escape-code-in-region (point-min) (point-max)))
-             (buffer-string)) "\n")
-        (insert (propertize "[File not readable]\n\n" 'font-lock-face 'error)))
-      (gptel-agent--confirm-overlay from (point)))))
+  "Preview Insert ARG-VALUES with the separators used by execution."
+  (pcase-let* ((`(,path ,line ,new) arg-values)
+               (change (car (gptel-agent-edit-prepare
+                             "Insert" (list :file_path path :line_number line :new_str new))))
+               (before (plist-get change :before))
+               (after (plist-get change :after))
+               (face-bg (gptel-agent--block-bg))
+               (org-p (derived-mode-p 'org-mode))
+               (from (point)))
+    (insert "("
+            (propertize "insert_into_file " 'font-lock-face 'font-lock-keyword-face)
+            (propertize (format "%S" path) 'font-lock-face 'font-lock-constant-face)
+            ")\n")
+    (insert
+     (with-temp-buffer
+       (insert before)
+       (gptel-agent-edit--goto-insertion line)
+       (let* ((offset (1- (point)))
+              (added-length (- (length after) (length before)))
+              (added (substring after offset (+ offset added-length))))
+         ;; Number the original context and mark the exact addition in the preview.
+         (save-excursion
+           (forward-line -6)
+           (let ((line-number (line-number-at-pos)))
+             (delete-region (point-min) (point))
+             (dotimes (_ 12)
+               (let ((start (point)))
+                 (forward-line 1)
+                 (put-text-property start (point) 'line-prefix
+                                    (propertize (format "%4d " line-number) 'face 'line-number)))
+               (cl-incf line-number))))
+         (insert (propertize added 'font-lock-face 'diff-added
+                             'fontified t 'font-lock-multiline t
+                             'line-prefix (propertize "   + " 'face 'diff-added)))
+         (forward-line 6)
+         (delete-region (point) (point-max)))
+       (font-lock-append-text-property (point-min) (point-max) 'font-lock-face face-bg)
+       (when org-p (org-escape-code-in-region (point-min) (point-max)))
+       (buffer-string))
+     "\n")
+    (gptel-agent--confirm-overlay from (point))))
 
 (defun gptel-agent--insert-in-file (path line-number new-str)
-  "Insert NEW-STR after LINE-NUMBER in PATH; 0 means start, -1 means end."
+  "Insert NEW-STR on a new line after LINE-NUMBER in PATH.
+Use 0 to prepend lines and -1 to append text verbatim."
   (gptel-agent-edit-apply
    (gptel-agent-edit-prepare
     "Insert" (list :file_path path :line_number line-number :new_str new-str))))
@@ -5108,7 +5105,7 @@ Test on-disk changes, address review feedback, and rerun relevant checks."
                    :root_directory (:type string :description "patch only: relative directory root, e.g. . for the batch root; omit file_path when used.")
                    :old_str (:type string :description "replace: nonempty unique old text.")
                    :new_str (:type string :description "replace/insert: new text; patch: unified diff.")
-                   :line_number (:type integer :minimum -1 :description "insert: line to insert after; 0=start, -1=end.")
+                   :line_number (:type integer :minimum -1 :description "insert: start on a new line after this line (past EOF uses the last line). 0 prepends lines, -1 appends verbatim.")
                    :content (:type string :description "write: complete file content; empty creates an empty file.")))))
  :category "gptel-agent" :confirm t :include t)
 
@@ -5121,7 +5118,7 @@ With confirmation enabled, updates cumulative review without waiting. Results st
 whether applied or staged; test on-disk changes and address review feedback."
  :function #'gptel-agent--insert-in-file
  :args '((:name "file_path" :type string :description "Complete path of an existing file; no trailing slash.")
-         (:name "line_number" :type integer :minimum -1 :description "Insert after this line; 0=start, -1=end.")
+         (:name "line_number" :type integer :minimum -1 :description "Start on a new line after this line (past EOF uses the last line). 0 prepends lines, -1 appends verbatim.")
          (:name "new_str" :type string :description "Text to insert."))
  :category "gptel-agent" :confirm t :include t)
 

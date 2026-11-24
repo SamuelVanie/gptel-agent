@@ -476,7 +476,12 @@ directories, and does not traverse directory symlinks.
 
 - =Write(file_path, content)= creates or overwrites a complete file, automatically
   creating missing parent directories. File paths must not end in =/=.
-- =Insert(file_path, line_number, new_str)= adds text to an existing file.
+- =Insert(file_path, line_number, new_str)= adds text to an existing
+  file. A positive line number starts the text on the next line, even when
+  the last line has no final newline. Numbers past the end use the last line.
+  Use 0 to prepend lines or -1 to append the text verbatim. An empty string
+  inserts a blank line before existing text. At EOF it produces no change.
+  Inserting into an empty file writes the supplied text verbatim.
 - =Edit= requires an explicit mode of =replace=, =patch=, or =batch=. Replacement uses
   =file_path= and a nonempty =old_str=. A patch explicitly selects either
   =file_path= for one existing file or =root_directory= for relative diff headers.

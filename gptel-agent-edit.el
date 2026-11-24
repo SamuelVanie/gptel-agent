@@ -461,6 +461,13 @@ providers which require every schema field, but never select a mode."
            (list path))))
       (_ (list path)))))
 
+(defun gptel-agent-edit--goto-insertion (line)
+  "Move to the insertion point for LINE in the original text."
+  (if (= line -1)
+      (goto-char (point-max))
+    (goto-char (point-min))
+    (forward-line line)))
+
 (defun gptel-agent-edit-prepare (name args)
   "Prepare NAME/ARGS with explicit file and directory contracts."
   (pcase-let* ((`(,mode ,path ,directory) (gptel-agent-edit--contract name args))
@@ -485,10 +492,11 @@ providers which require every schema field, but never select a mode."
                       (error "Insert requires line_number >= -1 and a string new_str"))
                     (with-temp-buffer
                       (insert (plist-get change :before))
-                      (if (= line -1) (goto-char (point-max))
-                        (goto-char (point-min)) (forward-line line))
+                      (gptel-agent-edit--goto-insertion line)
+                      (when (and (> line 0) (not (bolp)) (not (string-empty-p new)))
+                        (insert "\n"))
                       (insert new)
-                      (unless (or (string-suffix-p "\n" new) (eobp)) (insert "\n"))
+                      (unless (or (eobp) (string-suffix-p "\n" new)) (insert "\n"))
                       (setf (plist-get change :after) (buffer-string)))
                     (list change)))
                  ("Write"

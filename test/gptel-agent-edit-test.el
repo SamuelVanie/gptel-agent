@@ -157,12 +157,67 @@ diff --git a/sub/two b/sub/two
     (should-error (gptel-agent--write-file (expand-file-name "one" directory) "old"))))
 
 (ert-deftest gptel-edit-insert-preview-and-execution-agree ()
-  (dolist (line '(0 1 2 -1))
-    (gptel-edit-test--with-files '(("one" . "first\nsecond\n"))
+  (pcase-dolist (`(,before ,line ,text ,expected)
+                 '(("alpha" 1 "beta" "alpha\nbeta")
+                   ("alpha\n" 1 "beta" "alpha\nbeta")
+                   ("alpha" 1 "\nbeta\n" "alpha\n\nbeta\n")
+                   ("one\ntwo" 9 "extra" "one\ntwo\nextra")
+                   ("one\ntwo" 1 "mid" "one\nmid\ntwo")
+                   ("one\ntwo" 1 "mid\n" "one\nmid\ntwo")
+                   ("alpha" 0 "first" "first\nalpha")
+                   ("alpha" 0 "" "\nalpha")
+                   ("one\ntwo" 1 "" "one\n\ntwo")
+                   ("alpha" -1 "beta" "alphabeta")
+                   ("alpha\n" -1 "beta" "alpha\nbeta")
+                   ("" 0 "first" "first")
+                   ("" 1 "first" "first")
+                   ("" -1 "first" "first")))
+    (gptel-edit-test--with-files (list (cons "one" before))
       (let ((change (car (gptel-agent-edit-prepare
-                         "Insert" (list :file_path "one" :line_number line :new_str "new")))))
-        (gptel-agent--insert-in-file "one" line "new")
-        (should (equal (gptel-edit-test--read "one") (plist-get change :after)))))))
+                          "Insert" (list :file_path "one" :line_number line :new_str text)))))
+        (should (equal (plist-get change :after) expected)))
+      (cl-letf (((symbol-function 'gptel-agent--confirm-overlay) #'ignore))
+        (gptel-agent--insert-in-file-preview-setup (list "one" line text) nil))
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (equal (buffer-substring-no-properties (point) (point-max))
+                     (concat expected "\n")))
+      (gptel-agent--insert-in-file "one" line text)
+      (should (equal (gptel-edit-test--read "one") expected)))))
+
+(ert-deftest gptel-edit-batch-insert-uses-staged-line-endings ()
+  (gptel-edit-test--with-files nil
+    (gptel-agent--edit-files
+     "batch" nil directory nil nil
+     '[(:operation "write" :file_path "new" :content "alpha")
+       (:operation "insert" :file_path "new" :line_number 1 :new_str "beta")
+       (:operation "insert" :file_path "new" :line_number -1 :new_str "!")])
+    (should (equal (gptel-edit-test--read "new") "alpha\nbeta!"))))
+
+(ert-deftest gptel-edit-empty-insert-adds-a-blank-line-before-existing-text ()
+  (pcase-dolist (`(,before ,line ,expected)
+                 '(("one\ntwo" 0 "\none\ntwo")
+                   ("one\ntwo" 1 "one\n\ntwo")
+                   ("one\ntwo" 2 "one\ntwo")
+                   ("one\ntwo\n" 2 "one\ntwo\n")
+                   ("one\ntwo" -1 "one\ntwo")
+                   ("" 0 "") ("" 1 "") ("" -1 "")))
+    (dolist (batch '(nil t))
+      (gptel-edit-test--with-files (list (cons "one" before))
+        (let ((run (lambda ()
+                     (if batch
+                         (gptel-agent--edit-files
+                          "batch" nil directory nil nil
+                          (vector (list :operation "insert" :file_path "one"
+                                        :line_number line :new_str "")))
+                       (gptel-agent--insert-in-file "one" line "")))))
+          (if (equal before expected)
+              (progn
+                (should (string-match-p "No changes"
+                                        (error-message-string (should-error (funcall run)))))
+                (should-not (file-directory-p gptel-agent-history-directory)))
+            (funcall run)))
+        (should (equal (gptel-edit-test--read "one") expected))))))
 
 (ert-deftest gptel-edit-write-empty-new-file-is-a-change ()
   (gptel-edit-test--with-files nil
