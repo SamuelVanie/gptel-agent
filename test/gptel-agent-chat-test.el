@@ -103,6 +103,80 @@
             (goto-char (point-min)) (search-forward "PEER-MESSAGE")
             (should-not (get-text-property (1- (point)) 'gptel))))))))
 
+(ert-deftest gptel-agent-chat-custom-callback-receives-only-model-output ()
+  (dolist (stream '(nil t))
+    (let ((gptel-agent-workers-test--stream stream)
+          (gptel-agent-workers-test--backend
+           (gptel-make-openai "peer-callback" :key "unused" :models '(test) :stream t)))
+      (gptel-agent-chat-test--with-chats
+        (gptel-agent-workers-test--answer recipient-fsm "Done" stream)
+        (gptel-agent-chat-test--call sender-fsm "send" (gptel-agent-chat--id recipient) "PEER-TEXT")
+        (with-current-buffer recipient
+          (goto-char (point-max))
+          (let* ((boundary (point-marker))
+                 (draft (progn (insert "UNSENT-DRAFT") (point-marker)))
+                 responses
+                 (fsm (gptel-request "Auxiliary request"
+                        :position boundary :stream stream
+                        :transforms gptel-prompt-transform-functions
+                        :callback (lambda (response _info) (push response responses)))))
+            (should (eq fsm (car requests)))
+            (should-not responses)
+            (should (string-match-p "PEER-TEXT" (gptel-agent-workers-test--data fsm)))
+            (should-not (string-match-p "UNSENT-DRAFT" (gptel-agent-workers-test--data fsm)))
+            (should-not gptel-agent-chat--inbox)
+            (should (= 1 (how-many "PEER-TEXT" (point-min) boundary)))
+            (should (equal "UNSENT-DRAFT" (buffer-substring boundary draft)))
+            (goto-char boundary)
+            (search-backward "PEER-TEXT")
+            (should-not (get-text-property (point) 'gptel))
+            (gptel-agent-workers-test--answer fsm "MODEL-OUTPUT" stream)
+            (should (equal (nreverse responses) (if stream '("MODEL-OUTPUT" t)
+                                                  '("MODEL-OUTPUT"))))))))))
+
+(ert-deftest gptel-agent-chat-render-failure-is-retryable ()
+  (gptel-agent-chat-test--with-chats
+    (gptel-agent-chat-test--call sender-fsm "send" (gptel-agent-chat--id recipient) "TRY-AGAIN")
+    (with-current-buffer recipient
+      (let ((before (buffer-string))
+            (fail t))
+        (let ((after-change-functions
+               (list (lambda (&rest _)
+                       (when fail (setq fail nil) (error "Insertion hook failed"))))))
+          (should-error (gptel-agent-chat--inject recipient-fsm)))
+        (should (equal before (buffer-string)))
+        (should gptel-agent-chat--inbox)
+        (should-not (string-match-p "TRY-AGAIN" (gptel-agent-workers-test--data recipient-fsm)))
+        ;; Another send during the successful retry waits for the next boundary.
+        (let* ((sent nil)
+               (after-change-functions
+                (list (lambda (&rest _)
+                        (unless sent
+                          (setq sent t)
+                          (gptel-agent-chat--send sender (gptel-agent-chat--id recipient) "NEXT"))))))
+          (gptel-agent-chat--inject recipient-fsm))
+        (should (= 1 (how-many "TRY-AGAIN" (point-min) (point-max))))
+        (should (string-match-p "TRY-AGAIN" (gptel-agent-workers-test--data recipient-fsm)))
+        (should (equal '("NEXT") (mapcar (lambda (event) (plist-get event :text))
+                                          gptel-agent-chat--inbox)))))))
+
+(ert-deftest gptel-agent-chat-redirected-request-keeps-peer-message-in-recipient ()
+  (gptel-agent-chat-test--with-chats
+    (gptel-agent-chat-test--call sender-fsm "send" (gptel-agent-chat--id recipient) "LOCAL-ONLY")
+    (with-temp-buffer
+      (let ((elsewhere (point-marker)))
+        (with-current-buffer recipient
+          (let ((fsm (gptel-request "Redirected" :position elsewhere
+                       :transforms gptel-prompt-transform-functions
+                       :callback (lambda (_response _info) nil))))
+            (should (eq fsm (car requests)))
+            (should-not (string-search "LOCAL-ONLY" (gptel-agent-workers-test--data fsm)))
+            (should gptel-agent-chat--inbox)))
+        (should (zerop (buffer-size)))))
+    (with-current-buffer recipient (goto-char (point-max)) (gptel-send))
+    (should (string-search "LOCAL-ONLY" (gptel-agent-workers-test--data (car requests))))
+    (should-not (buffer-local-value 'gptel-agent-chat--inbox recipient))))
+
 (ert-deftest gptel-agent-chat-idle-draft-abort-and-retry ()
   (gptel-agent-chat-test--with-chats
     (gptel-agent-workers-test--answer recipient-fsm "Finished")

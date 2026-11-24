@@ -435,8 +435,12 @@ A recipient receives messages at its next model-request boundary, after any
 pending tool results. Sending never starts a new model request, submits an
 unsent draft, or automatically replies. Idle, aborted and failed chats keep
 messages until their next user-started turn. Read-only recipients keep messages
-queued until a request boundary with a writable buffer. Messages are labeled as peer
-context, not user instructions or authorization; ordinary replies stay local.
+queued until a request boundary with a writable buffer. Requests that direct output
+to another buffer also leave the inbox queued. A request with a custom callback
+and a position in the recipient delivers the peer context in its payload and
+transcript. The callback receives ordinary gptel response events.
+Messages are labeled as peer context, not user instructions or authorization;
+ordinary replies stay local.
 The recipient need not enable =MainChat= to receive messages, but its request
 must run =gptel-agent-chat--localize= (installed in the default prompt transforms).
 
