@@ -425,10 +425,12 @@ still save history snapshots.
 Use =M-x gptel-agent-history= to browse saved batches, =RET= to inspect a file's
 diff, and =r= to undo the selected batch's visible files. =M-x gptel-agent-history-restore=
 also lets you choose a snapshot directly. Finish any active review for those
-files first. Restores require files to match that snapshot's after-state;
-restore newer changes first to step back through history. Each restore is
+files first. Restores require file contents to match the snapshot's after-state.
+Restore newer changes first to step back through history. Each restore is
 itself saved, so it can be undone. Originals, proposed versions, encoding and
 file permissions are recorded, including creation and deletion of empty files.
+Undoing a text edit preserves the file's current permissions. When undo
+recreates a deleted file, it restores the permissions recorded before deletion.
 Edits that cannot be represented in a file's existing fixed encoding are
 rejected before any file in the batch is written. Use compatible text or
 explicitly change the file's encoding before retrying. New files and files

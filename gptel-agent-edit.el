@@ -524,8 +524,10 @@ providers which require every schema field, but never select a mode."
      files)))
 
 (defun gptel-agent-edit--write (change content)
-  "Write CONTENT for CHANGE, or remove the file when CONTENT is nil."
-  (let ((path (gptel-agent-path-resolve (plist-get change :path) 'file)))
+  "Write CONTENT for CHANGE, or remove the file when CONTENT is nil.
+Apply recorded permissions only when recreating a file."
+  (let* ((path (gptel-agent-path-resolve (plist-get change :path) 'file))
+         (create-modes (and content (not (file-exists-p path)) (plist-get change :modes))))
     (if (null content)
         (when (file-exists-p path) (delete-file path))
       (make-directory (file-name-directory path) t)
@@ -533,15 +535,16 @@ providers which require every schema field, but never select a mode."
         (insert content)
         (let ((coding-system-for-write (plist-get change :coding)))
           (write-region (point-min) (point-max) path nil 'silent)))
-      (when (plist-get change :modes) (set-file-modes path (plist-get change :modes))))))
+      (when create-modes (set-file-modes path create-modes)))))
 
 (defun gptel-agent-edit-validate (changes)
   "Check CHANGES against disk and reject text the file encoding cannot save.
 Validate every file before history is recorded or working files are written,
-including unsaved visiting buffers."
+including unsaved visiting buffers.  Return changes with current permissions
+for existing files and the supplied permissions for files to be recreated."
   (gptel-agent-edit--validate-file-parents changes)
-  (let (gptel-agent-edit--staged-changes)
-    (dolist (change changes)
+  (let (gptel-agent-edit--staged-changes validated)
+    (dolist (change changes (nreverse validated))
       ;; `write-region' silently substitutes unsupported characters when its
       ;; coding system is forced.  Undecided encodings are different: ASCII
       ;; and new files may still choose a suitable encoding for their text.
@@ -554,7 +557,11 @@ including unsaved visiting buffers."
                (aref content position) (plist-get change :path) coding))
       (let ((current (gptel-agent-edit--snapshot (plist-get change :path))))
         (unless (equal (plist-get current :before) (plist-get change :before))
-          (error "File changed since preview; review again: %s" (plist-get change :path)))))))
+          (error "File changed since preview; review again: %s" (plist-get change :path)))
+        (push (if-let* ((modes (plist-get current :modes)))
+                  (plist-put (copy-sequence change) :modes modes)
+                change)
+              validated)))))
 
 (defun gptel-agent-edit--refresh-buffer (path)
   "Refresh an unmodified buffer visiting PATH after an on-disk change."
@@ -573,7 +580,7 @@ Refresh unmodified visiting buffers.  Restore originals on a write error.
 Return a result message, or the snapshot directory when RETURN-SNAPSHOT
 is non-nil."
   (require 'gptel-agent-history)
-  (gptel-agent-edit-validate changes)
+  (setq changes (gptel-agent-edit-validate changes))
   (let ((snapshot (gptel-agent-history--record changes)) written)
     (condition-case err
         (dolist (change changes)
