@@ -2090,6 +2090,9 @@ root FSM.  Handles and callbacks are process-local, never persistent data."
     (when (and gptel-agent--supervision
                (not (gptel-agent--supervision-stopped gptel-agent--supervision)))
       (user-error "Buffer already has an active agent supervisor"))
+    ;; A host can retire an invocation before its post-response hook runs
+    ;; and then start another invocation in this same chat buffer.
+    (gptel-agent--reset-tool-call-counts)
     (setq gptel-agent--supervision
           (gptel-agent--make-supervision
            :buffer buffer :on-state-change on-state-change

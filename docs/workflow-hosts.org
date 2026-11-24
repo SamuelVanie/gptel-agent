@@ -75,6 +75,8 @@ Native submission, cancellation and stopped supervision expire the host action.
 The host owns the root transport, terminal handlers, retry policy and request
 budget. Stop supervision when an invocation ends, and abort the root transport
 when cancelling it. Start a fresh handle for a new invocation or feedback
-request. Child model calls remain internal to the host's invocation. Lifecycle
+request. Tool repetition tracking starts fresh with each new handle and
+continues across transport retries within an invocation.
+Child model calls remain internal to the host's invocation. Lifecycle
 notifications schedule deferred settlement; supervision never polls a model
 or runs a repeating timer.

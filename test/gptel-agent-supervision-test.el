@@ -185,6 +185,27 @@
       (should-error (gptel-agent-supervision-answer-questions scope batch '("Blue"))
                     :type 'user-error))))
 
+(ert-deftest gptel-agent-supervision-new-invocation-starts-fresh-loop-history ()
+  (with-temp-buffer
+    (let ((add '(:name "AskUserQuestion" :args (:action "add" :questions [(:question "Color?")])))
+          (wait '(:name "AskUserQuestion" :args (:action "wait")))
+          (gptel-agent-tool-cycle-length 4))
+      ;; A paused host retires the request while its tool is still waiting.
+      (let ((first (gptel-agent-supervise (current-buffer))))
+        (should-not (gptel-agent--detect-repetition add))
+        (should-not (gptel-agent--detect-repetition wait))
+        (gptel-agent-supervision-stop first))
+      (let ((resumed (gptel-agent-supervise (current-buffer))))
+        (unwind-protect
+            (progn
+              (should-not (gptel-agent--detect-repetition add))
+              (should-not (gptel-agent--detect-repetition wait))
+              ;; The same cycle repeated within this invocation is still blocked.
+              (should-not (gptel-agent--detect-repetition add))
+              (should (string-match-p
+                       "A-B-A-B" (plist-get (gptel-agent--detect-repetition wait) :result))))
+          (gptel-agent-supervision-stop resumed))))))
+
 (ert-deftest gptel-agent-supervision-retry-restores-report-delivery ()
   (gptel-agent-supervision-test--with-chat
     (setf (plist-get (gptel-fsm-info fsm) :error) "Unavailable"
