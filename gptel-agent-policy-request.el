@@ -230,7 +230,8 @@ reached final request construction yet.  Capture its existing limits first."
          (named (copy-tree args t)))
     (setf (gptel-tool-function proxy)
           (lambda (&rest supplied)
-            (let ((callback (and (gptel-tool-async delegate) (pop supplied))))
+            (let (gptel-agent-edit--preflight-changes gptel-agent-edit--preflight-disk-hooks
+                  (callback (and (gptel-tool-async delegate) (pop supplied))))
               (if (and (eq (gptel-fsm-state fsm) 'TOOL)
                        (memq call (plist-get (gptel-fsm-info fsm) :tool-use))
                        (not (plist-get call :result))

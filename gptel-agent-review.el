@@ -100,8 +100,7 @@ Changing this setting affects new review queues only."
       (dolist (change changes)
         (when (cl-some (lambda (file)
                          (and (not (eq (plist-get file :status) 'cancelled))
-                              (equal (file-truename (plist-get change :path))
-                                     (plist-get file :path))))
+                              (equal (plist-get change :path) (plist-get file :path))))
                        (gptel-agent-review--queue-files queue))
           (user-error "Finish the review in %s before changing %s"
                       (buffer-name buffer) (plist-get change :path)))))))
@@ -119,6 +118,18 @@ Changing this setting affects new review queues only."
               change))
           (cl-remove-if (lambda (file) (eq (plist-get file :status) 'cancelled)) files)))
 
+(defun gptel-agent-review--extend (original change)
+  "Return a cumulative copy of ORIGINAL ending at CHANGE's new state."
+  (let ((merged (copy-sequence original)))
+    (setf (plist-get merged :after) (plist-get change :after))
+    ;; A link has no file encoding or file permissions to restore.  If a
+    ;; regular file takes its place, refusal/undo needs that file's format.
+    (when (and (not (stringp (plist-get original :before)))
+               (stringp (plist-get change :after)))
+      (setf (plist-get merged :coding) (plist-get change :coding)
+            (plist-get merged :modes) (plist-get change :modes)))
+    merged))
+
 (defun gptel-agent-review--sync (queue &optional files)
   "Import saved external changes into applied QUEUE, returning changed files.
 Check FILES, or all queue entries when nil.  Keep the cumulative originals,
@@ -129,12 +140,24 @@ Never write working files or discard unsaved visiting-buffer edits."
       ;; Read everything before changing history or any review entry.
       (dolist (file (or files (gptel-agent-review--queue-files queue)))
         (unless (eq (plist-get file :status) 'cancelled)
-          (let ((snapshot (gptel-agent-edit--snapshot (plist-get file :path))))
-            (when-let* ((buffer (find-buffer-visiting (plist-get file :path))))
-              (when (or (not (verify-visited-file-modtime buffer))
-                        (not (equal (plist-get snapshot :before) (plist-get file :after))))
-                (push (plist-get file :path) refresh)))
+          (let ((path (plist-get file :path)))
+            (unless (equal path (gptel-agent-edit--entry-path path))
+              (error "File parent changed since review: %s" path)))
+          (let* ((path (plist-get file :path))
+                 (snapshot (gptel-agent-edit--snapshot path nil t))
+                 (entry-only (or (consp (plist-get snapshot :before)) (consp (plist-get file :after)))))
+            (when (cl-some (lambda (buffer)
+                             (or (not (verify-visited-file-modtime buffer))
+                                 (not (equal (plist-get snapshot :before) (plist-get file :after)))))
+                           (gptel-agent-edit--visiting-buffers path entry-only))
+              (push (cons path entry-only) refresh))
             (unless (equal (plist-get snapshot :before) (plist-get file :after))
+              ;; The new entry has no regular-file metadata when a link or
+              ;; absence replaces text.  Record the format of its predecessor.
+              (when (and (stringp (plist-get file :after))
+                         (not (stringp (plist-get snapshot :before))))
+                (setf (plist-get snapshot :coding) (plist-get file :coding)
+                      (plist-get snapshot :modes) (plist-get file :modes)))
               (setf (plist-get snapshot :after) (plist-get snapshot :before)
                     (plist-get snapshot :before) (plist-get file :after))
               (push (cons file snapshot) updates)))))
@@ -143,9 +166,8 @@ Never write working files or discard unsaved visiting-buffer edits."
         (gptel-agent-history--complete history)
         (dolist (update updates)
           (let* ((file (car update)) (snapshot (cdr update))
-                 (merged (copy-sequence file)))
-            (setf (plist-get merged :after) (plist-get snapshot :after)
-                  (plist-get merged :history)
+                 (merged (gptel-agent-review--extend file snapshot)))
+            (setf (plist-get merged :history)
                   (cons (gptel-agent-history--id history) (plist-get file :history))
                   (plist-get merged :revision) (1+ (plist-get file :revision))
                   (plist-get merged :external) t
@@ -161,7 +183,7 @@ Never write working files or discard unsaved visiting-buffer edits."
         (let ((versions (mapcar (lambda (file)
                                   (list file (plist-get file :revision) (plist-get file :status)))
                                 (or files (gptel-agent-review--queue-files queue)))))
-          (dolist (path refresh) (gptel-agent-edit--refresh-buffer path))
+          (dolist (entry refresh) (gptel-agent-edit--refresh-buffer (car entry) (cdr entry)))
           ;; Revert hooks can run tool callbacks or close/refuse this review.
           (unless (and (eq queue (buffer-local-value 'gptel-agent-review--queue
                                                      (gptel-agent-review--queue-owner queue)))
@@ -230,10 +252,10 @@ can inspect the new revision before accepting or restoring it."
       (let* ((path (plist-get change :path))
              (file (cl-find path (gptel-agent-review--queue-files queue)
                             :key (lambda (f) (plist-get f :path)) :test #'equal))
-             (merged (copy-sequence
-                      (if (and file (not (eq (plist-get file :status) 'cancelled))) file change))))
-        (setf (plist-get merged :after) (plist-get change :after)
-              (plist-get merged :history)
+             (merged (gptel-agent-review--extend
+                      (if (and file (not (eq (plist-get file :status) 'cancelled))) file change)
+                      change)))
+        (setf (plist-get merged :history)
               (if history (cons (gptel-agent-history--id history) (plist-get merged :history))
                 (plist-get merged :history))
               (plist-get merged :id) (or (plist-get file :id)
@@ -277,34 +299,42 @@ can inspect the new revision before accepting or restoring it."
 
 (defun gptel-agent-review-read (args &optional buffer)
   "Return a tool result for staged Read ARGS in BUFFER, or nil for disk reads."
-  (gptel-agent-path-resolve (plist-get args :file_path) 'file)
-  (when-let* (((not (bound-and-true-p gptel-agent--result-file-scope)))
-              (queue (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner buffer)))
-              ((gptel-agent-review--queue-applied queue))
-              (path (plist-get args :file_path))
-              (file (cl-find (file-truename path) (gptel-agent-review--queue-files queue)
-                             :key (lambda (f) (plist-get f :path)) :test #'equal)))
-    (when (gptel-agent-review--sync queue (list file))
-      (gptel-agent-review--refresh queue)))
-  (when-let* (((not (bound-and-true-p gptel-agent--result-file-scope)))
-              (queue (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner buffer)))
-              ((not (gptel-agent-review--queue-applied queue)))
-              (path (plist-get args :file_path))
-              (change (gethash (file-truename path) (gptel-agent-review--staged queue))))
-    (let ((text (plist-get change :after)) (start (plist-get args :start_line)) (end (plist-get args :end_line)))
-      (unless text (error "File is deleted in the pending review: %s" path))
-      (unless (and (or (null start) (and (integerp start) (> start 0)))
-                   (or (null end) (and (integerp end) (>= end (or start 1)))))
-        (error "Read requires positive line numbers with end_line >= start_line"))
-      (when (and (null start) (null end)
-                 (> (string-bytes text) (* 1024 gptel-agent-read-file-size-threshold)))
-        (error "Staged file is too large; specify a line range"))
-      (let ((page (gptel-agent--read-string-range
-                   text start end (plist-get args :start_column)
-                   (* 1024 gptel-agent-read-file-size-threshold))))
-        (list :confirm nil :result
-              (concat (plist-get page :text)
-                      (gptel-agent--read-continuation page "Read")))))))
+  (let* ((path (plist-get args :file_path))
+         (queue (unless (bound-and-true-p gptel-agent--result-file-scope)
+                  (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner buffer)))))
+    (if (and queue (not (gptel-agent-review--queue-applied queue)))
+        (let* ((gptel-agent-edit--staged-changes (gptel-agent-review--staged queue))
+               (change (gethash (gptel-agent-edit--file-path path)
+                                gptel-agent-edit--staged-changes)))
+          (when change (gptel-agent-review--read-change change args)))
+      (gptel-agent-path-resolve path 'file)
+      (when queue
+        ;; A recreated link can be under review separately from its target.
+        (let* ((entry (gptel-agent-edit--entry-path path))
+               (paths (list entry (file-truename entry)))
+               (files (cl-remove-if-not
+                       (lambda (file) (member (plist-get file :path) paths))
+                       (gptel-agent-review--queue-files queue))))
+          (when (and files (gptel-agent-review--sync queue files))
+            (gptel-agent-review--refresh queue))))
+      nil)))
+
+(defun gptel-agent-review--read-change (change args)
+  "Return the read result for staged CHANGE with the range specified in ARGS."
+  (let ((text (plist-get change :after)) (start (plist-get args :start_line)) (end (plist-get args :end_line)))
+    (unless text (error "File is deleted in the pending review: %s" (plist-get change :path)))
+    (unless (and (or (null start) (and (integerp start) (> start 0)))
+                 (or (null end) (and (integerp end) (>= end (or start 1)))))
+      (error "Read requires positive line numbers with end_line >= start_line"))
+    (when (and (null start) (null end)
+               (> (string-bytes text) (* 1024 gptel-agent-read-file-size-threshold)))
+      (error "Staged file is too large; specify a line range"))
+    (let ((page (gptel-agent--read-string-range
+                 text start end (plist-get args :start_column)
+                 (* 1024 gptel-agent-read-file-size-threshold))))
+      (list :confirm nil :result
+            (concat (plist-get page :text)
+                    (gptel-agent--read-continuation page "Read"))))))
 
 (defvar gptel-agent-review-mode-map
   (let ((map (make-sparse-keymap)))

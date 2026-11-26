@@ -11,9 +11,18 @@
 
 (require 'cl-lib)
 (require 'gptel)
+(require 'gptel-agent-tool-identity)
 (require 'rx)
 (require 'subr-x)
 (require 'url-parse)
+
+(defvar gptel-agent-edit--preflight-changes)
+(defvar gptel-agent-edit--preflight-disk-hooks)
+(defvar gptel-agent-edit--staged-changes)
+(declare-function gptel-agent-edit--file-path "gptel-agent-edit" (path &optional entry))
+(declare-function gptel-agent-edit-targets "gptel-agent-edit" (name args &optional operands))
+(declare-function gptel-agent-edit--deletion-p "gptel-agent-edit" (mode args))
+(declare-function gptel-agent-edit--entry-path "gptel-agent-edit" (path))
 
 (defvar-local gptel-agent-tool-policy nil
   "Named tool policy for this conversation, or nil for ordinary dispatch.
@@ -34,6 +43,12 @@ Select it in a gptel preset with :agent-tool-policy.  See
 (defconst gptel-agent-policy--missing (make-symbol "absent argument"))
 (defvar gptel-agent-policy--workspace)
 (defvar gptel-agent-policy--argument-directory)
+(defvar gptel-agent-policy--file-call nil
+  "Built-in file tool name and arguments being checked.")
+(defvar gptel-agent-policy--batch-operands nil
+  "Resolved file operands for this policy check, keyed by operation object.")
+(defvar gptel-agent-policy--file-args nil
+  "Argument object owning the current file_path predicate.")
 (defvar gptel-agent-policy--matching-deny nil
   "Treat an ambiguously decoded JSON value conservatively for a denial.")
 
@@ -99,13 +114,17 @@ Call after applying child presets and their hooks."
                   always (and rest (keywordp key) (not (memq key keys))
                               (push key keys))))))
 
-(defun gptel-agent-policy--path (value directory)
-  "Return the canonical local path of VALUE relative to DIRECTORY."
+(defun gptel-agent-policy--path (value directory &optional entry)
+  "Resolve local VALUE relative to DIRECTORY, preserving its leaf for ENTRY."
   (when (and (stringp value) (not (string-empty-p value))
              (not (file-remote-p value)) (not (file-remote-p directory)))
     (let ((default-directory (file-name-as-directory directory))
           file-name-handler-alist)
-      (directory-file-name (file-truename value)))))
+      (directory-file-name
+       (if entry
+           (gptel-agent-edit--entry-path
+            (if (file-name-absolute-p value) value (concat default-directory value)))
+         (file-truename value))))))
 
 (defun gptel-agent-policy--within-p (path base)
   "Whether canonical PATH is at or below canonical BASE on this filesystem."
@@ -130,31 +149,57 @@ Call after applying child presets and their hooks."
                    (setq parent (directory-file-name (file-name-directory parent))))
                  (file-name-case-insensitive-p parent)))))))
 
+(defun gptel-agent-policy--file-operand (value)
+  "Return VALUE's file target when the call uses staged or entry semantics."
+  (when (and gptel-agent-policy--file-args (stringp value) (not (string-empty-p value))
+             (not (file-remote-p value)) (not (file-remote-p gptel-agent-policy--argument-directory)))
+    (let* ((name (car gptel-agent-policy--file-call))
+           (call (cdr gptel-agent-policy--file-call))
+           (default-directory (file-name-as-directory gptel-agent-policy--argument-directory)))
+      (if (eq call gptel-agent-policy--file-args)
+          (let ((unlink (and (equal name "Edit")
+                             (gptel-agent-edit--deletion-p (plist-get call :mode) call))))
+            (when (or unlink gptel-agent-edit--preflight-changes)
+              (let ((gptel-agent-edit--staged-changes gptel-agent-edit--preflight-changes))
+                (gptel-agent-edit--file-path value unlink))))
+        (when (and (equal name "Edit") (equal (plist-get call :mode) "batch"))
+          (unless gptel-agent-policy--batch-operands
+            (setq gptel-agent-policy--batch-operands (make-hash-table :test #'eq))
+            (gptel-agent-edit-targets "Edit" call gptel-agent-policy--batch-operands))
+          (gethash gptel-agent-policy--file-args gptel-agent-policy--batch-operands))))))
+
 (defun gptel-agent-policy--under-p (value roots)
   "Whether VALUE is a local path at or below a member of ROOTS."
-  (when-let* ((path (gptel-agent-policy--path value gptel-agent-policy--argument-directory))
-              ((not (file-remote-p path))))
-    (let ((paths (list path))
-          (bases (delq nil
-                       (mapcar (lambda (root)
-                                 (gptel-agent-policy--path
-                                  (if (eq root 'workspace) "." root)
-                                  gptel-agent-policy--workspace))
-                               roots))))
-      ;; Some tools expand ".." before opening a path.  The OS follows
-      ;; symlinks as it traverses components.  Cover both possible targets.
-      (when (member ".." (split-string value "/" t))
-        (let ((expanded (expand-file-name value gptel-agent-policy--argument-directory)))
-          (cl-pushnew (gptel-agent-policy--path expanded gptel-agent-policy--argument-directory)
-                      paths :test #'equal)))
-      (funcall (if gptel-agent-policy--matching-deny #'cl-some #'cl-every)
-               (lambda (target)
-                 (and target (not (file-remote-p target))
-                      (cl-some (lambda (base)
-                                 (and (not (file-remote-p base))
-                                      (gptel-agent-policy--within-p target base)))
-                               bases)))
-               paths))))
+  (let* ((directory gptel-agent-policy--argument-directory)
+         (operand (gptel-agent-policy--file-operand value))
+         (path (or operand (gptel-agent-policy--path value directory))))
+    (when (and path (not (file-remote-p path)))
+      (let ((paths (list path))
+            (bases (delq nil
+                         (mapcar (lambda (root)
+                                   (gptel-agent-policy--path
+                                    (if (eq root 'workspace) "." root)
+                                    gptel-agent-policy--workspace))
+                                 roots))))
+        ;; Some tools expand ".." before opening a path.  The OS follows
+        ;; symlinks as it traverses components.  Cover both possible targets.
+        (when (member ".." (split-string value "/" t))
+          (let ((expanded (expand-file-name value directory)))
+            (if operand
+                ;; The tool expands its operand first.  Also check a parent
+                ;; traversed literally when it would resolve differently.
+                (let ((literal (gptel-agent-policy--path value directory t)))
+                  (unless (equal literal (gptel-agent-policy--path expanded directory t))
+                    (cl-pushnew (gptel-agent-policy--file-operand literal) paths :test #'equal)))
+              (cl-pushnew (gptel-agent-policy--path expanded directory) paths :test #'equal))))
+        (funcall (if gptel-agent-policy--matching-deny #'cl-some #'cl-every)
+                 (lambda (target)
+                   (and target (not (file-remote-p target))
+                        (cl-some (lambda (base)
+                                   (and (not (file-remote-p base))
+                                        (gptel-agent-policy--within-p target base)))
+                                 bases)))
+                 paths)))))
 
 (defun gptel-agent-policy--origin (value &optional configuration)
   "Parse VALUE into (SCHEME HOST PORT), or nil for a malformed network URL.
@@ -184,9 +229,11 @@ When CONFIGURATION is non-nil, require a bare origin."
 (defun gptel-agent-policy--match-fields (fields args)
   "Test the compiled FIELDS against the named values in ARGS."
   (cl-every (lambda (field)
-              (funcall (nth 2 field)
-                       (if-let* ((tail (plist-member args (car field))))
-                           (cadr tail) gptel-agent-policy--missing)))
+              (let ((gptel-agent-policy--file-args
+                     (and gptel-agent-policy--file-call (eq (car field) :file_path) args)))
+                (funcall (nth 2 field)
+                         (if-let* ((tail (plist-member args (car field))))
+                             (cadr tail) gptel-agent-policy--missing))))
             fields))
 
 (defun gptel-agent-policy--declared-p (pattern schema)
@@ -357,6 +404,10 @@ constraint on this present field in at least one policy."
   (if (null ceiling) (not required-field)
     (condition-case nil
         (let ((gptel-agent-policy--argument-directory workspace)
+              (gptel-agent-policy--file-call
+               (let ((name (gptel-agent--builtin-tool-name tool)))
+                 (and (member name '("Edit" "Read" "Write" "Insert")) (cons name args))))
+              gptel-agent-policy--batch-operands
               (definitions (or gptel-agent-policy--snapshot
                                (gptel-agent-policy--freeze ceiling)))
               (name (gptel-tool-name tool))
@@ -364,6 +415,10 @@ constraint on this present field in at least one policy."
                               (gptel-tool-args tool)))
               constrained)
           (and (gptel-agent-policy--plist-p args)
+               (or (not (and gptel-agent-policy--file-call
+                             (bound-and-true-p gptel-agent-edit--preflight-disk-hooks)))
+                   (let (gptel-agent-edit--preflight-disk-hooks gptel-agent-edit--preflight-changes)
+                     (gptel-agent-policy--allows-p ceiling tool args workspace required-field)))
                (cl-loop for entry in ceiling
                         always
                         (let ((gptel-agent-policy--workspace (cdr entry))

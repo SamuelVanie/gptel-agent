@@ -115,14 +115,15 @@ If none exists, split one off the frame root."
   queue file original proposed control revision before after config closing updating
   navigation-notice)
 
-(defun smv/gptel-ediff--fill (buffer text)
-  "Replace preview BUFFER with TEXT, retaining its approximate line position."
+(defun smv/gptel-ediff--fill (buffer content)
+  "Display snapshot CONTENT in preview BUFFER, retaining its line position."
   (with-current-buffer buffer
     (let ((line (line-number-at-pos)) (column (current-column)) (inhibit-read-only t))
       (save-restriction
         (widen)
         ;; Preserve window starts, marks and unchanged regions while updating.
-        (replace-region-contents (point-min) (point-max) (lambda () (or text "")))
+        (replace-region-contents (point-min) (point-max)
+                                 (lambda () (or (gptel-agent-edit--display-content content) "")))
         (goto-char (point-min))
         (forward-line (1- line))
         (move-to-column column))
@@ -135,7 +136,7 @@ If none exists, split one off the frame root."
     (unless (and (buffer-live-p (car pair))
                  (equal (with-current-buffer (car pair)
                           (save-restriction (widen) (buffer-substring-no-properties (point-min) (point-max))))
-                        (or (cdr pair) "")))
+                        (or (gptel-agent-edit--display-content (cdr pair)) "")))
       (user-error "Preview buffers were edited; close with Q and reopen the file"))))
 
 (defun smv/gptel-ediff-validate (queue)
@@ -158,8 +159,7 @@ If none exists, split one off the frame root."
                   (when notice (propertize (concat " — " notice) 'face 'warning))
                   (format " — %s — revision %d — %s%s%s"
                           (plist-get file :path) (plist-get file :revision) (plist-get file :status)
-                          (cond ((null (plist-get file :before)) " [new file]")
-                                ((null (plist-get file :after)) " [delete file]") (t ""))
+                          (gptel-agent-edit--change-label (plist-get file :before) (plist-get file :after))
                           (if (plist-get file :external) " [includes external changes]" "")))))
     (dolist (buffer (list (smv/gptel-ediff--view-control view)
                           (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-proposed view)))
@@ -288,7 +288,11 @@ Updates reuse the same buffers and control window; no recursive edit is used."
           (dolist (pair (list (cons (smv/gptel-ediff--view-original view) (smv/gptel-ediff--view-before view))
                               (cons (smv/gptel-ediff--view-proposed view) (smv/gptel-ediff--view-after view))))
             (smv/gptel-ediff--fill (car pair) (cdr pair))
-            (smv/gptel-ediff--set-mode-for (car pair) path)
+            ;; Link payloads are directory metadata.  Do not run file
+            ;; mode hooks on them or on the absent side of an unlink.
+            (when (or (stringp (cdr pair))
+                      (not (or (consp (plist-get file :before)) (consp (plist-get file :after)))))
+              (smv/gptel-ediff--set-mode-for (car pair) path))
             (with-current-buffer (car pair) (setq buffer-read-only t)))
           (smv/gptel-ediff--select-main-window)
           (setf (smv/gptel-ediff--view-control view)
@@ -375,6 +379,29 @@ Return an immediate :result so gptel can continue with more proposals."
          (list :block reason))))))
 
 (add-hook 'gptel-pre-tool-call-functions #'smv/gptel-ediff-tool-call)
+
+(defun smv/gptel-ediff--preflight (original fsm)
+  "Resolve pre-tool checks against FSM's pending review when its hook is active."
+  (let (gptel-agent-edit--preflight-changes gptel-agent-edit--preflight-disk-hooks)
+    (when-let* (((eq (gptel-fsm-state fsm) 'TPRE))
+                (source (plist-get (gptel-fsm-info fsm) :buffer))
+                ((buffer-live-p source))
+                (queue (buffer-local-value 'gptel-agent-review--queue (gptel-agent-review--owner source)))
+                ((not (gptel-agent-review--queue-applied queue))))
+      (let ((hooks (cl-loop for hook in (buffer-local-value 'gptel-pre-tool-call-functions source)
+                            if (eq hook t) append (default-value 'gptel-pre-tool-call-functions)
+                            else collect hook)))
+        (when (memq #'smv/gptel-ediff-tool-call hooks)
+          (setq gptel-agent-edit--preflight-changes (gptel-agent-review--staged queue)
+                gptel-agent-edit--preflight-disk-hooks
+                (cl-set-difference hooks '(smv/gptel-ediff-tool-call gptel-agent--detect-repetition))))))
+    (funcall original fsm)))
+
+;; The request policy and outside-access adapters both preflight before
+;; upstream invokes the hook.  A call that falls through to TOOL is checked
+;; afresh against disk, including when the review hook is disabled.
+(advice-add 'gptel--handle-pre-tool :around #'smv/gptel-ediff--preflight '((depth . -99)))
+(advice-add 'gptel--handle-tool-use :around #'smv/gptel-ediff--preflight '((depth . -99)))
 
 (provide 'gptel-ediff-prehook)
 ;;; gptel-ediff-prehook.el ends here

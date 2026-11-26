@@ -57,6 +57,19 @@
   "Return serialized payload of FSM."
   (prin1-to-string (plist-get (gptel-fsm-info fsm) :data)))
 
+(ert-deftest gptel-aside-unlink-question-receives-link-metadata ()
+  (gptel-aside-test--with-chat
+    (with-temp-file "shared" (insert "unrelated target contents"))
+    (make-symbolic-link "./shared" "alias")
+    (gptel-review-test--submit
+     "Edit" '(:mode "batch" :root_directory "." :operations [(:operation "delete" :file_path "alias")]))
+    (setq aside (gptel-agent-review-aside
+                 gptel-agent-review--queue (gptel-review-test--file 2) "What will be removed?"))
+    (with-current-buffer aside
+      (should (string-search "Symbolic link to \"./shared\"" (buffer-string)))
+      (should (string-search "Proposed file (deleted)" (buffer-string)))
+      (should-not (string-search "unrelated target contents" (buffer-string))))))
+
 (ert-deftest gptel-aside-name-shares-the-owner-family-once ()
   (dolist (existing-id '(nil "1234abcd"))
     (gptel-aside-test--with-chat

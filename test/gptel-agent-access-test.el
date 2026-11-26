@@ -295,33 +295,175 @@
        (should-not (file-exists-p (concat root "new.txt")))
        (should-not (file-exists-p (concat back "other.txt")))))))
 
-(ert-deftest gptel-agent-access-symlink-deletion-requires-unchanged-approval ()
+(ert-deftest gptel-agent-access-outside-symlink-entry-deletion-requires-approval ()
   (dolist (retarget '(nil t))
     (gptel-agent-access-test--with-project
       (with-current-buffer parent (setq gptel-agent-use-project-instructions nil))
-      (let ((target (concat back "target")) (other (concat back "other"))
-            (alias (concat front "alias")))
-        (gptel-agent-instructions-test--write target "original\n")
-        (gptel-agent-instructions-test--write other "original\n")
+      (let ((gptel-agent-history-directory (expand-file-name "history/" root))
+            (alias (concat back "alias"))
+            (target "../frontend/AGENTS.md"))
         (make-symbolic-link target alias)
         (setq fsm (gptel-agent-instructions-test--request parent))
-        (let ((pending (gptel-agent-access-test--ask
-                        fsm "Edit" '(:mode "patch" :file_path "alias"
-                                     :new_str "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-original\n"))))
+        (let* ((args (list :mode "patch" :file_path "../backend/alias"
+                           :new_str (concat "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-"
+                                            target "\n\\ No newline at end of file\n")))
+               (pending (gptel-agent-access-test--ask fsm "Edit" args)))
           (should pending)
-          (should (file-exists-p target))
+          (should (equal (file-symlink-p alias) target))
           (when retarget
             (delete-file alias)
-            (make-symbolic-link other alias))
+            (make-symbolic-link "data.txt" alias))
           (gptel--accept-tool-calls pending)
           (if retarget
               (progn
-                (should (file-exists-p target))
+                (should (equal (file-symlink-p alias) "data.txt"))
                 (should (string-match-p "target changed"
                                         (gptel-agent-instructions-test--payload fsm))))
-            (should-not (file-exists-p target)))
-          (should (file-exists-p other))
-          (should (equal (file-symlink-p alias) (if retarget other target))))))))
+            (should-not (file-symlink-p alias))
+            (should-not (file-exists-p alias)))
+          (should (file-exists-p (concat front "AGENTS.md")))
+          (should (file-exists-p (concat back "data.txt"))))))))
+
+(ert-deftest gptel-agent-access-unlinks-local-entry-with-outside-referent ()
+  (gptel-agent-access-test--with-project
+    (with-current-buffer parent (setq gptel-agent-use-project-instructions nil))
+    (let ((gptel-agent-history-directory (expand-file-name "history/" root))
+          (target (expand-file-name "data.txt" back))
+          (alias (expand-file-name "alias" front)))
+      (make-symbolic-link target alias)
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (should-not (gptel-agent-access-test--ask
+                   fsm "Edit" '(:mode "batch" :root_directory "."
+                                :operations [(:operation "delete" :file_path "alias")])))
+      (should-not (file-symlink-p alias))
+      (should-not (file-exists-p alias))
+      (should (equal (with-temp-buffer (insert-file-contents target) (buffer-string))
+                     "OUTSIDE-CONTENT")))))
+
+(ert-deftest gptel-agent-access-staged-unlink-write-and-read-use-local-entry ()
+  (pcase-dolist (`(,referent ,policy)
+                '(("missing.txt" nil) ("../backend/data.txt" nil)
+                  ("missing.txt" staged-local) ("../backend/data.txt" staged-local)))
+    (gptel-agent-access-test--with-project
+      (let ((alias (expand-file-name "link.txt" front))
+            (gptel-agent-history-directory (expand-file-name "history/" root))
+            (gptel-agent-review-apply-immediately nil)
+            (gptel-agent-policy--definitions (make-hash-table)))
+        (when policy
+          (gptel-agent-define-tool-policy
+           policy :allow '((:tool "Edit" :args (:operations (every (object :file_path (under workspace)))))
+                           (:tool "Write" :args (:file_path (under workspace)))
+                           (:tool "Read" :args (:file_path (under workspace))))))
+        (make-symbolic-link referent alias)
+        (with-current-buffer parent
+          (setq-local gptel-agent-tool-policy policy
+                      gptel-confirm-tool-calls 'auto
+                      gptel-pre-tool-call-functions '(smv/gptel-ediff-tool-call)))
+        (setq fsm (gptel-agent-instructions-test--request parent))
+        (cl-letf (((symbol-function 'display-buffer) #'ignore))
+          ;; Use separate backend responses so every access and instructions
+          ;; prehook has to resolve the path from the owner's pending review.
+          (dolist (call '(("Edit" (:mode "batch" :root_directory "."
+                                   :operations [(:operation "delete" :file_path "link.txt")]))
+                          ("Write" (:file_path "link.txt" :content "local replacement"))
+                          ("Read" (:file_path "link.txt"))))
+            (should-not (gptel-agent-access-test--ask fsm (car call) (cadr call)))
+            (should (eq (gptel-fsm-state fsm) 'WAIT))
+            (should (equal (plist-get (gptel-fsm-info fsm) :agent-instructions-targets)
+                           (list front)))
+            (should (equal (file-symlink-p alias) referent))))
+        (let* ((data (plist-get (gptel-fsm-info fsm) :data))
+               (messages (or (plist-get data :input) (plist-get data :messages)))
+               (result (car (last (append messages nil)))))
+          (should (or (equal (plist-get result :role) "tool")
+                      (equal (plist-get result :type) "function_call_output")))
+          (should (equal (or (plist-get result :output) (plist-get result :content))
+                         "local replacement")))
+        (when (equal referent "../backend/data.txt")
+          ;; Removing the review hook sends Read to disk.  A pending local
+          ;; replacement cannot authorize the physical link's outside target.
+          (with-current-buffer parent (setq-local gptel-pre-tool-call-functions nil))
+          (let* ((disk-fsm (gptel-agent-instructions-test--request parent))
+                 (pending (gptel-agent-access-test--ask disk-fsm "Read" '(:file_path "link.txt")))
+                 (payload (gptel-agent-instructions-test--payload disk-fsm)))
+            (if policy
+                (progn (should-not pending)
+                       (should (string-match-p "Tool policy denied Read" payload)))
+              (should pending))
+            (should-not (string-match-p "OUTSIDE-CONTENT" payload))))
+        (let ((queue (buffer-local-value 'gptel-agent-review--queue parent)))
+          (should (= 1 (length (gptel-agent-review--queue-files queue))))
+          (with-current-buffer (gptel-agent-review--queue-buffer queue)
+            (gptel-agent-review-accept-all)
+            (gptel-agent-review-done)))
+        (should-not (file-symlink-p alias))
+        (should (equal (with-temp-buffer (insert-file-contents alias) (buffer-string))
+                       "local replacement"))
+        (should-not (file-exists-p (expand-file-name "missing.txt" front)))
+        (should (equal (with-temp-buffer
+                         (insert-file-contents (expand-file-name "data.txt" back)) (buffer-string))
+                       "OUTSIDE-CONTENT"))))))
+
+(ert-deftest gptel-agent-access-disk-hook-cannot-use-a-staged-link-replacement ()
+  (gptel-agent-access-test--with-project
+    (let ((alias (expand-file-name "link.txt" front))
+          (gptel-agent-history-directory (expand-file-name "history/" root))
+          (gptel-agent-review-apply-immediately nil)
+          hook-ran)
+      (make-symbolic-link "../backend/data.txt" alias)
+      (with-current-buffer parent
+        (setq-local gptel-confirm-tool-calls 'auto
+                    gptel-pre-tool-call-functions '(smv/gptel-ediff-tool-call)))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (cl-letf (((symbol-function 'display-buffer) #'ignore))
+        (should-not (gptel-agent-access-test--ask
+                     fsm "Edit" '(:mode "batch" :root_directory "."
+                                  :operations [(:operation "delete" :file_path "link.txt")
+                                               (:operation "write" :file_path "link.txt" :content "staged")]))))
+      (let* ((queue (buffer-local-value 'gptel-agent-review--queue parent))
+             (file (car (gptel-agent-review--queue-files queue))))
+        (should (equal (plist-get file :after) "staged")))
+      (should (equal (file-symlink-p alias) "../backend/data.txt"))
+      ;; Additional prehooks can open the disk operand themselves.  Preserve
+      ;; its outside guard before any such hook runs.
+      (with-current-buffer parent
+        (add-hook 'gptel-pre-tool-call-functions (lambda (_) (setq hook-ran t) nil) nil t))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (let ((pending (gptel-agent-access-test--ask fsm "Read" '(:file_path "link.txt"))))
+        (should (= 1 (length pending)))
+        (should-not hook-ran)
+        (should-not (string-search "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload fsm)))
+        (with-current-buffer parent (gptel--reject-tool-calls pending))
+        (should-not (string-search "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload fsm)))))))
+
+(ert-deftest gptel-agent-access-unlink-uses-local-instruction-scope ()
+  (dolist (batch '(nil t))
+    (gptel-agent-access-test--with-project
+      (let* ((link (concat front "AGENTS.md"))
+             (target (concat back "data.txt"))
+             (relative (file-relative-name target front))
+             (args (if batch '(:mode "batch" :root_directory "."
+                               :operations [(:operation "delete" :file_path "AGENTS.md")])
+                     (list :mode "patch" :file_path "AGENTS.md"
+                           :new_str (concat "--- AGENTS.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-"
+                                            relative "\n\\ No newline at end of file\n"))))
+             (gptel-agent-history-directory (expand-file-name "history/" root)))
+        (make-symbolic-link relative link t)
+        (setq fsm (gptel-agent-instructions-test--request parent))
+        (should (string-match-p "OUTSIDE-CONTENT" (gptel-agent-instructions-test--payload fsm)))
+        ;; Changed local rules defer the mutation until the next model turn,
+        ;; even though the link itself is inside the workspace.
+        (gptel-agent-instructions-test--write target "NEW-SHARED-RULE")
+        (should-not (gptel-agent-access-test--ask fsm "Edit" args))
+        (should (equal (file-symlink-p link) relative))
+        (should (string-match-p "Deferred before staging" (gptel-agent-instructions-test--payload fsm)))
+        (should-not (gptel-agent-access-test--ask fsm "Edit" args))
+        (should-not (file-symlink-p link))
+        (should (equal (with-temp-buffer (insert-file-contents target) (buffer-string))
+                       "NEW-SHARED-RULE"))
+        (should-not (string-match-p "BACK-INSTRUCTION" (gptel-agent-instructions-test--payload fsm)))
+        (should (equal (buffer-local-value 'gptel-agent-instructions--targets parent)
+                       (list front)))))))
 
 (ert-deftest gptel-agent-access-async-searches-ask-and-complete ()
   (dolist (name '("Glob" "Grep"))

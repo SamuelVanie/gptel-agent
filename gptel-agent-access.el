@@ -58,11 +58,11 @@ Ordinary tool confirmations and file reviews still apply."
   (message "Outside file operations in %s require approval again" (buffer-name)))
 
 (defun gptel-agent-access--check-paths (paths)
-  "Require approval for outside PATHS before preparation or application."
+  "Require approval for resolved edit entry PATHS before preparation or apply."
   (unless (bound-and-true-p gptel-agent--result-file-scope)
     (gptel-agent-instructions--initialize)
     (dolist (path paths)
-      (setq path (file-truename path))
+      (setq path (gptel-agent-edit--entry-path path))
       (unless (or (gptel-agent-instructions--inside-p path gptel-agent-instructions--boundary)
                   (gptel-agent-access--granted-p)
                   (member path gptel-agent-access--approved))
@@ -75,26 +75,23 @@ GUARDED requests also resolve the final symlink of shared instruction files."
     (when-let* ((path (plist-get args key)))
       (when (and (stringp path) (file-remote-p path))
         (error "File tools do not support remote targets: %s" path))))
-  (mapcar
-   (lambda (path)
-     (unless (and (stringp path) (not (string-empty-p path)))
-       (error "File tool requires a nonempty target path"))
-     (let ((target (let (file-name-handler-alist)
-                     (file-truename (expand-file-name path)))))
-       (when (file-remote-p target)
-         (error "File tools do not support remote targets: %s" target))
-       target))
-   (pcase name
-     ((or "Edit" "Insert" "Write") (gptel-agent-edit-targets name args))
-     ("Read"
-      (let ((path (plist-get args :file_path)))
-        ;; Shared instruction symlinks retain their containing local scope.
-        (list (if (and (not guarded) gptel-agent-use-project-instructions (stringp path)
-                       (equal (file-name-nondirectory path) "AGENTS.md"))
-                  (file-name-directory (expand-file-name path)) path))))
-     ("Glob" (list (or (plist-get args :root_directory) ".")))
-     ((or "Mkdir" "Rmdir") (list (plist-get args :directory_path)))
-     (_ (list (plist-get args :path))))))
+  (if (member name '("Edit" "Insert" "Write")) (gptel-agent-edit-targets name args)
+    (let* ((path (pcase name
+                   ("Read" (plist-get args :file_path))
+                   ("Glob" (or (plist-get args :root_directory) "."))
+                   ((or "Mkdir" "Rmdir") (plist-get args :directory_path))
+                   (_ (plist-get args :path))))
+           (read (equal name "Read")))
+      (unless (and (stringp path) (not (string-empty-p path)))
+        (error "File tool requires a nonempty target path"))
+      (if-let* ((staged (and read (gptel-agent-edit--staged-read path))))
+          (list (plist-get staged :path))
+        (when (and read (not guarded) gptel-agent-use-project-instructions
+                   (equal (file-name-nondirectory path) "AGENTS.md"))
+          (setq path (file-name-directory (expand-file-name path))))
+        (let ((target (let (file-name-handler-alist) (file-truename (expand-file-name path)))))
+          (when (file-remote-p target) (error "File tools do not support remote targets: %s" target))
+          (list target))))))
 
 (defun gptel-agent-access--outside-p (name args &optional fsm)
   "Whether NAME/ARGS requires outside access approval for request FSM."
@@ -109,7 +106,14 @@ GUARDED requests also resolve the final symlink of shared instruction files."
                          ("Read" :file_path) ("Glob" :root_directory)
                          ((or "Grep" "PathInfo") :path)))
            (scope (and fsm (plist-get (gptel-fsm-info fsm) :agent-supervision))))
-      (and (not (gptel-agent-access--granted-p))
+      (or
+       ;; User hooks can open the on-disk operand independently of review.
+       ;; Retain its own authorization when the staged and disk paths differ.
+       (and gptel-agent-edit--preflight-disk-hooks
+            (member name '("Read" "Edit" "Write" "Insert"))
+            (let (gptel-agent-edit--preflight-changes gptel-agent-edit--preflight-disk-hooks)
+              (gptel-agent-access--outside-p name args fsm)))
+       (and (not (gptel-agent-access--granted-p))
            (not (and guarded read-field
                      (gptel-agent-policy-request-allows-p fsm name args read-field)
                      (let ((target (car paths)))
@@ -123,7 +127,7 @@ GUARDED requests also resolve the final symlink of shared instruction files."
            (cl-some (lambda (path)
                       (not (gptel-agent-instructions--inside-p
                             path gptel-agent-instructions--boundary)))
-                    paths)))))
+                    paths))))))
 
 (defun gptel-agent-access--scan (fsm)
   "Mark outside calls in FSM before instruction discovery and review hooks."
@@ -153,6 +157,8 @@ GUARDED requests also resolve the final symlink of shared instruction files."
                                              call (list :args args))
                     (setf (plist-get call :args) args))))
             (error
+             (unless (plist-member call :error) (nconc call (list :error nil)))
+             (setf (plist-get call :error) t)
              (gptel--process-tool-call
               fsm (cl-find (plist-get call :name) (plist-get info :tools)
                            :key #'gptel-tool-name :test #'equal)
@@ -205,10 +211,12 @@ GUARDED requests also resolve the final symlink of shared instruction files."
          (source (file-truename directory))
          (guarded (gptel-agent-policy-request-ceiling fsm))
          (paths (with-current-buffer owner (gptel-agent-access--paths name args guarded)))
+         (links (and (equal name "Edit") (mapcar #'file-symlink-p paths)))
          used)
     (setf (gptel-tool-function copy)
           (lambda (&rest supplied)
-            (let* ((callback (and (gptel-tool-async tool) (pop supplied)))
+            (let* (gptel-agent-edit--preflight-changes gptel-agent-edit--preflight-disk-hooks
+                   (callback (and (gptel-tool-async tool) (pop supplied)))
                    (result
                     (progn
                       (unless (and (not used) (not (plist-get call :agent-access-used))
@@ -222,7 +230,8 @@ GUARDED requests also resolve the final symlink of shared instruction files."
                       (with-current-buffer owner
                         (unless (and (equal supplied values) (equal default-directory directory)
                                      (equal (file-truename directory) source)
-                                     (equal (gptel-agent-access--paths name args guarded) paths))
+                                     (equal (gptel-agent-access--paths name args guarded) paths)
+                                     (or (not links) (equal links (mapcar #'file-symlink-p paths))))
                           (error "Approved operation or target changed; submit a fresh call"))
                         ;; Remember only after validating the live approval,
                         ;; but before instruction discovery can defer the call.

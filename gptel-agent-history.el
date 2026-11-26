@@ -52,21 +52,24 @@ if history must be retained indefinitely.  Snapshots are not pruned by gptel."
         (coding-system-for-write 'utf-8-emacs)
         (index 0) files)
     (dolist (change changes)
-      (let ((entry (list :path (file-truename (plist-get change :path))
+      (let ((entry (list :path (plist-get change :path)
                          :coding (plist-get change :coding) :modes (plist-get change :modes))))
         (when (plist-get change :kind)
           (setq entry (append entry (list :kind (plist-get change :kind)
                                           :reverses (plist-get change :reverses)))))
         (dolist (side '(:before :after))
-          (when (plist-get change side)
-            (let ((name (format "%d-%s" index (substring (symbol-name side) 1))))
-              (with-temp-file (expand-file-name name directory) (insert (plist-get change side)))
-              (set-file-modes (expand-file-name name directory) #o600)
-              (setq entry (plist-put entry side name)))))
+          (when-let* ((value (plist-get change side)))
+            (if (eq (car-safe value) 'symlink)
+                (setq entry (plist-put entry side value))
+              (let ((name (format "%d-%s" index (substring (symbol-name side) 1))))
+                (with-temp-file (expand-file-name name directory) (insert value))
+                (set-file-modes (expand-file-name name directory) #o600)
+                (setq entry (plist-put entry side name))))))
         (push entry files)
         (cl-incf index)))
     (with-temp-file (expand-file-name "manifest.el" directory)
-      (let ((print-length nil) (print-level nil))
+      (let ((print-length nil) (print-level nil)
+            (print-escape-newlines t) (print-escape-control-characters t))
         (prin1 (list :time (format-time-string "%Y-%m-%d %H:%M:%S.%3N")
                      :files (nreverse files)) (current-buffer))))
     (set-file-modes (expand-file-name "manifest.el" directory) #o600)
@@ -86,13 +89,17 @@ if history must be retained indefinitely.  Snapshots are not pruned by gptel."
     (goto-char (point-min))
     (read (current-buffer))))
 
-(defun gptel-agent-history--content (directory name)
-  "Read snapshot NAME in DIRECTORY; nil represents a nonexistent file."
-  (when name
-    (with-temp-buffer
-      (let ((coding-system-for-read 'utf-8-emacs))
-        (insert-file-contents (expand-file-name name directory)))
-      (buffer-string))))
+(defun gptel-agent-history--content (directory side)
+  "Return the recorded value for a manifest SIDE in DIRECTORY.
+Strings name saved text files.  Symbolic link destinations are stored
+literally in the manifest.  Nil represents an absent entry."
+  (cond
+   ((null side) nil)
+   ((eq (car-safe side) 'symlink) side)
+   (t (with-temp-buffer
+        (let ((coding-system-for-read 'utf-8-emacs))
+          (insert-file-contents (expand-file-name side directory)))
+        (buffer-string)))))
 
 (defun gptel-agent-history--entries ()
   "Return completed snapshot directories, newest first."
@@ -236,9 +243,13 @@ In the history browser, restore only the files visible under the current filter.
       (unwind-protect
           (progn
             (with-current-buffer before
-              (insert (or (gptel-agent-history--content directory (plist-get file :before)) "")))
+              (insert (or (gptel-agent-edit--display-content
+                           (gptel-agent-history--content directory (plist-get file :before)))
+                          "")))
             (with-current-buffer after
-              (insert (or (gptel-agent-history--content directory (plist-get file :after)) "")))
+              (insert (or (gptel-agent-edit--display-content
+                           (gptel-agent-history--content directory (plist-get file :after)))
+                          "")))
             (diff before after "-u" t))
         (kill-buffer before)
         (kill-buffer after)))))

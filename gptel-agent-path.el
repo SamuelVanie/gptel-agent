@@ -32,13 +32,18 @@ Nil, JSON null or an empty string uses FALLBACK, or `default-directory'."
 
 (defun gptel-agent-path-resolve (path expected &optional must-exist)
   "Resolve PATH and validate EXPECTED type without changing the filesystem.
-EXPECTED is `file', `directory', or `any'.  MUST-EXIST requires existence.
+EXPECTED is `file', `file-entry', `directory', or `any'.  A file entry
+can also be a final symlink, including a dangling one.  MUST-EXIST
+requires existence.
 File syntax is checked before canonicalization can hide a trailing slash."
   (unless (and (stringp path) (not (string-empty-p path)))
     (gptel-agent-path--error (format "%S" path) expected "empty or invalid path"
                             "Supply a nonempty path; use PathInfo to inspect a target."))
   (let* ((resolved (expand-file-name path))
-         (actual (gptel-agent-path-type resolved)))
+         (entry (eq expected 'file-entry))
+         (expected (if entry 'file expected))
+         (actual (if (and entry (file-symlink-p resolved))
+                     "file" (gptel-agent-path-type resolved))))
     (when (and (eq expected 'file) (equal actual "directory"))
       (gptel-agent-path--error
        resolved "file" actual

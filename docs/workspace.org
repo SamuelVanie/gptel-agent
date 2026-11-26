@@ -536,9 +536,18 @@ Replace text and create a second file in one batch.
 }
 #+end_src
 
-File edits follow symlinks. Deleting through a symlink removes the target and
-preserves the link. History restores the target. The structured file tools
-review text changes and do not support renames, binary files, or mode changes.
+Text edits follow symlinks to their targets. A batch =delete= or a patch
+whose new path is =/dev/null= removes the named directory entry. If that
+entry is a symlink, review shows its literal destination and undo recreates
+the link, including a relative or dangling link. A deletion hunk for a link
+must match that destination exactly, including Git's no-final-newline marker
+when applicable. For example, deleting a project's =AGENTS.md= link leaves
+the shared rules file and other projects' links intact. The link's containing
+directory determines the access and instruction scope of the unlink. When undo
+restores a symlink, Emacs detaches any unmodified buffer visiting that entry
+and keeps its previous contents. Reopening the path loads the link's target.
+The structured file tools review text changes and symlink deletions and do
+not support renames, binary files, or mode changes.
 Shell and Elisp side effects are outside that review.
 
 Preparation and execution share =gptel-agent-edit.el=. Failed patches,

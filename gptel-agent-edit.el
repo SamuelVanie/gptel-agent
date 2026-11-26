@@ -17,12 +17,94 @@
 
 (defvar gptel-agent-edit--staged-changes nil
   "Dynamically bound table of file changes while preparing proposals.
-Keys are canonical paths; values retain the original :before and latest :after.")
+Keys are resolved entry paths; values retain the original :before and
+latest :after.  Each side is text, nil for absence, or (symlink . TARGET)
+with the link's literal destination.")
+
+(defvar gptel-agent-edit--preflight-changes nil
+  "Owning review's staged entries while preflighting a review tool batch.
+Disk execution and final validation use the physical filesystem.")
+
+(defvar gptel-agent-edit--preflight-disk-hooks nil
+  "Whether the pre-tool batch also has hooks that may open the disk path.")
+
+(defun gptel-agent-edit--staged-read (path)
+  "Return the pending review entry that a Read of PATH would use."
+  (when gptel-agent-edit--preflight-changes
+    (let ((gptel-agent-edit--staged-changes gptel-agent-edit--preflight-changes))
+      (gethash (gptel-agent-edit--file-path path) gptel-agent-edit--staged-changes))))
+
+(defun gptel-agent-edit--entry-path (path)
+  "Return absolute PATH with its parent canonicalized and its leaf intact."
+  (unless (file-name-absolute-p path) (setq path (expand-file-name path)))
+  (let ((parent (let (file-name-handler-alist)
+                  (file-truename (file-name-directory path)))))
+    (when (file-remote-p parent) (error "File tools require a local path: %s" parent))
+    (concat (file-name-as-directory parent) (file-name-nondirectory path))))
+
+(defun gptel-agent-edit--check-staged-directory (directory &optional seen)
+  "Check that each component of DIRECTORY is still a directory when staged.
+Follow directory aliases too, rejecting cycles tracked in SEEN."
+  (when (and gptel-agent-edit--staged-changes
+             (> (hash-table-count gptel-agent-edit--staged-changes) 0))
+    (let ((path (directory-file-name directory)))
+      (while (not (equal path (directory-file-name (file-name-directory path))))
+        (let ((entry (gptel-agent-edit--entry-path path)))
+          (when-let* ((change (gethash entry gptel-agent-edit--staged-changes)))
+            (gptel-agent-path--error entry "parent directory"
+                                    (if (plist-get change :after) "file in pending changes"
+                                      "entry deleted in pending changes")
+                                    "Choose a path whose parent is still a directory."))
+          (when (file-symlink-p entry)
+            (when (member entry seen) (error "Cyclic directory symlink: %s" entry))
+            (gptel-agent-edit--check-staged-directory
+             (file-chase-links entry 1) (cons entry seen))))
+        (setq path (directory-file-name (file-name-directory path)))))))
+
+(defun gptel-agent-edit--file-path (path &optional entry)
+  "Resolve file operand PATH in the staged filesystem.
+ENTRY selects the named directory entry, even when it is a symlink."
+  (setq path (gptel-agent-path-resolve path 'file-entry))
+  (gptel-agent-edit--check-staged-directory (file-name-directory path))
+  (let ((path (gptel-agent-edit--entry-path path))
+        seen)
+    (unless entry
+      ;; A staged unlink or recreation shadows the physical link even when
+      ;; reached through another link in the same batch.
+      (while (and (not (and gptel-agent-edit--staged-changes
+                            (gethash path gptel-agent-edit--staged-changes)))
+                  (file-symlink-p path))
+        (when (member path seen) (error "Cyclic symlink: %s" path))
+        (push path seen)
+        (let ((next (file-chase-links path 1)))
+          (gptel-agent-edit--check-staged-directory (file-name-directory next))
+          (setq path (gptel-agent-edit--entry-path next))))
+      (let ((staged (and gptel-agent-edit--staged-changes
+                         (gethash path gptel-agent-edit--staged-changes))))
+        (when (and seen (if staged (null (plist-get staged :after)) (not (file-exists-p path))))
+          (gptel-agent-path--error (car (last seen)) "file" "broken symlink"
+                                  "Inspect the link with PathInfo and correct file_path."))
+        (unless staged (gptel-agent-path-resolve path 'file))))
+    path))
+
+(defun gptel-agent-edit--display-content (content)
+  "Format CONTENT for a read-only review of a snapshot."
+  (if (eq (car-safe content) 'symlink)
+      (format "Symbolic link to %S\n" (cdr content))
+    content))
+
+(defun gptel-agent-edit--change-label (before after)
+  "Describe the entry types in a preview of BEFORE and AFTER."
+  (cond ((consp after) " [proposed symbolic link]")
+        ((consp before) (if after " [replace symbolic link with file]" " [delete symbolic link]"))
+        ((null before) " [new file]")
+        ((null after) " [delete file]")
+        (t "")))
 
 (defun gptel-agent-edit-stage (changes table)
   "Merge CHANGES into TABLE without modifying the supplied change plists."
   (dolist (change changes)
-    (let* ((path (file-truename (plist-get change :path)))
+    (let* ((path (plist-get change :path))
            (merged (copy-sequence (or (gethash path table) change))))
       (setf (plist-get merged :path) path
             (plist-get merged :after) (plist-get change :after))
@@ -114,18 +196,28 @@ Exact matches take precedence.  Never guess changed words or punctuation."
     (setf (plist-get change :after) (buffer-string)))
   (list change))
 
-(defun gptel-agent-edit--snapshot (path &optional must-exist)
-  "Read PATH's canonical target into a change plist.
-Require an existing file if MUST-EXIST.  All file edits follow symlinks,
-including deletion, so application and history refer to the same target."
-  (setq path (file-truename (gptel-agent-path-resolve path 'file)))
-  (when gptel-agent-edit--staged-changes
-    (let ((parent (file-name-directory path)))
-      (while (and parent (not (equal parent (file-name-directory (directory-file-name parent)))))
-        (when (plist-get (gethash (directory-file-name parent) gptel-agent-edit--staged-changes) :after)
-          (gptel-agent-path--error parent "parent directory" "file in pending changes"
-                                  "Choose a different path; this parent is already staged as a file."))
-        (setq parent (file-name-directory (directory-file-name parent))))))
+(defun gptel-agent-edit--visiting-buffers (path entry-only)
+  "Return local buffers visiting PATH, a resolved entry path.
+ENTRY-ONLY matches the final name even through aliases of its parent.
+Otherwise also include the buffer visiting the file through a symlink."
+  (let ((leaf (file-name-nondirectory path))
+        buffers)
+    (dolist (buffer (buffer-list))
+      (when-let* ((name (buffer-file-name buffer))
+                  ((not (file-remote-p name)))
+                  ((equal leaf (file-name-nondirectory name)))
+                  ((or (equal name path)
+                       (equal path (ignore-errors (gptel-agent-edit--entry-path name))))))
+        (push buffer buffers)))
+    (unless entry-only
+      (when-let* ((buffer (find-buffer-visiting path)))
+        (cl-pushnew buffer buffers)))
+    buffers))
+
+(defun gptel-agent-edit--snapshot (path &optional must-exist entry)
+  "Read PATH into a change plist, requiring existence if MUST-EXIST.
+When ENTRY is non-nil, snapshot the final symlink itself."
+  (setq path (gptel-agent-edit--file-path path entry))
   (if-let* ((staged (and gptel-agent-edit--staged-changes
                          (gethash path gptel-agent-edit--staged-changes))))
       (let ((snapshot (copy-sequence staged)))
@@ -133,16 +225,18 @@ including deletion, so application and history refer to the same target."
           (error "File was deleted earlier in this batch: %s" path))
         (setf (plist-get snapshot :before) (plist-get staged :after))
         snapshot)
-    (when-let* ((buffer (find-buffer-visiting path)))
-      (when (buffer-modified-p buffer)
-        (error "Save or revert the unsaved buffer before editing %s" path)))
-    (when must-exist (gptel-agent-path-resolve path 'file t))
-    (with-temp-buffer
-      (let ((exists (file-exists-p path)))
-        (when exists (insert-file-contents path))
-        (list :path path :before (and exists (buffer-string))
-              :coding buffer-file-coding-system
-              :modes (and exists (file-modes path)))))))
+    (let ((link (and entry (file-symlink-p path))))
+      (when (cl-some #'buffer-modified-p (gptel-agent-edit--visiting-buffers path link))
+        (error "Save or revert the unsaved buffer before editing %s" path))
+      (if link
+          (list :path path :before (cons 'symlink link))
+        (when must-exist (gptel-agent-path-resolve path 'file t))
+        (with-temp-buffer
+          (let ((exists (file-exists-p path)))
+            (when exists (insert-file-contents path))
+            (list :path path :before (and exists (buffer-string))
+                  :coding buffer-file-coding-system
+                  :modes (and exists (file-modes path)))))))))
 
 (defun gptel-agent-edit--normalize-patch (text)
   "Remove optional Markdown fences from unified diff TEXT."
@@ -206,7 +300,7 @@ starting with additional plus or minus signs.  Never count file headers."
       (apply #'concat (nreverse hunks)))))
 
 (defun gptel-agent-edit--sections (text)
-  "Parse unified diff TEXT into (OLD-PATH NEW-PATH HUNKS) sections."
+  "Parse unified diff TEXT into (OLD-PATH NEW-PATH HUNKS DELETED-MODE) sections."
   (with-temp-buffer
     (insert (gptel-agent-edit--normalize-patch text))
     (goto-char (point-min))
@@ -218,7 +312,7 @@ starting with additional plus or minus signs.  Never count file headers."
       (unless (equal (match-string 1) "100644")
         (error "Edit cannot create special or executable files")))
     (goto-char (point-min))
-    (let (headers sections boundaries)
+    (let ((metadata (point-min)) headers sections boundaries)
       (while (re-search-forward "^--- \\([^\n]+\\)\n\\+\\+\\+ \\([^\n]+\\)\n@@ " nil t)
         (push (list (match-beginning 0) (- (match-end 0) 3)
                     (gptel-agent-edit--header-path (match-string 1))
@@ -239,14 +333,18 @@ starting with additional plus or minus signs.  Never count file headers."
                (unless (cl-find-if (lambda (h) (and (>= (car h) start) (< (car h) end))) headers)
                  (error "Diff file section has no valid headers and hunks")))
       (while headers
-        (pcase-let* ((`(,_ ,start ,old ,new) (pop headers))
+        (pcase-let* ((`(,header ,start ,old ,new) (pop headers))
                      (end (if headers (caar headers) (point-max))))
           (when-let* ((boundary (cl-find-if (lambda (b) (and (> b start) (< b end))) boundaries)))
             (setq end boundary))
+          (goto-char metadata)
           (push (list old new
                       (gptel-agent-edit--hunks
-                       (buffer-substring-no-properties start end)))
-                sections)))
+                       (buffer-substring-no-properties start end))
+                      (when (re-search-forward "^deleted file mode \\([0-9]+\\)$" header t)
+                        (match-string 1)))
+                sections)
+          (setq metadata end)))
       (nreverse sections))))
 
 (defun gptel-agent-edit--target (old new directory)
@@ -264,10 +362,7 @@ starting with additional plus or minus signs.  Never count file headers."
               (member ".." (split-string name "/"))
               (equal name "/dev/null"))
       (error "Diff paths must be relative to path: %s" name))
-    (let ((target (gptel-agent-path-resolve (expand-file-name name directory) 'file)))
-      (unless (file-in-directory-p (file-truename target) (file-truename directory))
-        (error "Diff path escapes the target directory: %s" name))
-      target)))
+    (gptel-agent-edit--batch-path name directory nil (equal new "/dev/null"))))
 
 (defun gptel-agent-edit--patch (change hunks)
   "Apply HUNKS to a temporary copy of CHANGE and return the resulting text."
@@ -304,52 +399,82 @@ starting with additional plus or minus signs.  Never count file headers."
             (buffer-string)))
       (delete-directory directory t))))
 
+(defun gptel-agent-edit--unlink-hunks (link)
+  "Return the exact normalized unified deletion hunk for literal LINK."
+  (let* ((newline (string-suffix-p "\n" link))
+         (lines (split-string (if newline (substring link 0 -1) link) "\n")))
+    (concat (format "@@ -1,%d +0,0 @@\n" (length lines))
+            (mapconcat (lambda (line) (concat "-" line "\n")) lines "")
+            (unless newline "\\ No newline at end of file\n"))))
+
+(defun gptel-agent-edit--stage-table ()
+  "Copy the current staged filesystem, or start an empty one."
+  (if gptel-agent-edit--staged-changes (copy-hash-table gptel-agent-edit--staged-changes)
+    (make-hash-table :test #'equal)))
+
 (defun gptel-agent-edit--prepare-diff (path text directory)
   "Prepare unified diff TEXT at PATH; DIRECTORY explicitly selects a root."
-  (let* ((path (gptel-agent-path-resolve path (if directory 'directory 'file)))
-         (sections (gptel-agent-edit--sections text))
+  (let* ((sections (gptel-agent-edit--sections text))
+         (gptel-agent-edit--staged-changes (gptel-agent-edit--stage-table))
+         (batch-changes (make-hash-table :test #'equal))
          changes)
-    (unless (or (and (file-readable-p path) (or (not directory) (file-directory-p path)))
-                (and gptel-agent-edit--staged-changes
-                     (plist-get (gethash (file-truename path) gptel-agent-edit--staged-changes) :after)))
-      (gptel-agent-path-resolve path (if directory 'directory 'file) t)
-      (error "Path is not readable: %s; inspect permissions with PathInfo" path))
     (when (and (not directory) (> (length sections) 1))
       (error "Use root_directory for a diff affecting multiple files; file_path selects one file"))
     (dolist (section sections)
-      (pcase-let* ((`(,old ,new ,hunks) section)
-                   (target (if directory (gptel-agent-edit--target old new path) path))
-                   (target (file-truename target))
-                   (existing (cl-find target changes :key (lambda (c) (plist-get c :path))
-                                      :test #'equal))
-                   (change (or existing (gptel-agent-edit--snapshot target
-                                                                    (not (equal old "/dev/null")))))
-                   (before (if existing (plist-get existing :after)
-                             (plist-get change :before))))
+      (pcase-let* ((`(,old ,new ,hunks ,deleted-mode) section)
+                   (delete (equal new "/dev/null"))
+                   (target (if directory (gptel-agent-edit--target old new path)
+                             (gptel-agent-edit--file-path path delete)))
+                   (change (gptel-agent-edit--snapshot target
+                                                       (or (not directory) (not (equal old "/dev/null")))
+                                                       t))
+                   (before (plist-get change :before)))
+        (when (and deleted-mode
+                   (not (and delete
+                             (if (eq (car-safe before) 'symlink) (equal deleted-mode "120000")
+                               (member deleted-mode '("100644" "100755"))))))
+          (error "Deletion diff mode %s does not match the entry at %s" deleted-mode target))
         (when (and (equal old "/dev/null") before)
           (error "Diff would create an existing file: %s" target))
-        (let ((after (gptel-agent-edit--patch (list :path target :before before) hunks)))
-          (when (equal new "/dev/null")
+        (let ((after
+               (if (eq (car-safe before) 'symlink)
+                   (if (and delete (equal hunks (gptel-agent-edit--unlink-hunks (cdr before)))) ""
+                     (error "Deletion diff must match the exact symbolic link destination: %s" target))
+                 (gptel-agent-edit--patch change hunks))))
+          (when delete
             (unless (string-empty-p after)
               (error "Deletion diff leaves content in %s" target))
             (setq after nil))
           (setf (plist-get change :after) after))
-        (unless existing (push change changes))))
-    (nreverse changes)))
+        (unless (gethash target batch-changes) (push target changes))
+        (gptel-agent-edit-stage (list change) batch-changes)
+        (gptel-agent-edit-stage (list change) gptel-agent-edit--staged-changes)))
+    (mapcar (lambda (target) (gethash target batch-changes)) (nreverse changes))))
 
-(defun gptel-agent-edit--batch-path (path root &optional directory)
-  "Resolve relative PATH inside ROOT, explicitly expecting a DIRECTORY or file."
+(defun gptel-agent-edit--batch-path (path root &optional directory entry)
+  "Resolve relative PATH inside ROOT as a DIRECTORY, file or final ENTRY."
   (unless (and (stringp path) (not (string-empty-p path))
                (not (file-name-absolute-p path))
                (not (member ".." (split-string path "/"))))
     (error "Operation path must be relative to the batch directory: %S" path))
-  (let ((target (file-truename
-                 (gptel-agent-path-resolve (expand-file-name path root)
-                                           (if directory 'directory 'file) directory))))
-    (unless (or (equal (directory-file-name target) (directory-file-name root))
-                (file-in-directory-p target root))
+  (let* ((absolute (expand-file-name path root))
+         (target (if directory
+                     (progn
+                       (gptel-agent-edit--check-staged-directory absolute)
+                       (file-truename (gptel-agent-path-resolve absolute 'directory t)))
+                   (gptel-agent-edit--file-path absolute entry)))
+         (root (file-name-as-directory (file-truename root))))
+    (unless (or (and directory (equal (directory-file-name target) (directory-file-name root)))
+                (string-prefix-p root target))
       (error "Operation path escapes the batch directory: %s" path))
     target))
+
+(defun gptel-agent-edit--deletion-p (mode args)
+  "Whether MODE with ARGS unlinks its single file operand."
+  (or (member mode '("delete" "Delete"))
+      (and (equal mode "patch")
+           (let ((sections (gptel-agent-edit--sections (plist-get args :new_str))))
+             (and (null (cdr sections)) (equal (cadar sections) "/dev/null"))))))
 
 (defun gptel-agent-edit--operation-args (operation root)
   "Translate OPERATION's explicit relative targets under ROOT."
@@ -360,8 +485,9 @@ starting with additional plus or minus signs.  Never count file headers."
     (dolist (key '(:file_path :root_directory))
       (when-let* ((value (plist-get args key))
                   ((not (equal value ""))))
-        (setq args (plist-put args key (gptel-agent-edit--batch-path
-                                       value root (eq key :root_directory))))))
+        (let ((unlink (and (eq key :file_path) (gptel-agent-edit--deletion-p kind args))))
+          (setq args (plist-put args key (gptel-agent-edit--batch-path
+                                         value root (eq key :root_directory) unlink))))))
     (setq args (plist-put args :mode kind))
     (cons (pcase kind ((or "replace" "patch") "Edit")
                  ("insert" "Insert") ("write" "Write") ("delete" "Delete"))
@@ -378,17 +504,14 @@ starting with additional plus or minus signs.  Never count file headers."
   (unless (and (or (listp operations) (vectorp operations)) (> (length operations) 0))
     (error "Batch mode requires a nonempty operations array"))
   (let ((root (file-name-as-directory (file-truename root)))
-        (gptel-agent-edit--staged-changes
-         (if gptel-agent-edit--staged-changes
-             (copy-hash-table gptel-agent-edit--staged-changes)
-           (make-hash-table :test #'equal)))
+        (gptel-agent-edit--staged-changes (gptel-agent-edit--stage-table))
         (batch-changes (make-hash-table :test #'equal))
         (index 0) paths)
     (dolist (operation (append operations nil))
       (cl-incf index)
       (condition-case err
           (dolist (change (gptel-agent-edit--prepare-operation operation root))
-            (let* ((path (file-truename (plist-get change :path)))
+            (let* ((path (plist-get change :path))
                    (previous (gethash path batch-changes)))
               (unless previous (push path paths))
               (gptel-agent-edit-stage (list change) batch-changes)
@@ -434,32 +557,54 @@ providers which require every schema field, but never select a mode."
          (error "Patch mode requires exactly one of file_path or root_directory; omit old_str or leave it empty")))
       (_ (unless (and has-file (not has-root))
            (error "%s requires file_path; omit root_directory or leave it empty" mode))))
+    (when has-root (gptel-agent-edit--check-staged-directory (expand-file-name root)))
     (list mode
           (gptel-agent-path-resolve (if has-root root file)
-                                    (if has-root 'directory 'file) has-root)
+                                    (if has-root 'directory 'file-entry) has-root)
           has-root)))
 
-(defun gptel-agent-edit-targets (name args)
-  "Return validated file targets of NAME/ARGS without staging edits."
+(defun gptel-agent-edit-targets (name args &optional operands)
+  "Return resolved file targets of NAME/ARGS without reading their contents.
+If supplied, map each batch operation with a file_path to its entry in OPERANDS."
+  (let* ((gptel-agent-edit--staged-changes
+          (or gptel-agent-edit--staged-changes gptel-agent-edit--preflight-changes))
+         (gptel-agent-edit--staged-changes (gptel-agent-edit--stage-table)))
+    (delete-dups (gptel-agent-edit--collect-targets name args operands))))
+
+(defun gptel-agent-edit--collect-targets (name args &optional operands)
+  "Collect NAME/ARGS targets in order, optionally indexing OPERANDS."
   (pcase-let* ((`(,mode ,path ,directory) (gptel-agent-edit--contract name args)))
     (pcase mode
       ("batch"
-       (delete-dups
-        (cl-mapcan
-         (lambda (operation)
-           (pcase-let ((`(,op-name . ,op-args)
-                         (gptel-agent-edit--operation-args operation path)))
-             (gptel-agent-edit-targets op-name op-args)))
-         (append (plist-get args :operations) nil))))
+       (cl-mapcan
+        (lambda (operation)
+          (pcase-let* ((`(,op-name . ,op-args) (gptel-agent-edit--operation-args operation path))
+                       (targets (gptel-agent-edit--collect-targets op-name op-args)))
+            (when (and operands (stringp (plist-get operation :file_path))
+                       (not (string-empty-p (plist-get operation :file_path)))
+                       (= (length targets) 1))
+              (puthash operation (car targets) operands))
+            targets))
+        (append (plist-get args :operations) nil)))
       ("patch"
        (unless (stringp (plist-get args :new_str))
          (error "Patch mode requires a unified diff in new_str"))
        (let ((sections (gptel-agent-edit--sections (plist-get args :new_str))))
-         (if directory
-             (mapcar (lambda (section)
-                       (gptel-agent-edit--target (nth 0 section) (nth 1 section) path)) sections)
-           (list path))))
-      (_ (list path)))))
+         (when (and (not directory) (cdr sections))
+           (error "Use root_directory for a diff affecting multiple files"))
+         (cl-loop for (old new _) in sections
+                  for delete = (equal new "/dev/null")
+                  for target = (if directory (gptel-agent-edit--target old new path)
+                                 (gptel-agent-edit--file-path path delete))
+                  do (puthash target (list :after (unless delete "")) gptel-agent-edit--staged-changes)
+                  collect target)))
+      ("Delete"
+       (let ((target (gptel-agent-edit--file-path path t)))
+         (puthash target '(:after nil) gptel-agent-edit--staged-changes)
+         (list target)))
+      (_ (let ((target (gptel-agent-edit--file-path path)))
+           (puthash target '(:after "") gptel-agent-edit--staged-changes)
+           (list target))))))
 
 (defun gptel-agent-edit--goto-insertion (line)
   "Move to the insertion point for LINE in the original text."
@@ -506,7 +651,7 @@ providers which require every schema field, but never select a mode."
                     (setf (plist-get change :after) (plist-get args :content))
                     (list change)))
                  ("Delete"
-                  (let ((change (gptel-agent-edit--snapshot path t)))
+                  (let ((change (gptel-agent-edit--snapshot path t t)))
                     (setf (plist-get change :after) nil)
                     (list change))))))
     (setq changes (cl-remove-if
@@ -520,7 +665,7 @@ providers which require every schema field, but never select a mode."
   (let ((files (make-hash-table :test #'equal)))
     (dolist (change changes)
       (when (plist-get change :after)
-        (puthash (file-truename (plist-get change :path)) t files)))
+        (puthash (plist-get change :path) t files)))
     (maphash
      (lambda (path _)
        (let ((parent (file-name-directory path)))
@@ -531,19 +676,55 @@ providers which require every schema field, but never select a mode."
            (setq parent (file-name-directory (directory-file-name parent))))))
      files)))
 
+(defvar gptel-agent-edit--write-state nil
+  "Progress of the active write if it fails: nil, `removed' or `writing'.")
+
+(defun gptel-agent-edit--entry-version (path)
+  "Return the identity and modification metadata of the entry at PATH."
+  (when-let* ((attrs (file-attributes path 'integer)))
+    (list (file-attribute-file-identifier attrs) (file-attribute-type attrs)
+          (file-attribute-size attrs) (file-attribute-modification-time attrs)
+          (file-attribute-status-change-time attrs))))
+
 (defun gptel-agent-edit--write (change content)
-  "Write CONTENT for CHANGE, or remove the file when CONTENT is nil.
-Apply recorded permissions only when recreating a file."
-  (let* ((path (gptel-agent-path-resolve (plist-get change :path) 'file))
-         (create-modes (and content (not (file-exists-p path)) (plist-get change :modes))))
-    (if (null content)
-        (when (file-exists-p path) (delete-file path))
-      (make-directory (file-name-directory path) t)
-      (with-temp-buffer
-        (insert content)
-        (let ((coding-system-for-write (plist-get change :coding)))
-          (write-region (point-min) (point-max) path nil 'silent)))
-      (when create-modes (set-file-modes path create-modes)))))
+  "Install CONTENT from CHANGE's expected :before entry, even during rollback."
+  (let ((path (plist-get change :path)) (before (plist-get change :before)))
+    (gptel-agent-path-resolve path 'file-entry)
+    (gptel-agent-edit--check-entry change)
+    (when (and before (or (null content) (consp before) (consp content)))
+      (delete-file path)
+      (setq gptel-agent-edit--write-state 'removed))
+    (cond
+     ((consp content)
+      ;; Never replace an entry installed between deletion and creation.
+      (make-symbolic-link (cdr content) path))
+     ((stringp content)
+      (let ((create (not (stringp before))))
+        (make-directory (file-name-directory path) t)
+        (with-temp-buffer
+          (insert content)
+          (let ((coding-system-for-write (plist-get change :coding))
+                (previous gptel-agent-edit--write-state))
+            ;; Other write failures can leave a partially written regular file.
+            (setq gptel-agent-edit--write-state 'writing)
+            (condition-case err
+                (write-region (point-min) (point-max) path nil 'silent nil (and create 'excl))
+              (file-already-exists
+               (setq gptel-agent-edit--write-state previous)
+               (signal (car err) (cdr err))))))
+        (when (and create (plist-get change :modes))
+          (set-file-modes path (plist-get change :modes))))))))
+
+(defun gptel-agent-edit--check-entry (change)
+  "Reject a changed parent, type or symlink destination for CHANGE."
+  (let* ((path (plist-get change :path))
+         (before (plist-get change :before))
+         (link (file-symlink-p path)))
+    (unless (and (equal path (gptel-agent-edit--entry-path path))
+                 (cond (link (equal before (cons 'symlink link)))
+                       ((null before) (not (file-exists-p path)))
+                       (t (and (stringp before) (file-regular-p path)))))
+      (error "File changed since preview; review again: %s" path))))
 
 (defun gptel-agent-edit-validate (changes)
   "Check CHANGES against disk and reject text the file encoding cannot save.
@@ -557,13 +738,15 @@ for existing files and the supplied permissions for files to be recreated."
       ;; coding system is forced.  Undecided encodings are different: ASCII
       ;; and new files may still choose a suitable encoding for their text.
       (when-let* ((content (plist-get change :after))
+                  ((stringp content))
                   (coding (plist-get change :coding))
                   ((not (eq (coding-system-type coding) 'undecided)))
                   (position (unencodable-char-position
                              0 (length content) coding nil content)))
         (error "Cannot encode U+%04X in %s using %s; use compatible text or explicitly change the file encoding before retrying. No changes were applied"
                (aref content position) (plist-get change :path) coding))
-      (let ((current (gptel-agent-edit--snapshot (plist-get change :path))))
+      (gptel-agent-edit--check-entry change)
+      (let ((current (gptel-agent-edit--snapshot (plist-get change :path) nil t)))
         (unless (equal (plist-get current :before) (plist-get change :before))
           (error "File changed since preview; review again: %s" (plist-get change :path)))
         (push (if-let* ((modes (plist-get current :modes)))
@@ -571,16 +754,24 @@ for existing files and the supplied permissions for files to be recreated."
                 change)
               validated)))))
 
-(defun gptel-agent-edit--refresh-buffer (path)
-  "Refresh an unmodified buffer visiting PATH after an on-disk change."
-  (when-let* ((buffer (find-buffer-visiting path)))
-    (with-current-buffer buffer
-      (unless (buffer-modified-p)
-        (if (file-exists-p path)
-            (condition-case err (revert-buffer t t t)
-              (error (message "File %s changed, but buffer refresh failed: %s"
-                              path (error-message-string err))))
-          (clear-visited-file-modtime))))))
+(defun gptel-agent-edit--refresh-buffer (path &optional entry-only)
+  "Refresh unmodified buffers visiting PATH after a disk change.
+ENTRY-ONLY restricts updates to visitors of the named entry.  Detach
+previous contents when the entry is now a link, without loading its target."
+  (dolist (buffer (gptel-agent-edit--visiting-buffers path entry-only))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (unless (buffer-modified-p)
+          (condition-case err
+              (cond
+               ((and entry-only (file-symlink-p path))
+                (set-visited-file-name nil t)
+                (set-buffer-modified-p nil)
+                (message "Symbolic link at %s; %s no longer visits that path" path (buffer-name)))
+               ((not (file-exists-p path)) (clear-visited-file-modtime))
+               (t (revert-buffer t t t)))
+            (error (message "File %s changed, but buffer refresh failed: %s"
+                            path (error-message-string err)))))))))
 
 (defun gptel-agent-edit-apply (changes &optional return-snapshot)
   "Snapshot and apply CHANGES after verifying every original is current.
@@ -589,24 +780,45 @@ Return a result message, or the snapshot directory when RETURN-SNAPSHOT
 is non-nil."
   (require 'gptel-agent-history)
   (setq changes (gptel-agent-edit-validate changes))
-  (let ((snapshot (gptel-agent-history--record changes)) written)
+  (let ((snapshot (gptel-agent-history--record changes))
+        gptel-agent-edit--write-state current written)
     (condition-case err
         (dolist (change changes)
-          (push change written)
-          (gptel-agent-edit--write change (plist-get change :after)))
+          (setq current change gptel-agent-edit--write-state nil)
+          (gptel-agent-edit--write change (plist-get change :after))
+          (push (list change (plist-get change :after)
+                      (gptel-agent-edit--entry-version (plist-get change :path)))
+                written)
+          (setq current nil))
       ((error quit)
        (let (failures)
-         (dolist (change written)
-           (condition-case restore-error
-               (gptel-agent-edit--write change (plist-get change :before))
-             (error (push (error-message-string restore-error) failures))))
+         ;; A failed exclusive create did not acquire the competing entry.
+         ;; If we already unlinked the original, only its empty slot is ours.
+         (when (and current gptel-agent-edit--write-state)
+           (let ((version (and (eq gptel-agent-edit--write-state 'writing)
+                               (gptel-agent-edit--entry-version (plist-get current :path)))))
+             (push (list current (and version (plist-get current :after)) version) written)))
+         (dolist (item written)
+           (pcase-let* ((`(,change ,expected ,version) item)
+                        (path (plist-get change :path))
+                        (original (plist-get change :before))
+                        (inverse (copy-sequence change)))
+             (condition-case restore-error
+                 (progn
+                   (unless (equal version (gptel-agent-edit--entry-version path))
+                     (error "Entry changed during rollback: %s" path))
+                   (setf (plist-get inverse :before) expected
+                         (plist-get inverse :after) original)
+                   (gptel-agent-edit--write inverse original))
+               (error (push (error-message-string restore-error) failures)))))
          (if failures
              (error "%s; restoring originals also failed: %s; recover from snapshots in %s"
                     (error-message-string err) (string-join failures "; ") snapshot)
            (signal (car err) (cdr err))))))
     (gptel-agent-history--complete snapshot)
     (dolist (change changes)
-      (gptel-agent-edit--refresh-buffer (plist-get change :path)))
+      (gptel-agent-edit--refresh-buffer
+       (plist-get change :path) (or (consp (plist-get change :before)) (consp (plist-get change :after)))))
     (if return-snapshot snapshot
       (format "Applied changes to %d file(s):\n%s" (length changes)
               (mapconcat (lambda (c) (plist-get c :path)) changes "\n")))))

@@ -210,9 +210,9 @@ existing aside without sending.  Further questions reuse its own history."
                            "Original file%s:\n%s\n\nProposed file%s:\n%s\n\n%sQuestion: %s")
                    path (plist-get file :revision)
                    (if (null (plist-get file :before)) " (absent)" "")
-                   (or (plist-get file :before) "")
+                   (or (gptel-agent-edit--display-content (plist-get file :before)) "")
                    (if (null (plist-get file :after)) " (deleted)" "")
-                   (or (plist-get file :after) "")
+                   (or (gptel-agent-edit--display-content (plist-get file :after)) "")
                    (if context (concat "Selected context" context "\n\n") "") question))
           ;; An unfinished streamed parent response may have sticky role props.
           (set-text-properties start (point) nil))

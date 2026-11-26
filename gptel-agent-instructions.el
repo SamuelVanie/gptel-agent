@@ -386,7 +386,10 @@ Used before every send and before saving a retained worker's conversation."
         (error "Project instructions do not support remote targets: %s" path))))
   (cond
    ((equal name "Read")
-    (list (gptel-agent-instructions--reference-directory (plist-get args :file_path))))
+    (let* ((path (plist-get args :file_path))
+           (staged (gptel-agent-edit--staged-read path)))
+      (list (if staged (file-name-directory (plist-get staged :path))
+              (gptel-agent-instructions--reference-directory path)))))
    ((member name '("Glob" "Grep" "PathInfo" "Mkdir" "Rmdir"))
     (let ((path (pcase name
                   ("Glob" (or (plist-get args :root_directory) "."))
@@ -396,7 +399,7 @@ Used before every send and before saving a retained worker's conversation."
              path (or (member name '("Glob" "Mkdir" "Rmdir")) (file-directory-p path))))))
    (t
     (delete-dups
-     (mapcar #'gptel-agent-instructions--directory
+     (mapcar (lambda (path) (gptel-agent-instructions--directory (file-name-directory path) t))
              (pcase name
                ((or "Edit" "Insert" "Write") (gptel-agent-edit-targets name args))))))))
 
@@ -437,11 +440,12 @@ Used before every send and before saving a retained worker's conversation."
 (defun gptel-agent-instructions--read-ack (args)
   "Return an acknowledgement for a managed Read of AGENTS.md in ARGS."
   (let* ((path (expand-file-name (plist-get args :file_path)))
-         (target (if (equal (file-name-nondirectory path) "AGENTS.md")
-                     path
-                   (file-truename path))))
-    (when (or (equal (file-name-nondirectory path) "AGENTS.md")
-              (equal (file-name-nondirectory target) "AGENTS.md"))
+         (staged (gptel-agent-edit--staged-read path))
+         (target (if (or staged (equal (file-name-nondirectory path) "AGENTS.md"))
+                     path (file-truename path))))
+    (when (and (not staged)
+               (or (equal (file-name-nondirectory path) "AGENTS.md")
+                   (equal (file-name-nondirectory target) "AGENTS.md")))
       (let* ((dir (gptel-agent-instructions--directory
                    (file-name-directory (if (equal (file-name-nondirectory path) "AGENTS.md") path target)) t))
              (source (expand-file-name "AGENTS.md" dir))
@@ -516,11 +520,14 @@ Used before every send and before saving a retained worker's conversation."
   "Guard NAME/ARGS even when another pre-tool hook changed the proposal."
   (when-let* ((fsm gptel-agent-instructions--request))
     (with-current-buffer (plist-get (gptel-fsm-info fsm) :buffer)
-      (when (fboundp 'gptel-agent-access--check-paths)
-        (gptel-agent-access--check-paths (gptel-agent-edit-targets name args)))
-      (when (gptel-agent-instructions--enabled-p fsm)
-        (gptel-agent-instructions--guard-directories
-         fsm (gptel-agent-instructions--tool-targets name args))))))
+      ;; Preparation now has the actual queue's table, or nil for a disk
+      ;; edit.  Never substitute an earlier preflight view at this point.
+      (let ((gptel-agent-edit--preflight-changes gptel-agent-edit--staged-changes))
+        (when (fboundp 'gptel-agent-access--check-paths)
+          (gptel-agent-access--check-paths (gptel-agent-edit-targets name args)))
+        (when (gptel-agent-instructions--enabled-p fsm)
+          (gptel-agent-instructions--guard-directories
+           fsm (gptel-agent-instructions--tool-targets name args)))))))
 
 (defun gptel-agent-instructions--before-apply (changes &rest _)
   "Check saved instruction versions again before applying CHANGES."
@@ -530,7 +537,8 @@ Used before every send and before saving a retained worker's conversation."
         (gptel-agent-access--check-paths (mapcar (lambda (c) (plist-get c :path)) changes)))
       (when (gptel-agent-instructions--enabled-p fsm)
         (gptel-agent-instructions--guard-directories
-         fsm (delete-dups (mapcar (lambda (c) (gptel-agent-instructions--directory (plist-get c :path)))
+         fsm (delete-dups (mapcar (lambda (c) (gptel-agent-instructions--directory
+                                               (file-name-directory (plist-get c :path)) t))
                                   changes)))))))
 
 (defun gptel-agent-instructions--wrap-tools (fsm)

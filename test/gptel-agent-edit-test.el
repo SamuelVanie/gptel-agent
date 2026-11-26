@@ -539,16 +539,16 @@ diff --git a/sub/two b/sub/two
       (should (equal (file-symlink-p "alias") "one"))
       (should (equal (gptel-edit-test--read "one") "final\n")))))
 
-(ert-deftest gptel-edit-prepared-symlink-deletion-keeps-original-target ()
+(ert-deftest gptel-edit-prepared-symlink-deletion-rejects-retarget ()
   (gptel-edit-test--with-files '(("target" . "original\n") ("other" . "original\n"))
     (make-symbolic-link "target" "alias")
     (let ((changes (gptel-agent-edit-prepare
                     "Edit" '(:mode "patch" :file_path "alias"
-                             :new_str "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-original\n"))))
+                             :new_str "--- alias\n+++ /dev/null\n@@ -1 +0,0 @@\n-target\n\\ No newline at end of file\n"))))
       (delete-file "alias")
       (make-symbolic-link "other" "alias")
-      (gptel-agent-edit-apply changes)
-      (should-not (file-exists-p "target"))
+      (should-error (gptel-agent-edit-apply changes))
+      (should (equal (gptel-edit-test--read "target") "original\n"))
       (should (equal (file-symlink-p "alias") "other"))
       (should (equal (gptel-edit-test--read "other") "original\n")))))
 

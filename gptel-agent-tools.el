@@ -1229,10 +1229,11 @@ diagnostics."
                                  :old_str old :new_str new :operations operations)))
       (let ((before (plist-get change :before)) (after (plist-get change :after)))
         (insert (format "%s%s\n" (plist-get change :path)
-                        (cond ((null before) " [new file]")
-                              ((null after) " [delete file]") (t ""))))
-        (when before (insert (propertize before 'face 'diff-removed) "\n"))
-        (when after (insert (propertize after 'face 'diff-added) "\n"))))
+                        (gptel-agent-edit--change-label before after)))
+        (when before
+          (insert (propertize (gptel-agent-edit--display-content before) 'face 'diff-removed) "\n"))
+        (when after
+          (insert (propertize (gptel-agent-edit--display-content after) 'face 'diff-added) "\n"))))
     (gptel-agent--confirm-overlay from (point) t)))
 
 (defun gptel-agent--make-directory (directory-path)
@@ -5133,6 +5134,8 @@ and file creation/deletion. Standard a/ and b/ prefixes work. Missing parents ar
 array. Each operation has explicit relative file_path, or root_directory for a patch.
 Use operation=write with complete content to create files, including missing parents;
 replace/insert require existing files (or files created earlier in this batch).
+Deleting a symlink removes the named link. A deletion patch must remove its
+literal link destination exactly. Other text edits follow the link.
 
 Omit unused fields, or leave strings empty and operations=[] if your provider requires
 all fields. Never infer mode from text or add dummy operations. Text changes only;
