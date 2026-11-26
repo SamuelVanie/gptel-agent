@@ -54,5 +54,67 @@
                       (when excluded (should-not (string-match-p (car excluded) user)))))))))
         (kill-buffer buffer)))))
 
+(ert-deftest gptel-agent-instructions-context-uses-collected-directory-files ()
+  (gptel-agent-instructions-test--with-project
+    (let* ((leaf (expand-file-name "nested/" front))
+           (notes (expand-file-name "notes.txt" leaf))
+           (rules (expand-file-name "AGENTS.md" leaf))
+           (missing (expand-file-name "absent.txt" back))
+           (dead (generate-new-buffer " *dead context*"))
+           (gptel-context-restrict-to-project-files t)
+           (gptel-context--project-files nil)
+           (scans 0)
+           (scan (symbol-function 'directory-files-recursively)))
+      (kill-buffer dead)
+      (gptel-agent-instructions-test--write notes "VISIBLE-NOTE")
+      (make-symbolic-link (concat back "AGENTS.md") rules)
+      (gptel-agent-instructions-test--write (expand-file-name "ignored/AGENTS.md" front)
+                                            "IGNORED-INSTRUCTION")
+      (with-current-buffer parent
+        (setq gptel-context (list front missing dead)
+              gptel-use-context 'user))
+      (cl-letf (((symbol-function 'project-files) (lambda (&rest _) (list notes rules)))
+                ((symbol-function 'directory-files-recursively)
+                 (lambda (dir &rest args)
+                   (when (equal (directory-file-name dir) (directory-file-name front))
+                     (cl-incf scans))
+                   (apply scan dir args))))
+        (dolist (defer '(nil t))
+          (let* (finish
+                 (gptel-context-string-function
+                  (if defer
+                      (lambda (done sources)
+                        (setq finish (lambda () (funcall done (gptel-context--string sources)))))
+                    #'gptel-context--string)))
+            (setq scans 0 requests nil)
+            (with-current-buffer parent
+              (setq gptel-agent-use-project-instructions (not defer))
+              (setq fsm (gptel-request "Review" :callback #'ignore
+                                       :transforms '(gptel--transform-add-context))))
+            (when defer (should-not requests) (funcall finish))
+            (should (= 1 (length requests)))
+            (when defer
+              (should-not (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+              (with-current-buffer parent (setq gptel-agent-use-project-instructions t))
+              (gptel--handle-wait fsm))
+            (let ((records (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+                  (payload (gptel-agent-instructions-test--payload fsm)))
+              (should (string-search "VISIBLE-NOTE" payload))
+              (should-not (string-search "IGNORED-INSTRUCTION" payload))
+              (should (equal (mapcar (lambda (r) (plist-get r :scope)) records)
+                             (list root front leaf)))
+              (should (= scans 1)))))))))
+
+(ert-deftest gptel-agent-instructions-context-custom-transform-skips-missing-files ()
+  (gptel-agent-instructions-test--with-project
+    (let ((missing (expand-file-name "missing.txt" back)))
+      (with-current-buffer parent
+        (setq gptel-use-context t
+              gptel-context (list front missing (list missing :lines '(1 . 2)))))
+      (setq fsm (gptel-agent-instructions-test--request parent))
+      (should (equal (mapcar (lambda (record) (plist-get record :scope))
+                             (plist-get (gptel-fsm-info fsm) :agent-instructions-sent))
+                     (list root front))))))
+
 (provide 'gptel-agent-instructions-context-test)
 ;;; gptel-agent-instructions-context-test.el ends here

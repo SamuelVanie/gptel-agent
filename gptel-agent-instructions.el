@@ -22,6 +22,7 @@
 (require 'gptel-agent-edit)
 
 (defvar gptel-agent--result-file-scope)
+(defvar gptel-context-string-function)
 (declare-function gptel-agent-access--check-paths "gptel-agent-access")
 
 (defcustom gptel-agent-use-project-instructions t
@@ -56,6 +57,8 @@ Records contain :path, :scope, :text, :version, and optionally :error.")
   "Owned snapshot of instruction records supplied by the latest call.")
 (defvar gptel-agent-instructions--request nil
   "Dynamically bound FSM while preparing or executing its file tools.")
+(defvar-local gptel-agent-instructions--collected-context nil
+  "Effective gptel attachments in the temporary prompt buffer, when collected.")
 
 (defun gptel-agent-instructions--info (fsm)
   "Return FSM's info with stable places for instruction metadata.
@@ -81,21 +84,44 @@ Records contain :path, :scope, :text, :version, and optionally :error.")
        (not (bound-and-true-p gptel-agent--result-file-scope))
        (gptel-agent-instructions--configuration fsm)))
 
+(defun gptel-agent-instructions--wrap-context (original callback prompt)
+  "Capture the filtered context sources that ORIGINAL formats in PROMPT.
+Keep the formatter's synchronous or asynchronous calling convention."
+  (with-current-buffer prompt
+    (make-local-variable 'gptel-context-string-function)
+    (let* ((formatter gptel-context-string-function)
+           (gptel-context-string-function
+            (if (= (car (func-arity formatter)) 2)
+                (lambda (done sources)
+                  (setq-local gptel-agent-instructions--collected-context sources)
+                  (funcall formatter done sources))
+              (lambda (sources)
+                (setq-local gptel-agent-instructions--collected-context sources)
+                (funcall formatter sources)))))
+      (funcall original callback prompt))))
+
 (defun gptel-agent-instructions--transform (fsm)
   "Capture explicit file context for FSM.
-Do not change the base system prompt, including function/list prompts."
+Use gptel's collected sources, including files selected under directories.
+Custom requests that omit context formatting can still nominate a readable
+file or directory for its own instruction scope without attaching its text."
   (let ((info (gptel-agent-instructions--info fsm)))
     (with-current-buffer (if (bufferp (plist-get info :data))
                              (plist-get info :data) (current-buffer))
       (setf (plist-get info :agent-instructions-context)
             (when gptel-use-context
-              (cl-loop for entry in gptel-context
-                       for source = (if (consp entry) (car entry) entry)
-                       for path = (cond ((stringp source) source)
-                                        ((buffer-live-p source)
-                                         (buffer-file-name
-                                          (or (buffer-base-buffer source) source))))
-                       when path collect (expand-file-name path)))))))
+              (let ((collected (local-variable-p 'gptel-agent-instructions--collected-context)))
+                (cl-loop for entry in (if collected gptel-agent-instructions--collected-context
+                                        gptel-context)
+                         for source = (if (consp entry) (car entry) entry)
+                         for path = (cond ((and (stringp source)
+                                                (or collected (file-remote-p source)
+                                                    (file-readable-p source)))
+                                           source)
+                                          ((buffer-live-p source)
+                                           (buffer-file-name
+                                            (or (buffer-base-buffer source) source))))
+                         when path collect (expand-file-name path))))))))
 
 (defun gptel-agent-instructions--skip (fsm)
   "Exclude the compaction request FSM from managed instruction delivery."
@@ -333,7 +359,8 @@ Used before every send and before saving a retained worker's conversation."
                                  (and buffer-file-name (not gptel-mode)
                                       (list buffer-file-name)))))
                 (setf (plist-get info :agent-instructions-targets)
-                      (or (mapcar #'gptel-agent-instructions--reference-directory context)
+                      (or (delete-dups
+                           (mapcar #'gptel-agent-instructions--reference-directory context))
                           gptel-agent-instructions--targets
                           (list (gptel-agent-instructions--directory default-directory t))))))
             (setq records (gptel-agent-instructions--records
@@ -578,6 +605,7 @@ With ARG, enable if positive and disable otherwise."
       (princ (or (gptel-agent-instructions--format sent) "No managed instructions.\n")))))
 
 (add-hook 'gptel-prompt-transform-functions #'gptel-agent-instructions--transform t)
+(advice-add 'gptel-context--wrap :around #'gptel-agent-instructions--wrap-context)
 ;; Also capture final @preset/context settings when callers supply their own
 ;; transform list.  This runs in the prompt buffer and never alters its text.
 (advice-add 'gptel--realize-query :before #'gptel-agent-instructions--transform)
