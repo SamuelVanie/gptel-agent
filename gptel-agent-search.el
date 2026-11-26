@@ -160,7 +160,7 @@ emit({'status': status, 'examined': count})
 
 (cl-defstruct (gptel-agent--repo (:constructor gptel-agent--make-repo))
   name source callback fsm cleanup backend root regex glob depth type context
-  check-path grep-access-live read-roots read-batch directories next-directories (walk-level 1) (walk-base 0)
+  check-path grep-access-live read-roots batch-names directories next-directories (walk-level 1) (walk-base 0)
   max-results max-entries limit traversal-limit process stderr-process timer timeout
   stage walk-status status done (pending "") (stderr "") (entries nil) (files nil)
   (output nil) (used 0) (count 0) (examined 0) (walk-bytes 0))
@@ -208,19 +208,18 @@ emit({'status': status, 'examined': count})
 (defun gptel-agent--repo-access-change (job)
   "Discard JOB's output and return a reason if its read access changed."
   (let* ((valid (gptel-agent--repo-grep-access-live job))
-         (files (gptel-agent--repo-read-batch job))
+         (names (gptel-agent--repo-batch-names job))
          (reason
           (cond
            ((and valid (not (ignore-errors (funcall valid))))
             "incomplete: conversation access changed")
            ;; Native matchers open pathnames after launch.  Detect redirection
            ;; of a canonical argument or its ancestors before releasing bytes.
-           ((and files (not (ignore-errors
+           ((and names (not (ignore-errors
                               (let (file-name-handler-alist)
-                                (cl-every (lambda (file)
-                                            (and (equal file (file-truename file))
-                                                 (file-regular-p file)))
-                                          files)))))
+                                (cl-loop for file being the hash-keys of names
+                                         always (and (equal file (file-truename file))
+                                                     (file-regular-p file)))))))
             "incomplete: search targets changed"))))
     (when reason
       (setf (gptel-agent--repo-output job) nil
@@ -269,7 +268,7 @@ emit({'status': status, 'examined': count})
                          (condition-case err
                              (if-let* ((reason (gptel-agent--repo-access-change job)))
                                  (gptel-agent--repo-finish job reason)
-                               (setf (gptel-agent--repo-read-batch job) nil)
+                               (setf (gptel-agent--repo-batch-names job) nil)
                                (funcall function job))
                            (error (gptel-agent--repo-finish job (concat "incomplete: " (error-message-string err))))))))))
 
@@ -334,16 +333,21 @@ emit({'status': status, 'examined': count})
   (unless (equal record "--")
     (unless (string-match "\\`\\([^\0]+\\)\0\\([0-9]+\\)\\([:-]\\)\\(.*\\)\\'" record)
       (error "invalid or oversized search record"))
-    (let ((text (format "%S:%s%s%s\n" (match-string 1 record) (match-string 2 record)
-                        (match-string 3 record) (match-string 4 record)))
-          (match (equal (match-string 3 record) ":")))
-      (if (> (+ (gptel-agent--repo-used job) (length text)) (gptel-agent--repo-limit job))
-          (gptel-agent--repo-finish job "incomplete: output limit")
-        (push text (gptel-agent--repo-output job))
-        (cl-incf (gptel-agent--repo-used job) (length text))
-        (when match (cl-incf (gptel-agent--repo-count job)))
-        (when (>= (gptel-agent--repo-count job) (gptel-agent--repo-max-results job))
-          (gptel-agent--repo-finish job "incomplete: match limit"))))))
+    (let* ((target (match-string 1 record))
+           (line (substring record (match-beginning 2)))
+           (match (equal (match-string 3 record) ":"))
+           (batch (gptel-agent--repo-batch-names job))
+           (names (if batch (gethash target batch) (list target))))
+      (unless names (error "unrecognized filename in search output"))
+      (while (and names (not (gptel-agent--repo-done job)))
+        (let ((text (format "%S:%s\n" (pop names) line)))
+          (if (> (+ (gptel-agent--repo-used job) (length text)) (gptel-agent--repo-limit job))
+              (gptel-agent--repo-finish job "incomplete: output limit")
+            (push text (gptel-agent--repo-output job))
+            (cl-incf (gptel-agent--repo-used job) (length text))
+            (when match (cl-incf (gptel-agent--repo-count job)))
+            (when (>= (gptel-agent--repo-count job) (gptel-agent--repo-max-results job))
+              (gptel-agent--repo-finish job "incomplete: match limit"))))))))
 
 (defun gptel-agent--repo-filter (job process output)
   "Parse OUTPUT incrementally, bounding even an unterminated giant record.
@@ -533,16 +537,26 @@ Guarded walkers examine one level of admitted directories in each batch."
 
 (defun gptel-agent--repo-grep-batch (job)
   "Search the next bounded batch of explicit filenames for JOB."
-  (let ((size 0) (examined 0) files (backend (gptel-agent--repo-backend job)))
+  (let ((size 0) (examined 0) files (backend (gptel-agent--repo-backend job))
+        (names (make-hash-table :test #'equal)))
     (while (and (gptel-agent--repo-files job) (< examined 64) (< size 32768))
       (cl-incf examined)
-      (when-let* ((file (gptel-agent--repo-permitted-path job (pop (gptel-agent--repo-files job)))))
-        (if (file-regular-p file)
-            (progn (cl-incf size (string-bytes file)) (push file files))
-          (setf (gptel-agent--repo-status job) "incomplete: candidate changed file type"))))
+      (let* ((name (pop (gptel-agent--repo-files job)))
+             (target (gptel-agent--repo-permitted-path job name)))
+        (when target
+          (if (not (file-regular-p target))
+              (setf (gptel-agent--repo-status job) "incomplete: candidate changed file type")
+            (unless (gethash target names)
+              (cl-incf size (string-bytes target))
+              (push target files))
+            (push name (gethash target names))))))
     (setq files (nreverse files))
     (when (gptel-agent--repo-grep-access-live job)
-      (setf (gptel-agent--repo-read-batch job) files))
+      ;; Search each verified target once per batch.  Display and count one
+      ;; result for each discovered basename that passed the glob and guards.
+      (dolist (file files)
+        (puthash file (nreverse (gethash file names)) names))
+      (setf (gptel-agent--repo-batch-names job) names))
     (if (and (null files) (gptel-agent--repo-files job))
         (gptel-agent--repo-schedule job #'gptel-agent--repo-grep-batch)
       (gptel-agent--repo-launch

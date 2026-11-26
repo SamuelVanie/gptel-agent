@@ -313,8 +313,10 @@ absolute filenames with line numbers. Searches currently require local paths;
 remote paths fail explicitly instead of running blocking TRAMP operations.
 
 Directory Grep resolves each candidate just before sending its batch of files
-to the matcher. An in-project file symlink can reach another file in the
-project. A one-time outside directory approval also covers targets within
+to the matcher. Each match is labeled with the discovered filename. When the
+glob selects both a file and a symlink to it, each name contributes its own
+matching lines to the result limit. An in-project file symlink can reach
+another file in the project. A one-time outside directory approval also covers targets within
 that directory's canonical tree. Targets beyond those boundaries require a
 conversation grant, live supervised outside reads, or an applicable policy
 path constraint. Tool policy denials still apply. Grep skips files requiring
