@@ -183,6 +183,14 @@ inconclusive report only if the model still produces no usable answer.
 
 ** Defining agents
 
+In Markdown and Org agent files, =pre= and =post= are Lisp expressions.
+Discovery, registry refresh and preset lookup leave these expressions
+unevaluated.  When gptel applies the preset or starts a delegated agent,
+it resolves each hook on first use in the buffer applying the definition.
+The resulting function runs before (=pre=) or after (=post=) the preset
+settings on each application.  These hooks run with the permissions of
+your Emacs process.
+
 *** Agents from Elisp
 
 Use =gptel-agent-register= to define an agent without a Markdown or Org file,
@@ -344,10 +352,9 @@ are pre-approved. Always-confirm mode and per-call confirmation/blocking hooks
 keep their normal precedence. Global settings and registered tools are unchanged.
 
 Discovery exposes only name and description. Skills without =allowed-tools=
-continue to load instructions only. Skill frontmatter is data, not evaluated
-agent configuration: agent-definition =pre= and =post= evaluation and hooks
-remain unchanged. Automatic unloading and persistence across Emacs restarts are
-not supported.
+continue to load instructions only. Skill discovery and loading ignore =pre=
+and =post= fields. Automatic unloading and persistence across Emacs restarts
+are not supported.
 
 ** Manually invoked skills
 

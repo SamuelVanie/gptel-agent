@@ -452,20 +452,21 @@
       (should-not gptel-agent-skills-test--effects)
       (should (gptel-agent-skills-test--tool fsm "SkillMutation")))))
 
-(ert-deftest gptel-agent-skills-agent-markdown-and-org-pre-post-unchanged ()
-  (let ((gptel-agent-skills-test--effects nil))
-    (dolist (data (list
-                  (gptel-agent--parse-yaml-frontmatter
-                   (concat "pre: '(progn (push :parse-pre gptel-agent-skills-test--effects) "
-                           "(lambda () (push :pre gptel-agent-skills-test--effects)))'\n"
-                           "post: '(progn (push :parse-post gptel-agent-skills-test--effects) "
-                           "(lambda () (push :post gptel-agent-skills-test--effects)))'\n") #'always)
-                  (gptel-agent--org-properties-alist-to-plist
-                   '(("PRE" . "(progn (push :parse-pre gptel-agent-skills-test--effects) (lambda () (push :pre gptel-agent-skills-test--effects)))")
-                     ("POST" . "(progn (push :parse-post gptel-agent-skills-test--effects) (lambda () (push :post gptel-agent-skills-test--effects)))")) #'always)))
-      (with-temp-buffer (gptel--apply-preset data)))
-    (should (equal (nreverse gptel-agent-skills-test--effects)
-                   '(:parse-pre :parse-post :parse-pre :parse-post :pre :post :pre :post)))))
+(ert-deftest gptel-agent-skills-agent-file-hooks-run-on-preset-application ()
+  (let* ((gptel-agent-skills-test--effects nil)
+         (pre (concat "(let ((count 0)) (push :resolve-pre gptel-agent-skills-test--effects) "
+                      "(lambda () (push (cl-incf count) gptel-agent-skills-test--effects)))"))
+         (post "(progn (push :resolve-post gptel-agent-skills-test--effects) nil)"))
+    (dolist (spec (list (gptel-agent--parse-yaml-frontmatter
+                         (format "pre: %S\npost: %S\n" pre post) #'always)
+                        (gptel-agent--org-properties-alist-to-plist
+                         (list (cons "PRE" pre) (cons "POST" post)) #'always)))
+      (should-not gptel-agent-skills-test--effects)
+      (with-temp-buffer
+        (dotimes (_ 2) (gptel--apply-preset spec)))
+      (should (equal (reverse gptel-agent-skills-test--effects)
+                     '(:resolve-pre 1 :resolve-post 2)))
+      (setq gptel-agent-skills-test--effects nil))))
 
 (ert-deftest gptel-agent-skills-default-agent-is-lazy ()
   (let* ((agent (cdr (gptel-agent-read-file

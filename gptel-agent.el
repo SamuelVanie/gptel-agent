@@ -67,6 +67,7 @@
 ;;; Code:
 
 (require 'compat)
+(require 'thunk)
 (require 'gptel)
 (require 'gptel-agent-tools)
 (require 'gptel-agent-discussion)
@@ -374,7 +375,7 @@ still apply, and requests already in flight retain their definitions."
   subagent)
 
 (defvar gptel-agent--skill-file-cache nil
-  "Data-only skill parses, separate from evaluated agent definitions.")
+  "Data-only skill parses, separate from agent definitions.")
 
 (defun gptel-agent--cached-read-skill-file (file &optional full)
   "Read FILE as skill data, including its body when FULL is non-nil.
@@ -419,6 +420,9 @@ discovery.  Agent preset keys such as pre and post are never evaluated."
 ;;;###autoload
 (defun gptel-agent-read-file (agent-file &optional templates metadata-only)
   "Read a preset/agent from AGENT-FILE.
+
+Returned :pre and :post functions evaluate their file expressions on
+first invocation, when gptel applies the preset.
 
 If TEMPLATES is non-nil, read the system-prompt with templates applied
 to them.  TEMPLATES should be an alist of (VAR-NAME . VAR-VALUE) for
@@ -847,6 +851,16 @@ Substitution happens in-place in the buffer."
 ;; - Markdown files with YAML frontmatter
 ;; - Org files with PROPERTIES blocks
 
+(defun gptel-agent--deferred-file-hook (source)
+  "Return a preset hook that resolves SOURCE on its first call.
+Keep the resulting function so a stateful hook retains its closure."
+  ;; Registry snapshots use `copy-tree'.  The vector shares the lazy value
+  ;; even on Emacs 29, where interpreted closures are lists.
+  (let ((resolver (vector (thunk-delay (eval (car (read-from-string source)) t)))))
+    (lambda ()
+      (when-let* ((hook (thunk-force (aref resolver 0))))
+        (funcall hook)))))
+
 (defun gptel-agent--parse-yaml-frontmatter (frontmatter-str validator)
   "Parse FRONTMATTER-STR as YAML and validate with VALIDATOR."
   (let ((parsed-yaml (yaml-parse-string
@@ -860,8 +874,8 @@ Substitution happens in-place in the buffer."
         (let ((key (pop tail))
               (val (pop tail)))
           (pcase key
-            ;; :pre and :post are Elisp expressions as strings.
-            ((or :pre :post) (plist-put parsed-yaml key (eval (read val) t)))
+            ((or :pre :post)
+             (plist-put parsed-yaml key (gptel-agent--deferred-file-hook val)))
             ;; :parents is a YAML list of strings read as a list.
             (:parents (plist-put parsed-yaml key
                                  (mapcar #'intern (ensure-list val))))
@@ -991,7 +1005,8 @@ opening delimiter '---' found but no closing delimiter" file-path))))))
         (let ((key (pop tail))
               (val (pop tail)))
           (pcase key
-            ((or :pre :post) (plist-put props-plist key (eval (read val) t)))
+            ((or :pre :post)
+             (plist-put props-plist key (gptel-agent--deferred-file-hook val)))
             (:parents (plist-put props-plist key
                                  (mapcar #'intern
                                          (ensure-list (read val)))))))))
