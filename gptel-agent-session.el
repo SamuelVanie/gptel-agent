@@ -111,7 +111,8 @@ only one message, that message alone supplies the context."
     gptel-include-reasoning gptel-cache gptel-use-curl gptel-confirm-tool-calls
     gptel-org-convert-response gptel-track-media gptel--request-params
     gptel-prompt-prefix-alist gptel-response-prefix-alist gptel-response-separator
-    gptel-agent-use-project-instructions gptel-agent--current-agent
+    gptel-agent-use-project-instructions gptel-agent-instructions-context-paths
+    gptel-agent--current-agent
     gptel-agent-tool-policy gptel-agent-policy--inherited
     gptel-agent--enabled-agents gptel-agent--enabled-skills gptel-agent--todos)
   "Data settings persisted without request closures, grants or credentials.
@@ -485,17 +486,25 @@ DEPTH bounds malformed or cyclic input.  Never serialize executable closures."
                            (gptel-agent-session--data item (1+ (or depth 0)))) value)))
         (t (error "Non-data value in session"))))
 
+(defun gptel-agent-session--check-instruction-paths (paths)
+  "Require PATHS to contain only file or directory names."
+  (unless (and (proper-list-p paths) (cl-every #'stringp paths))
+    (error "Invalid instruction context paths in session"))
+  t)
+
 (defun gptel-agent-session--snapshot (&optional fsm)
   "Capture this chat's durable state including an active FSM's policy ceiling."
   (save-restriction
     (let ((narrow (and (buffer-narrowed-p) (cons (point-min) (point-max))))
           (position (point)) settings)
       (widen)
+      (gptel-agent-session--check-instruction-paths gptel-agent-instructions-context-paths)
       (dolist (symbol gptel-agent-session--settings)
         (when (and (boundp symbol)
                    ;; Older readers reject unknown settings.  Ordinary
                    ;; records keep working with them.
-                   (or (not (memq symbol '(gptel-agent-tool-policy gptel-agent-policy--inherited)))
+                   (or (not (memq symbol '(gptel-agent-tool-policy gptel-agent-policy--inherited
+                                           gptel-agent-instructions-context-paths)))
                        (symbol-value symbol)))
           (condition-case nil
               (push (cons symbol (gptel-agent-session--data (symbol-value symbol))) settings)
@@ -969,6 +978,8 @@ FAMILY-ID supplies the shared display identity for a native family restore."
           (insert (plist-get record :text))
           (dolist (entry (plist-get record :settings))
             (when (memq (car entry) gptel-agent-session--settings)
+              (when (eq (car entry) 'gptel-agent-instructions-context-paths)
+                (gptel-agent-session--check-instruction-paths (cdr entry)))
               (if (eq (car entry) 'gptel-agent-policy--inherited)
                   (gptel-agent-policy-inherit (cdr entry))
                 (set (make-local-variable (car entry)) (cdr entry)))))
@@ -1116,6 +1127,8 @@ survive restoration.  Saving works independently of `gptel-agent-session-mode'."
                                 (and (proper-list-p prompt)
                                      (cl-every #'string-or-null-p prompt)))))
                          ('gptel-use-curl (booleanp (cdr entry)))
+                         ('gptel-agent-instructions-context-paths
+                          (gptel-agent-session--check-instruction-paths (cdr entry)))
                          (key (memq key gptel-agent-session--settings)))))
                 settings)
                (proper-list-p bounds)

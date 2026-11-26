@@ -114,6 +114,44 @@
       (gptel-agent-session-save)
       (should (equal "Source" (plist-get (gptel-agent-session--read copy-id) :text))))))
 
+(ert-deftest gptel-agent-session-standalone-instruction-paths ()
+  (gptel-agent-session-test--with-store
+    (let* ((source (gptel-agent-session-test--buffer "*scoped chat*" "Review this"))
+           (workspace (file-name-as-directory gptel-agent-session-directory))
+           (rules (expand-file-name "nested/AGENTS.md" workspace))
+           (file (expand-file-name "archive.eld" workspace))
+           (paths '("nested/code.el" "nested/"))
+           payload)
+      (make-directory (file-name-directory rules))
+      (with-temp-file rules (insert "ARCHIVED-RULE"))
+      (cl-letf (((symbol-function 'gptel-curl-get-response)
+                 (lambda (fsm) (setq payload (prin1-to-string (plist-get (gptel-fsm-info fsm) :data)))))
+                ((symbol-function 'gptel--url-get-response)
+                 (lambda (&rest _) (ert-fail "Unexpected URL transport"))))
+        (with-current-buffer source
+          (setq-local default-directory workspace
+                      gptel-agent-use-project-instructions t
+                      gptel-use-curl t)
+          ;; V1 records without path metadata remain loadable.
+          (let ((old (gptel-agent-session-buffer-record source)))
+            (should-not (assq 'gptel-agent-instructions-context-paths (plist-get old :settings)))
+            (should-not (buffer-local-value 'gptel-agent-instructions-context-paths
+                                            (gptel-agent-session-buffer-from-record old))))
+          (setq-local gptel-agent-instructions-context-paths paths)
+          (gptel-send)
+          (should (string-match-p "ARCHIVED-RULE" payload))
+          (gptel-agent-session-export-buffer source file))
+        (should-not (with-temp-buffer
+                      (insert-file-contents file)
+                      (search-forward "ARCHIVED-RULE" nil t)))
+        (with-temp-file rules (insert "UPDATED-RULE"))
+        (with-current-buffer (gptel-agent-session-import-buffer file)
+          (should (equal workspace default-directory))
+          (should (equal paths gptel-agent-instructions-context-paths))
+          (gptel-send)
+          (should (string-match-p "UPDATED-RULE" payload))
+          (should-not (string-match-p "ARCHIVED-RULE" payload)))))))
+
 (ert-deftest gptel-agent-session-standalone-captures-effective-directive ()
   (gptel-agent-session-test--with-store
     (let ((source (gptel-agent-session-test--buffer "*directive chat*" "Prompt"))
@@ -144,6 +182,8 @@
                        (:settings (gptel-system-prompt . kill-emacs))
                        (:settings (gptel-system-prompt . "Safe") (gptel-system-prompt . kill-emacs))
                        (:settings (gptel-use-curl . "/unknown/program"))
+                       (:settings (gptel-agent-instructions-context-paths . "not-a-list"))
+                       (:settings (gptel-agent-instructions-context-paths (:file "nested/code.el")))
                        (:bounds (response (1 99))) (:draft . -1)))
         (should-error (gptel-agent-session-buffer-from-record
                        (plist-put (copy-sequence record) (car entry) (cdr entry)))))
