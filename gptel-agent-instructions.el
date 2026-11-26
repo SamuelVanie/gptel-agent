@@ -36,6 +36,13 @@ outgoing call; already submitted calls retain their snapshot."
   "Maximum size of one AGENTS.md file.  Larger files are reported, not truncated."
   :type 'natnum :group 'gptel-agent)
 
+(defvar-local gptel-agent-instructions-context-paths nil
+  "Additional file and directory names for project instruction discovery.
+Hosts can set this list in the conversation buffer before a request.
+Paths are resolved against its `default-directory' alongside explicit
+gptel context when selecting the first call's scopes.  The referenced
+files themselves are not attached to the prompt.")
+
 (defvar-local gptel-agent-instructions--registry nil
   "Private alist of discovered paths and immutable content records.
 Records contain :path, :scope, :text, :version, and optionally :error.")
@@ -319,8 +326,12 @@ Used before every send and before saving a retained worker's conversation."
               ;; delivery (explicit context may point into a sibling scope).
               (gptel-agent-instructions--discover
                (gptel-agent-instructions--directory default-directory t))
-              (let ((context (or (plist-get info :agent-instructions-context)
-                                 (when buffer-file-name (list buffer-file-name)))))
+              ;; A chat file stores the transcript.  Only an ordinary source
+              ;; buffer contributes its visited file as implicit context.
+              (let ((context (or (append (plist-get info :agent-instructions-context)
+                                         gptel-agent-instructions-context-paths)
+                                 (and buffer-file-name (not gptel-mode)
+                                      (list buffer-file-name)))))
                 (setf (plist-get info :agent-instructions-targets)
                       (or (mapcar #'gptel-agent-instructions--reference-directory context)
                           gptel-agent-instructions--targets

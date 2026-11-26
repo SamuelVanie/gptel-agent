@@ -17,6 +17,7 @@
 (declare-function gptel-agent--new-chat-buffer "gptel-agent-tools")
 (declare-function gptel-agent-instructions--transform "gptel-agent-instructions")
 (declare-function smv/gptel-ediff-open "gptel-ediff-prehook")
+(defvar gptel-agent-instructions-context-paths)
 (defvar gptel-agent-instructions--targets)
 
 (defvar-local gptel-agent-review-aside--queue nil)
@@ -138,7 +139,7 @@
           (dolist (entry (plist-get info :discussion-config))
             (set (make-local-variable (car entry)) (copy-tree (cdr entry))))
           (setq default-directory (buffer-local-value 'default-directory owner))
-          (setq-local gptel-agent-instructions--targets
+          (setq-local gptel-agent-instructions-context-paths
                       (delete-dups
                        (cons (file-name-directory path)
                              (copy-sequence
