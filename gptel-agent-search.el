@@ -160,7 +160,7 @@ emit({'status': status, 'examined': count})
 
 (cl-defstruct (gptel-agent--repo (:constructor gptel-agent--make-repo))
   name source callback fsm cleanup backend root regex glob depth type context
-  check-path grep-access-live read-roots directories next-directories (walk-level 1) (walk-base 0)
+  check-path grep-access-live read-roots read-batch directories next-directories (walk-level 1) (walk-base 0)
   max-results max-entries limit traversal-limit process stderr-process timer timeout
   stage walk-status status done (pending "") (stderr "") (entries nil) (files nil)
   (output nil) (used 0) (count 0) (examined 0) (walk-bytes 0))
@@ -205,23 +205,35 @@ emit({'status': status, 'examined': count})
   "Sort metadata records A and B by lstat mtime, breaking ties by path."
   (if (= (nth 3 a) (nth 3 b)) (string< (car a) (car b)) (> (nth 3 a) (nth 3 b))))
 
-(defun gptel-agent--repo-access-valid-p (job)
-  "Whether JOB still owns the access it had when traversal started."
-  (let ((valid (gptel-agent--repo-grep-access-live job)))
-    (or (null valid) (ignore-errors (funcall valid)))))
+(defun gptel-agent--repo-access-change (job)
+  "Discard JOB's output and return a reason if its read access changed."
+  (let* ((valid (gptel-agent--repo-grep-access-live job))
+         (files (gptel-agent--repo-read-batch job))
+         (reason
+          (cond
+           ((and valid (not (ignore-errors (funcall valid))))
+            "incomplete: conversation access changed")
+           ;; Native matchers open pathnames after launch.  Detect redirection
+           ;; of a canonical argument or its ancestors before releasing bytes.
+           ((and files (not (ignore-errors
+                              (let (file-name-handler-alist)
+                                (cl-every (lambda (file)
+                                            (and (equal file (file-truename file))
+                                                 (file-regular-p file)))
+                                          files)))))
+            "incomplete: search targets changed"))))
+    (when reason
+      (setf (gptel-agent--repo-output job) nil
+            (gptel-agent--repo-count job) 0))
+    reason))
 
 (defun gptel-agent--repo-finish (job status)
   "Deliver JOB once with explicit coverage STATUS and release ownership."
   (unless (gptel-agent--repo-done job)
     (when (and (equal status "complete") (gptel-agent--repo-status job))
       (setq status (gptel-agent--repo-status job)))
-    ;; A matcher may have been running, or earlier batches buffered, when the
-    ;; owner changed directory or revoked access.  Never deliver those bytes.
-    (when (and (gptel-agent--repo-live-p job)
-               (not (gptel-agent--repo-access-valid-p job)))
-      (setf (gptel-agent--repo-output job) nil
-            (gptel-agent--repo-count job) 0)
-      (setq status "incomplete: conversation access changed"))
+    (when (gptel-agent--repo-live-p job)
+      (setq status (or (gptel-agent--repo-access-change job) status)))
     (when (> (length status) 2048)
       (setq status (concat (substring status 0 2048) "…")))
     (when (equal (gptel-agent--repo-name job) "Glob")
@@ -255,8 +267,10 @@ emit({'status': status, 'examined': count})
                      (lambda ()
                        (if (not (gptel-agent--repo-live-p job)) (gptel-agent--repo-dispose job)
                          (condition-case err
-                             (if (gptel-agent--repo-access-valid-p job) (funcall function job)
-                               (gptel-agent--repo-finish job "incomplete: conversation access changed"))
+                             (if-let* ((reason (gptel-agent--repo-access-change job)))
+                                 (gptel-agent--repo-finish job reason)
+                               (setf (gptel-agent--repo-read-batch job) nil)
+                               (funcall function job))
                            (error (gptel-agent--repo-finish job (concat "incomplete: " (error-message-string err))))))))))
 
 (defun gptel-agent--repo-walk-end (job status)
@@ -485,7 +499,10 @@ Guarded walkers examine one level of admitted directories in each batch."
                    (not (file-remote-p default-directory))
                    (equal (file-name-as-directory (file-truename default-directory)) working)
                    (or (not grant) (eq grant gptel-agent-access--grant))
-                   (or (not supervised) (gptel-agent-supervision-request-live-p scope fsm))))))))
+                   (or (not supervised)
+                       (and (eq scope (plist-get (gptel-fsm-info fsm) :agent-supervision))
+                            (gptel-agent--supervision-allow-outside-reads scope)
+                            (gptel-agent-supervision-request-live-p scope fsm)))))))))
 
 (defun gptel-agent--repo-permitted-path (job file)
   "Return the verified target of a recursive FILE read, or nil if denied."
@@ -520,8 +537,12 @@ Guarded walkers examine one level of admitted directories in each batch."
     (while (and (gptel-agent--repo-files job) (< examined 64) (< size 32768))
       (cl-incf examined)
       (when-let* ((file (gptel-agent--repo-permitted-path job (pop (gptel-agent--repo-files job)))))
-        (cl-incf size (string-bytes file)) (push file files)))
+        (if (file-regular-p file)
+            (progn (cl-incf size (string-bytes file)) (push file files))
+          (setf (gptel-agent--repo-status job) "incomplete: candidate changed file type"))))
     (setq files (nreverse files))
+    (when (gptel-agent--repo-grep-access-live job)
+      (setf (gptel-agent--repo-read-batch job) files))
     (if (and (null files) (gptel-agent--repo-files job))
         (gptel-agent--repo-schedule job #'gptel-agent--repo-grep-batch)
       (gptel-agent--repo-launch
@@ -533,7 +554,9 @@ Guarded walkers examine one level of admitted directories in each batch."
                  (if (eq (plist-get backend :name) 'rg)
                      ;; Parallel rg buffers output per file; stream one file at
                      ;; a time so the parent can stop even a prolific match.
-                     '("--no-config" "--no-heading" "--color=never" "--no-mmap"
+                     ;; Only the walker may enumerate directories, even if a
+                     ;; candidate changes type between its check and open.
+                     '("--no-config" "--no-heading" "--color=never" "--no-mmap" "--max-depth=0"
                        "--threads=1" "--line-buffered" "--text" "--null" "-H" "-n")
                    '("-E" "-a" "--line-buffered" "--null" "-H" "-n"))
                  (list (format "-C%d" (gptel-agent--repo-context job)) "-e" (gptel-agent--repo-regex job) "--")

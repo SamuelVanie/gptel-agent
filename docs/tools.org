@@ -320,7 +320,9 @@ conversation grant, live supervised outside reads, or an applicable policy
 path constraint. Tool policy denials still apply. Grep skips files requiring
 separate approval and reports incomplete coverage. To search one, call Grep
 on its path directly. Changing the owning chat's working directory or revoking
-a grant used by a running directory search discards the pending results.
+a grant used by a running directory search discards the pending results. Grep
+also discards results if it detects that a matched batch's canonical file
+paths were redirected while the matcher was running.
 
 Each call has a =gptel-agent-search-timeout= deadline (30 seconds), including
 traversal, and stops when its request is aborted or its owning buffer is killed.
