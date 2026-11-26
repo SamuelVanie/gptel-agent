@@ -87,14 +87,15 @@ Do not change the base system prompt, including function/list prompts."
   (let ((info (gptel-agent-instructions--info fsm)))
     (with-current-buffer (if (bufferp (plist-get info :data))
                              (plist-get info :data) (current-buffer))
-      (when gptel-use-context
-        (setf (plist-get info :agent-instructions-context)
-              (delq nil
-                    (mapcar (lambda (entry)
-                              (cond ((buffer-live-p (car entry))
-                                     (buffer-file-name (car entry)))
-                                    ((stringp (car entry)) (car entry))))
-                            gptel-context)))))))
+      (setf (plist-get info :agent-instructions-context)
+            (when gptel-use-context
+              (cl-loop for entry in gptel-context
+                       for source = (if (consp entry) (car entry) entry)
+                       for path = (cond ((stringp source) source)
+                                        ((buffer-live-p source)
+                                         (buffer-file-name
+                                          (or (buffer-base-buffer source) source))))
+                       when path collect (expand-file-name path)))))))
 
 (defun gptel-agent-instructions--skip (fsm)
   "Exclude the compaction request FSM from managed instruction delivery."
@@ -145,13 +146,12 @@ Outside scopes are permitted after file-call approval; remote paths fail."
   "Return the scope of a Read or context reference to PATH.
 An AGENTS.md reference uses its containing directory, even when the file
 is a symlink to shared instructions outside the discovery boundary."
-  (if (and (stringp path) (equal (file-name-nondirectory path) "AGENTS.md"))
-      (progn
-        (when (file-remote-p path)
-          (error "Project instructions do not support remote targets: %s" path))
-        (gptel-agent-instructions--directory
-         (file-name-directory (expand-file-name path)) t))
-    (gptel-agent-instructions--directory path)))
+  (when (file-remote-p path)
+    (error "Project instructions do not support remote targets: %s" path))
+  (if (equal (file-name-nondirectory path) "AGENTS.md")
+      (gptel-agent-instructions--directory
+       (file-name-directory (expand-file-name path)) t)
+    (gptel-agent-instructions--directory path (file-directory-p path))))
 
 (defun gptel-agent-instructions--load (path)
   "Refresh instruction PATH from disk, replacing its private registry record.
