@@ -8,6 +8,10 @@
 (require 'gptel)
 (require 'gptel-agent-tool-identity)
 (require 'gptel-agent-path)
+(require 'gptel-agent-access)
+
+(declare-function gptel-agent--supervision-allow-outside-reads "gptel-agent-tools")
+(declare-function gptel-agent-supervision-request-live-p "gptel-agent-tools")
 
 (defvar gptel-agent-tool-result-max-chars)
 
@@ -95,7 +99,7 @@ emit({'status': status, 'examined': count})
 (defconst gptel-agent--repo-glob-description
   "Find typed entries on disk under root_directory. Include hidden, ignored, dependency and build entries; omit only .git directories. List symlink directories without traversing them. Results are sorted newest first (path order breaks mtime ties); incomplete results describe only the collected subset. depth=1 inspects immediate children; omitted depth allows all depths. ")
 (defconst gptel-agent--repo-grep-description
-  "Search text on disk at path, returning quoted absolute filenames and line numbers, with optional context. Directory searches include hidden, ignored, dependency and build files, omit .git directories, and never traverse symlink directories. Search regular files as text, including binary bytes. glob is an optional case-insensitive basename glob (*, ?, [...], no / or **), with the same syntax as Glob. depth=1 inspects immediate children; omit for all depths. ")
+  "Search text on disk at path, returning quoted absolute filenames and line numbers, with optional context. Directory searches include hidden, ignored, dependency and build files, omit .git directories, and never traverse symlink directories. Files whose resolved targets need separate outside approval are skipped with incomplete coverage. Search regular files as text, including binary bytes. glob is an optional case-insensitive basename glob (*, ?, [...], no / or **), with the same syntax as Glob. depth=1 inspects immediate children; omit for all depths. ")
 
 (defun gptel-agent--repo-tool (base fsm backend)
   "Clone BASE, advertising and capturing BACKEND and owning FSM."
@@ -156,13 +160,12 @@ emit({'status': status, 'examined': count})
 
 (cl-defstruct (gptel-agent--repo (:constructor gptel-agent--make-repo))
   name source callback fsm cleanup backend root regex glob depth type context
-  check-path directories next-directories (walk-level 1) (walk-base 0)
+  check-path grep-access-live read-roots directories next-directories (walk-level 1) (walk-base 0)
   max-results max-entries limit traversal-limit process stderr-process timer timeout
   stage walk-status status done (pending "") (stderr "") (entries nil) (files nil)
   (output nil) (used 0) (count 0) (examined 0) (walk-bytes 0))
 
 (defvar-local gptel-agent--repository-searches nil "Searches owned by this buffer.")
-(defvar gptel-agent-policy--active-check)
 (put 'gptel-agent--repository-searches 'permanent-local t)
 
 (defun gptel-agent--repo-stop-process (job)
@@ -202,11 +205,23 @@ emit({'status': status, 'examined': count})
   "Sort metadata records A and B by lstat mtime, breaking ties by path."
   (if (= (nth 3 a) (nth 3 b)) (string< (car a) (car b)) (> (nth 3 a) (nth 3 b))))
 
+(defun gptel-agent--repo-access-valid-p (job)
+  "Whether JOB still owns the access it had when traversal started."
+  (let ((valid (gptel-agent--repo-grep-access-live job)))
+    (or (null valid) (ignore-errors (funcall valid)))))
+
 (defun gptel-agent--repo-finish (job status)
   "Deliver JOB once with explicit coverage STATUS and release ownership."
   (unless (gptel-agent--repo-done job)
     (when (and (equal status "complete") (gptel-agent--repo-status job))
       (setq status (gptel-agent--repo-status job)))
+    ;; A matcher may have been running, or earlier batches buffered, when the
+    ;; owner changed directory or revoked access.  Never deliver those bytes.
+    (when (and (gptel-agent--repo-live-p job)
+               (not (gptel-agent--repo-access-valid-p job)))
+      (setf (gptel-agent--repo-output job) nil
+            (gptel-agent--repo-count job) 0)
+      (setq status "incomplete: conversation access changed"))
     (when (> (length status) 2048)
       (setq status (concat (substring status 0 2048) "…")))
     (when (equal (gptel-agent--repo-name job) "Glob")
@@ -239,7 +254,9 @@ emit({'status': status, 'examined': count})
         (run-at-time 0.001 nil
                      (lambda ()
                        (if (not (gptel-agent--repo-live-p job)) (gptel-agent--repo-dispose job)
-                         (condition-case err (funcall function job)
+                         (condition-case err
+                             (if (gptel-agent--repo-access-valid-p job) (funcall function job)
+                               (gptel-agent--repo-finish job "incomplete: conversation access changed"))
                            (error (gptel-agent--repo-finish job (concat "incomplete: " (error-message-string err))))))))))
 
 (defun gptel-agent--repo-walk-end (job status)
@@ -444,21 +461,58 @@ Guarded walkers examine one level of admitted directories in each batch."
         (gptel-agent--repo-schedule job #'gptel-agent--repo-walk-next)
       (gptel-agent--repo-walk-end job status))))
 
+(defun gptel-agent--repo-guard-grep (job)
+  "Capture the owning conversation's access for a directory Grep JOB."
+  (gptel-agent-instructions--initialize)
+  (let* ((owner (current-buffer))
+         (directory default-directory)
+         (working gptel-agent-instructions--working-directory)
+         (grant gptel-agent-access--grant)
+         (fsm (gptel-agent--repo-fsm job))
+         (scope (and fsm (plist-get (gptel-fsm-info fsm) :agent-supervision)))
+         (supervised (and scope (gptel-agent--supervision-allow-outside-reads scope)
+                          (gptel-agent-supervision-request-live-p scope fsm)))
+         (root (file-truename (gptel-agent--repo-root job))))
+    (unless (or grant supervised)
+      (setf (gptel-agent--repo-read-roots job)
+            (cons gptel-agent-instructions--boundary
+                  ;; Run once on an outside directory covers its real subtree.
+                  (when (member root gptel-agent-access--approved) (list root)))))
+    (setf (gptel-agent--repo-grep-access-live job)
+          (lambda ()
+            (with-current-buffer owner
+              (and (equal default-directory directory)
+                   (not (file-remote-p default-directory))
+                   (equal (file-name-as-directory (file-truename default-directory)) working)
+                   (or (not grant) (eq grant gptel-agent-access--grant))
+                   (or (not supervised) (gptel-agent-supervision-request-live-p scope fsm))))))))
+
 (defun gptel-agent--repo-permitted-path (job file)
   "Return the verified target of a recursive FILE read, or nil if denied."
-  (if-let* ((check (gptel-agent--repo-check-path job)))
+  (let ((check (gptel-agent--repo-check-path job))
+        (roots (gptel-agent--repo-read-roots job)))
+    (if (not (or check (gptel-agent--repo-grep-access-live job))) file
+      ;; Pass the checked target to the matcher, never the original file link.
       (let* ((target (let (file-name-handler-alist) (file-truename file)))
+             (outside (and roots (not (cl-some (lambda (root)
+                                                  (gptel-agent-instructions--inside-p target root))
+                                                roots))))
              (field (if (equal (gptel-agent--repo-name job) "Glob") :root_directory :path)))
-        ;; A broad rule for the directory does not grant outside access via
-        ;; a child symlink. Require a matching path constraint for that target.
-        (if (and (not (file-remote-p target))
-                 (or (equal file target) (funcall check (list field file)))
-                 (funcall check (list field target)
-                          (unless (file-in-directory-p target (gptel-agent--repo-root job)) field)))
-            target
-          (setf (gptel-agent--repo-status job) "incomplete: paths excluded by tool policy")
-          nil))
-    file))
+        (cond
+         ((file-remote-p target)
+          (setf (gptel-agent--repo-status job) "incomplete: remote paths excluded") nil)
+         (check
+          ;; Broad directory admission cannot authorize a target outside either
+          ;; the search tree or the conversation's read roots.
+          (if (and (or (equal file target) (funcall check (list field file)))
+                   (funcall check (list field target)
+                            (when (or outside (not (file-in-directory-p target (gptel-agent--repo-root job))))
+                              field)))
+              target
+            (setf (gptel-agent--repo-status job) "incomplete: paths excluded by tool policy") nil))
+         (outside
+          (setf (gptel-agent--repo-status job) "incomplete: paths require outside approval") nil)
+         (t target))))))
 
 (defun gptel-agent--repo-grep-batch (job)
   "Search the next bounded batch of explicit filenames for JOB."
@@ -553,6 +607,8 @@ Guarded walkers examine one level of admitted directories in each batch."
     (condition-case err
         (if (file-directory-p path)
             (progn
+              (when (equal (gptel-agent--repo-name job) "Grep")
+                (gptel-agent--repo-guard-grep job))
               (setf (gptel-agent--repo-stage job) 'walk)
               (gptel-agent--repo-walk-directories job (list path)))
           (setf (gptel-agent--repo-stage job) 'grep
@@ -574,8 +630,11 @@ contract."
   "Asynchronously search PATH with REGEX in the advertised BACKEND dialect.
 GLOB filters basenames; CONTEXT is 0..15.  DEPTH, MAX-RESULTS and MAX-ENTRIES
 bound traversal and global matches.  FSM owns cancellation."
-  (gptel-agent--repo-start callback "Grep" regex path glob (or context 0) depth "files"
-                           max-results max-entries fsm backend))
+  (let ((owner (if fsm (plist-get (gptel-fsm-info fsm) :buffer) (current-buffer))))
+    (if (not (buffer-live-p owner)) (funcall callback "Cancelled: Grep owner closed.")
+      (with-current-buffer owner
+        (gptel-agent--repo-start callback "Grep" regex path glob (or context 0) depth "files"
+                                 max-results max-entries fsm backend)))))
 
 (provide 'gptel-agent-search)
 ;;; gptel-agent-search.el ends here

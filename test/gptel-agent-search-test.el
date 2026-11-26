@@ -245,6 +245,8 @@
 
 (ert-deftest gptel-agent-repo-traversal-and-fallback-reads-stay-outside-caller ()
   (gptel-edit-test--with-files '(("nested/one.el" . "before\nneedle\nafter\n"))
+                               ;; Normal dispatch initializes the boundary before Grep runs.
+                               (gptel-agent-instructions--initialize)
                                (dolist (walker '(python emacs))
                                  (when (or (eq walker 'emacs) (executable-find "python3"))
                                    (let ((backend (gptel-agent-repo-test--backend 'emacs walker)))
